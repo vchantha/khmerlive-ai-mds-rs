@@ -87,6 +87,18 @@ async def upload(file:UploadFile=File(...),actor:dict=Depends(authorize)):
         db.add(obj);db.commit()
     return {"media_id":mid,"size_bytes":size,"sha256":digest.hexdigest()}
 
+def ensure_translation_ready():
+    if settings.model_mode=="real_subtitles":
+        from app.real_inference import model_paths
+        try:
+            model_paths(settings.whisper_model_path,settings.translation_model_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(503,
+                "Offline ASR or translation model weights are not installed. "
+                "Download and validate the two models first.") from exc
+    elif settings.model_mode!="demo":
+        raise HTTPException(503,"Unsupported MODEL_MODE")
+
 class JobCreate(BaseModel):
     media_id:str
     source_lang:str=Field(pattern="^(en|km)$")
@@ -95,8 +107,7 @@ class JobCreate(BaseModel):
 @app.post("/api/jobs",status_code=202,dependencies=[Depends(authorize)])
 def create_job(payload:JobCreate,actor:dict=Depends(authorize)):
     if payload.source_lang==payload.target_lang:raise HTTPException(422,"Language pair must differ")
-    if settings.model_mode not in ("demo","real_subtitles"):
-        raise HTTPException(503,"Unsupported model mode")
+    ensure_translation_ready()
     with session() as db:
         media=db.get(MediaAsset,payload.media_id)
         if media is None or (not actor["admin"] and media.owner_user_id!=actor["user_id"]):
@@ -122,8 +133,7 @@ class StreamJobCreate(BaseModel):
 def create_url_job(payload:StreamJobCreate,actor:dict=Depends(authorize)):
     if payload.source_lang==payload.target_lang:
         raise HTTPException(422,"Language pair must differ")
-    if settings.model_mode not in ("demo","real_subtitles"):
-        raise HTTPException(503,"Unsupported model mode")
+    ensure_translation_ready()
     try:
         url=validate_stream_url(payload.url)
         seconds=capture_seconds_valid(payload.capture_seconds)
