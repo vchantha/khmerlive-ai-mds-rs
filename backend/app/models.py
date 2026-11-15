@@ -22,6 +22,7 @@ class TranslationJob(Base):
     status:Mapped[str]=mapped_column(String(32),default="queued")
     progress:Mapped[int]=mapped_column(default=0)
     stage:Mapped[str|None]=mapped_column(String(64),nullable=True)
+    cancel_requested:Mapped[bool]=mapped_column(default=False,server_default="false")
     error:Mapped[str|None]=mapped_column(Text,nullable=True)
     transcript:Mapped[str|None]=mapped_column(Text,nullable=True)
     translation:Mapped[str|None]=mapped_column(Text,nullable=True)
