@@ -1,10 +1,10 @@
 import hashlib
 import uuid
 from contextlib import contextmanager
-from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header
+from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header,Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
-from sqlalchemy import select,text
+from sqlalchemy import select,text,func,or_
 from app.db import SessionLocal
 from app.models import MediaAsset,TranslationJob
 from app.storage import client
@@ -79,18 +79,72 @@ def create_job(payload:JobCreate):
         raise HTTPException(503,"Queue temporarily unavailable") from exc
     return {"job_id":jid,"status":"queued","mode":settings.model_mode}
 
-@app.get("/api/jobs",dependencies=[Depends(authorize)])
-def list_jobs():
+def format_job(job,media):
+    return {
+        "id":job.id,"media_id":job.media_id,"filename":media.filename,
+        "size_bytes":media.size_bytes,"status":job.status,
+        "progress":job.progress or 0,"stage":job.stage,
+        "source_lang":job.source_lang,"target_lang":job.target_lang,
+        "created_at":job.created_at.isoformat() if job.created_at else None,
+        "updated_at":job.updated_at.isoformat() if job.updated_at else None,
+        "transcript":job.transcript,"translation":job.translation,
+        "error":job.error,"has_output":bool(job.output_key),"mode":settings.model_mode,
+    }
+
+@app.get("/api/dashboard",dependencies=[Depends(authorize)])
+def dashboard():
     with session() as db:
-        jobs=db.scalars(select(TranslationJob).order_by(TranslationJob.created_at.desc()).limit(100)).all()
-        return [{"id":j.id,"status":j.status,"source_lang":j.source_lang,"target_lang":j.target_lang,"created_at":j.created_at.isoformat()} for j in jobs]
+        rows=db.execute(select(TranslationJob.status,func.count(TranslationJob.id)).group_by(TranslationJob.status)).all()
+        counts=dict(rows)
+    return {"total":sum(counts.values()),"queued":counts.get("queued",0),
+        "processing":counts.get("processing",0),"completed":counts.get("completed",0),
+        "failed":counts.get("failed",0)+counts.get("dispatch_failed",0),
+        "by_status":counts,"mode":settings.model_mode}
+
+@app.get("/api/system",dependencies=[Depends(authorize)])
+def system_status():
+    checks={"api":"online","database":"unknown","redis":"unknown","storage":"unknown","worker":"unknown"}
+    try:
+        with session() as db:db.execute(text("SELECT 1"))
+        checks["database"]="online"
+    except Exception:checks["database"]="offline"
+    try:
+        from redis import Redis
+        checks["redis"]="online" if Redis.from_url(settings.redis_url,socket_timeout=1,socket_connect_timeout=1).ping() else "offline"
+    except Exception:checks["redis"]="offline"
+    try:
+        client().head_bucket(Bucket=settings.minio_bucket)
+        checks["storage"]="online"
+    except Exception:checks["storage"]="offline"
+    try:
+        from app.tasks import celery_app
+        checks["worker"]="online" if celery_app.control.inspect(timeout=0.8).ping() else "unknown"
+    except Exception:checks["worker"]="unknown"
+    return {"services":checks,"mode":settings.model_mode}
+
+@app.get("/api/jobs",dependencies=[Depends(authorize)])
+def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
+              status:str|None=Query(None),search:str|None=Query(None,max_length=200)):
+    with session() as db:
+        q=select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id)
+        if status and status!="all":
+            if status=="failed":q=q.where(TranslationJob.status.in_(["failed","dispatch_failed"]))
+            elif status in ("queued","processing","completed","dispatch_failed"):
+                q=q.where(TranslationJob.status==status)
+            else:raise HTTPException(422,"Unsupported job status")
+        if search:
+            term=f"%{search.strip()}%"
+            q=q.where(or_(MediaAsset.filename.ilike(term),TranslationJob.id.ilike(term)))
+        total=db.scalar(select(func.count()).select_from(q.order_by(None).subquery())) or 0
+        rows=db.execute(q.order_by(TranslationJob.created_at.desc(),TranslationJob.id.desc()).offset(offset).limit(limit)).all()
+        return {"items":[format_job(j,m) for j,m in rows],"total":total,"limit":limit,"offset":offset}
 
 @app.get("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
 def get_job(job_id:str):
     with session() as db:
-        j=db.get(TranslationJob,job_id)
-        if j is None:raise HTTPException(404,"Not found")
-        return {"id":j.id,"status":j.status,"source_lang":j.source_lang,"target_lang":j.target_lang,"transcript":j.transcript,"translation":j.translation,"error":j.error,"has_output":bool(j.output_key),"mode":settings.model_mode}
+        row=db.execute(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id).where(TranslationJob.id==job_id)).first()
+        if row is None:raise HTTPException(404,"Not found")
+        return format_job(*row)
 
 @app.get("/api/jobs/{job_id}/download",dependencies=[Depends(authorize)])
 def download(job_id:str):
