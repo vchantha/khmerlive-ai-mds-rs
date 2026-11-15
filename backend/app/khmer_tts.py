@@ -4,12 +4,12 @@ Audio is synthetic and replaces the source speech. Do not imply voice cloning.
 The MMS Khmer checkpoint is CC-BY-NC-4.0: obtain commercial rights before
 using it in any commercial product.
 """
+from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 import subprocess
 import wave
 
-import numpy as np
 
 def require_tts_model(path:str)->Path:
     root=Path(path)
@@ -30,6 +30,7 @@ def load_khmer_tts(path:str,device:str="cpu"):
 
 def synthesize_khmer(text:str,model_path:str,device:str="cpu")->tuple[np.ndarray,int]:
     import torch
+    import numpy as np
     if not text.strip():
         raise ValueError("Cannot synthesize empty Khmer speech")
     if not any("\u1780"<=c<="\u17ff" for c in text):
@@ -50,6 +51,7 @@ def resample_to_length(audio:np.ndarray,sample_rate:int,samples:int)->np.ndarray
     Linear interpolation preserves timing but changes pitch; a future
     pitch-preserving stretch engine should replace this research MVP.
     """
+    import numpy as np
     if samples<=0: return np.zeros(0,dtype=np.float32)
     if len(audio)==0:return np.zeros(samples,dtype=np.float32)
     source_seconds=len(audio)/sample_rate
@@ -64,6 +66,7 @@ def resample_to_length(audio:np.ndarray,sample_rate:int,samples:int)->np.ndarray
 def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
                        device:str="cpu",synthesizer=None)->Path:
     """Produce a 24kHz mono PCM track with silence outside translated speech."""
+    import numpy as np
     if duration_seconds<=0 or duration_seconds>3600:
         raise ValueError("Invalid video duration")
     rate=24000
