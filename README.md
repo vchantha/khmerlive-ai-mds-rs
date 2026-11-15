@@ -11,6 +11,10 @@ No end-to-end Khmer speech synthesis on the user's machine has been verified.
 
 # KhmerLive AI — Docker Compose Research MVP
 
+Videos longer than the default ten-minute limit require the
+[long-video processing profile](docs/LONG_VIDEOS.md), which allows two-hour
+inputs and extends the worker timeout. Retry alone does not change the limit.
+
 **Research:** Uncertainty-Aware Adaptive Speech Segmentation for Low-Latency Offline English–Khmer Simultaneous Translation. [Notion roadmap](https://app.notion.com/p/41931200c90381c9bd02d240f29d9392).
 
 > **Important: Infrastructure DEMO, not a working Khmer translator.** ASR and MT return explicit demo placeholders, and FFmpeg re-muxes the original audio/video unchanged. Khmer AI models, TTS, adaptive streaming and measured accuracy are not yet implemented. Never represent the exported video as dubbed or translated. This repo is a reproducible *Phase 0–1 service foundation*, not a completed research result.

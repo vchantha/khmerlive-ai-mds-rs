@@ -234,6 +234,8 @@ function App() {
     subtitle_translation_configured: boolean;
     speech_dubbing_available: boolean;
     khmer_dubbing_enabled?: boolean;
+    max_video_duration_seconds?: number;
+    max_upload_mb?: number;
   } | null>(null);
   const [playback, setPlayback] = useState<{
       video_url: string;
@@ -333,6 +335,8 @@ function App() {
           subtitle_translation_configured: boolean;
           speech_dubbing_available: boolean;
           khmer_dubbing_enabled?: boolean;
+          max_video_duration_seconds?: number;
+          max_upload_mb?: number;
         }>("/api/models"),
       ]);
       setModelInfo(models);
@@ -1262,7 +1266,12 @@ function App() {
               <small>
                 {file
                   ? size(file.size)
-                  : "MP4 (H.264) · max 1 GiB configured by default"}
+                  : "MP4 (H.264)"}
+              </small>
+              <small>
+                {modelInfo?.max_video_duration_seconds !== undefined
+                  ? `Maximum duration: ${modelInfo.max_video_duration_seconds / 60} minutes · Maximum size: ${modelInfo.max_upload_mb ?? 1024} MiB`
+                  : "Connect to load the server's upload limits."}
               </small>
               <input
                 ref={input}

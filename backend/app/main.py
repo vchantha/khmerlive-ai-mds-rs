@@ -66,6 +66,8 @@ def models():
         except FileNotFoundError:
             pass
     return {"mode":settings.model_mode,"subtitle_translation_configured":configured,
+            "max_video_duration_seconds":settings.max_video_duration_seconds,
+            "max_upload_mb":settings.max_upload_mb,
             "speech_dubbing_available":dubbing_ready,
             "khmer_dubbing_enabled":settings.enable_khmer_dubbing,
             "note":"English to Khmer jobs replace source audio with offline Khmer TTS when enabled. Khmer to English remains subtitle-only."}

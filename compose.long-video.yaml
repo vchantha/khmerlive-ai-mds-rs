@@ -1,0 +1,11 @@
+# Opt-in two-hour input profile. Place after compose.real.yaml if using real AI.
+# Keep API and worker limits identical; environment overrides existing .env values.
+services:
+  api:
+    environment:
+      MAX_VIDEO_DURATION_SECONDS: "7200"
+      JOB_TIME_LIMIT_SECONDS: "21600"
+  worker:
+    environment:
+      MAX_VIDEO_DURATION_SECONDS: "7200"
+      JOB_TIME_LIMIT_SECONDS: "21600"

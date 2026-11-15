@@ -198,7 +198,8 @@ def translate_media(self,job_id:str):
                         set_state(db,job,"processing",progress=70,stage="synthesizing Khmer voice")
                         dubbed=root/"khmer-dub.wav"
                         build_dubbed_audio(rows_for_dubbing or [],dubbed,clip_seconds,
-                                           settings.khmer_tts_model_path,settings.inference_device)
+                                           settings.khmer_tts_model_path,settings.inference_device,
+                                           max_duration_seconds=settings.max_video_duration_seconds)
                         check_cancel(db,job)
                         audio_args=["-i",str(dubbed)]
                     cmd=["ffmpeg","-v","error","-nostdin","-y",

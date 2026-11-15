@@ -9,6 +9,8 @@ from functools import lru_cache
 from pathlib import Path
 import subprocess
 import wave
+import math
+import tempfile
 
 
 def require_tts_model(path:str)->Path:
@@ -64,13 +66,28 @@ def resample_to_length(audio:np.ndarray,sample_rate:int,samples:int)->np.ndarray
     return np.interp(positions,np.arange(len(audio)),audio).astype(np.float32)
 
 def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
-                       device:str="cpu",synthesizer=None)->Path:
+                       device:str="cpu",synthesizer=None,max_duration_seconds:float=600)->Path:
     """Produce a 24kHz mono PCM track with silence outside translated speech."""
     import numpy as np
-    if duration_seconds<=0 or duration_seconds>3600:
+    if not math.isfinite(duration_seconds) or not 0<duration_seconds<=max_duration_seconds:
         raise ValueError("Invalid video duration")
     rate=24000
-    timeline=np.zeros(round(duration_seconds*rate),dtype=np.float32)
+    # Disk-backed assembly avoids allocating several full-length audio arrays
+    # in RAM when an administrator enables long videos.
+    output.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryFile(dir=output.parent) as backing:
+        samples=round(duration_seconds*rate)
+        if samples<1:
+            raise ValueError("Invalid video duration")
+        backing.truncate(samples*4)
+        timeline=np.memmap(backing,dtype=np.float32,mode="r+",shape=(samples,))
+        try:
+            return _assemble_track(rows,output,timeline,rate,model_path,device,synthesizer)
+        finally:
+            timeline._mmap.close()
+
+def _assemble_track(rows,output,timeline,rate,model_path,device,synthesizer):
+    import numpy as np
     synth=synthesizer or (lambda text:synthesize_khmer(text,model_path,device))
     populated=0
     for row in rows:
@@ -84,10 +101,13 @@ def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
         populated+=1
     if not populated:
         raise ValueError("No translated Khmer speech segments available for dubbing")
-    peak=float(np.max(np.abs(timeline)))
-    if peak>0.95:timeline*=0.95/peak
-    output.parent.mkdir(parents=True,exist_ok=True)
+    block_size=rate*10
+    peak=max(float(np.max(np.abs(timeline[i:i+block_size])))
+             for i in range(0,len(timeline),block_size))
+    gain=0.95/peak if peak>0.95 else 1.0
     with wave.open(str(output),"wb") as wav:
         wav.setnchannels(1);wav.setsampwidth(2);wav.setframerate(rate)
-        wav.writeframes((np.clip(timeline,-1,1)*32767).astype("<i2").tobytes())
+        for i in range(0,len(timeline),block_size):
+            block=timeline[i:i+block_size]*gain
+            wav.writeframes((np.clip(block,-1,1)*32767).astype("<i2").tobytes())
     return output
