@@ -80,6 +80,9 @@ def main():
     else:raise TimeoutError("Real model job timed out before completion; check worker CPU/GPU and logs")
     if job["status"]!="completed":
         raise RuntimeError("Real job failed: "+str(job.get("error")))
+    if target=="km" and info.get("khmer_dubbing_enabled"):
+        if not job.get("has_khmer_voice"):
+            raise RuntimeError("English→Khmer job completed without a Khmer-dubbed audio artifact")
     if not job.get("has_subtitles") or not job.get("has_output"):
         raise RuntimeError("Job completed but video/subtitles are missing")
     _,_,srt=get(base,"/api/jobs/"+jid+"/subtitles")
