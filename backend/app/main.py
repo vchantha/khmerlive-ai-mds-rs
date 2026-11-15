@@ -57,9 +57,18 @@ def models():
             configured=True
         except FileNotFoundError:
             configured=False
+    from app.khmer_tts import require_tts_model
+    dubbing_ready=False
+    if settings.model_mode=="real_subtitles" and settings.enable_khmer_dubbing:
+        try:
+            require_tts_model(settings.khmer_tts_model_path)
+            dubbing_ready=True
+        except FileNotFoundError:
+            pass
     return {"mode":settings.model_mode,"subtitle_translation_configured":configured,
-            "speech_dubbing_available":False,
-            "note":"Real subtitle mode requires local Whisper/M2M100 weights and an AI worker. Speech dubbing is not implemented."}
+            "speech_dubbing_available":dubbing_ready,
+            "khmer_dubbing_enabled":settings.enable_khmer_dubbing,
+            "note":"English to Khmer jobs replace source audio with offline Khmer TTS when enabled. Khmer to English remains subtitle-only."}
 
 @app.post("/api/media",status_code=201,dependencies=[Depends(authorize)])
 async def upload(file:UploadFile=File(...),actor:dict=Depends(authorize)):
@@ -87,14 +96,17 @@ async def upload(file:UploadFile=File(...),actor:dict=Depends(authorize)):
         db.add(obj);db.commit()
     return {"media_id":mid,"size_bytes":size,"sha256":digest.hexdigest()}
 
-def ensure_translation_ready():
+def ensure_translation_ready(target_lang:str):
     if settings.model_mode=="real_subtitles":
         from app.real_inference import model_paths
         try:
             model_paths(settings.whisper_model_path,settings.translation_model_path)
+            if settings.enable_khmer_dubbing and target_lang=="km":
+                from app.khmer_tts import require_tts_model
+                require_tts_model(settings.khmer_tts_model_path)
         except FileNotFoundError as exc:
             raise HTTPException(503,
-                "Offline ASR or translation model weights are not installed. "
+                "Offline ASR, translation or Khmer TTS model weights are not installed. "
                 "Download and validate the two models first.") from exc
     elif settings.model_mode!="demo":
         raise HTTPException(503,"Unsupported MODEL_MODE")
@@ -107,7 +119,7 @@ class JobCreate(BaseModel):
 @app.post("/api/jobs",status_code=202,dependencies=[Depends(authorize)])
 def create_job(payload:JobCreate,actor:dict=Depends(authorize)):
     if payload.source_lang==payload.target_lang:raise HTTPException(422,"Language pair must differ")
-    ensure_translation_ready()
+    ensure_translation_ready(payload.target_lang)
     with session() as db:
         media=db.get(MediaAsset,payload.media_id)
         if media is None or (not actor["admin"] and media.owner_user_id!=actor["user_id"]):
@@ -179,6 +191,7 @@ def format_job(job,media):
         "updated_at":job.updated_at.isoformat() if job.updated_at else None,
         "transcript":job.transcript,"translation":job.translation,
         "processing_mode":job.processing_mode,"has_subtitles":bool(job.subtitle_key),
+        "has_khmer_voice":bool(job.output_key and job.processing_mode=="real_subtitles" and job.target_lang=="km" and settings.enable_khmer_dubbing),
         "error":job.error,"has_output":bool(job.output_key),"mode":settings.model_mode,
     }
 
