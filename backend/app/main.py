@@ -83,7 +83,7 @@ def format_job(job,media):
     return {
         "id":job.id,"media_id":job.media_id,"filename":media.filename,
         "size_bytes":media.size_bytes,"status":job.status,
-        "progress":job.progress or 0,"stage":job.stage,
+        "progress":job.progress or 0,"stage":job.stage,"cancel_requested":bool(job.cancel_requested),
         "source_lang":job.source_lang,"target_lang":job.target_lang,
         "created_at":job.created_at.isoformat() if job.created_at else None,
         "updated_at":job.updated_at.isoformat() if job.updated_at else None,
@@ -145,6 +145,51 @@ def get_job(job_id:str):
         row=db.execute(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id).where(TranslationJob.id==job_id)).first()
         if row is None:raise HTTPException(404,"Not found")
         return format_job(*row)
+
+
+@app.post("/api/jobs/{job_id}/cancel",dependencies=[Depends(authorize)])
+def cancel_job(job_id:str):
+    with session() as db:
+        j=db.scalar(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update())
+        if j is None:raise HTTPException(404,"Job not found")
+        if j.status not in ("queued","processing","cancelling"):
+            raise HTTPException(409,"Job is not cancellable")
+        j.cancel_requested=True
+        if j.status=="queued":
+            j.status="cancelled"
+            j.stage="cancelled before execution"
+        else:
+            j.status="cancelling"
+            j.stage="cancellation requested"
+        db.commit()
+        return {"id":j.id,"status":j.status}
+
+@app.post("/api/jobs/{job_id}/retry",dependencies=[Depends(authorize)])
+def retry_job(job_id:str):
+    with session() as db:
+        j=db.scalar(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update())
+        if j is None:raise HTTPException(404,"Job not found")
+        if j.status not in ("failed","dispatch_failed","cancelled"):
+            raise HTTPException(409,"Only failed or cancelled jobs can be retried")
+        j.status="queued"
+        j.cancel_requested=False
+        j.progress=0
+        j.stage="queued for retry"
+        j.error=None
+        j.output_key=None
+        j.transcript=None
+        j.translation=None
+        db.commit()
+    try:translate_media.delay(job_id)
+    except Exception as exc:
+        with session() as db:
+            j=db.get(TranslationJob,job_id)
+            if j and j.status=="queued":
+                j.status="dispatch_failed"
+                j.error="Queue dispatch failed"
+                db.commit()
+        raise HTTPException(503,"Queue dispatch failed") from exc
+    return {"id":job_id,"status":"queued"}
 
 @app.get("/api/jobs/{job_id}/download",dependencies=[Depends(authorize)])
 def download(job_id:str):
