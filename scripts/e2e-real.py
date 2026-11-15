@@ -98,8 +98,8 @@ def main():
     status,headers,prefix=get(base,playback["video_url"],range_header="bytes=0-4095")
     if status!=206 or b"ftyp" not in prefix[:32]:
         raise RuntimeError("Translated MP4 cannot be previewed with byte ranges")
-    print("PASS: real ASR/MT returned target-script subtitles, SRT and playable seekable MP4")
-    print("NOTE: This verifies function, NOT translation quality, voice dubbing or perfect accuracy.")
+    print("PASS: real ASR/MT generated translated SRT and seekable MP4; Khmer dubbing artifact checked if enabled")
+    print("NOTE: Artifact existence does not prove audible Khmer quality, accurate translation, or synchronization.")
     print("Job:",jid)
     return 0
 
