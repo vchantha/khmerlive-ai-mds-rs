@@ -53,3 +53,13 @@ def test_webvtt_route_converts_khmer_srt(monkeypatch):
     assert r.status_code==200
     assert r.text.startswith("WEBVTT")
     assert "00:00:00.000 --> 00:00:01.500" in r.text
+
+
+def test_download_uses_streaming_attachment(monkeypatch):
+    monkeypatch.setattr(main,"playback_job",lambda job,token:("sample.mp4",None))
+    monkeypatch.setattr(main,"client",lambda:FakeS3())
+    with TestClient(app) as http:
+        r=http.get("/api/jobs/uuid/preview",params={"token":"a"*30,"download":"1"})
+    assert r.status_code==200
+    assert "attachment" in r.headers["content-disposition"]
+    assert r.headers["accept-ranges"]=="bytes"
