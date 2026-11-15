@@ -40,10 +40,9 @@ function App(){
   if(!currentKey.current)return;
   if(!silent)setLoading(true);
   try{
-   const params=new URLSearchParams({limit:String(limit),offset:String(qref.current),status:filter==='active'?'all':filter});
+   const params=new URLSearchParams({limit:String(limit),offset:String(qref.current),status:filter});
    const [q,m,s]=await Promise.all([req<QueueData>('/api/jobs?'+params),req<Metrics>('/api/dashboard'),req<SystemData>('/api/system')]);
-   const rows=filter==='active'?q.items.filter(j=>['queued','processing','cancelling'].includes(j.status)):q.items;
-   setQueue(rows);setTotal(q.total);setMetrics(m);setServices(s.services);setLastUpdate(new Date());
+   setQueue(q.items);setTotal(q.total);setMetrics(m);setServices(s.services);setLastUpdate(new Date());
    if(selectedRef.current){const j=await req<Job>('/api/jobs/'+selectedRef.current);setSelected(j)}
    if(!silent)setError('');
   }catch(e){setError(String(e))}
