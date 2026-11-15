@@ -155,6 +155,35 @@ curl -s http://localhost:8080/api/auth/me
 Migration `0006_user_social_auth` retains earlier jobs and adds nullable user ownership.
 Old jobs without an owner remain admin-key-visible only. **Never run `docker compose down -v` on existing production data.**
 
+## Video review, translated captions and URL near-live processing
+
+The redesigned Job Details panel now uses **real HTML5 video playback** with seeking, subtitles and transcription/translation text review. An authenticated user or trusted admin API key can mint a short-lived, job-specific playback grant; **the API key is not embedded in the video URL**. The player streams MP4 bytes using HTTP Range requests via S3 object storage. When real subtitle mode is enabled and the job completes, the player also requests a UTF-8 WebVTT track from the saved translated SRT. Video exports are normalized to **H.264 + AAC**, with selectable MP4 `mov_text` subtitle tracks for broad browser compatibility.
+
+The provider requires original audio. If the stream contains no intelligible speech, the job fails explicitly instead of fabricating a translation. Previous demo jobs may retain an unplayable codec; reprocessing them into new H.264/AAC output may be necessary.
+
+### Direct online URL translation (bounded near-live captions)
+
+With `MODEL_MODE=real_subtitles`, allowlisted public HTTP(S) MP4/HLS stream URLs are recorded in **closed chunks** (around 12 seconds). When a chunk closes, its audio is processed by the locally loaded offline ASR + MT models and partial translated text is persisted to PostgreSQL. The Job Details view refreshes approximately every 8 seconds, allowing intermediate caption text to appear as inference completes. At the end of the selected **15–120 second** capture, the segments are merged and exported to S3 as an MP4 with a translated subtitle track and downloadable SRT. Latency depends on CPU/GPU and actual model speed; **this is not continuous zero-latency simultaneous speech translation**.
+
+Server-side URL ingestion is **admin-only by default** (`STREAM_URL_ALLOW_USERS=false`). Administrators must supply an explicit `STREAM_ALLOWED_HOSTS` allowlist in the private `.env`. Re-enabling URL submission for ordinary social users without an egress firewall is not recommended: FFmpeg manifests/redirects can bypass a simple host allowlist, risking SSRF. Never allow untrusted public URLs on a network with unrestricted access to PostgreSQL, Redis, MinIO or cloud metadata.
+
+### Local model and browser E2E tests
+
+```bash
+# Demo mode: verify upload -> queue -> FFmpeg -> completed MP4 -> HTTP 206 preview
+python3 scripts/e2e-demo.py
+
+# Offline subtitle mode: requires approved model weights in models/asr, models/mt
+docker compose -f compose.yaml -f compose.real.yaml up -d --build
+docker compose -f compose.yaml -f compose.real.yaml run --rm --no-deps api pytest -q
+```
+
+Real-mode jobs are rejected with HTTP 503 when model files are absent, rather than falsely marked ready. Real-mode speech quality and end-to-end throughput have not been tested on your hardware. The pipeline creates **translated subtitles, not translated voice dubbing**.
+
+## Monthly model evaluation
+
+After placing real human-reviewed English/Khmer evaluation samples in the private `benchmarks/private/` directory, use [the monthly model quality benchmark](benchmarks/README.md) to measure source-language CER/WER, translated text chrF++, and inference duration for each direction. It can be scheduled on a trusted server each month, but the repository does not contain your dataset or automatically retrain model weights. No accuracy benchmark is fabricated. If you meant **a monthly paid AI model subscription** or **automatic monthly retraining**, please specify which: they require different architectures.
+
 ## API
 - `GET /api/health/live`, `GET /api/health/ready`
 - `GET /api/models` with `X-API-Key`
