@@ -11,7 +11,7 @@ def test_languages():
 
 def test_routes_exist():
     paths={r.path for r in app.routes}
-    assert {"/api/media","/api/jobs","/api/jobs/{job_id}","/api/health/live","/api/dashboard","/api/system"}.issubset(paths)
+    assert {"/api/media","/api/jobs","/api/jobs/{job_id}","/api/health/live","/api/dashboard","/api/system","/api/jobs/from-url","/api/jobs/{job_id}/cancel","/api/jobs/{job_id}/retry"}.issubset(paths)
 
 def test_job_serialization_contains_real_progress():
     from datetime import datetime,timezone
@@ -24,3 +24,12 @@ def test_job_serialization_contains_real_progress():
     assert data["progress"]==45
     assert data["stage"]=="demo transcription"
     assert data["has_output"] is False
+
+
+def test_url_job_input_constraints():
+    import pytest
+    from pydantic import ValidationError
+    from app.main import StreamJobCreate
+    assert StreamJobCreate(url="https://media.example.org/live/index.m3u8",source_lang="km",target_lang="en",capture_seconds=30).capture_seconds == 30
+    with pytest.raises(ValidationError):
+        StreamJobCreate(url="https://media.example.org/live/index.m3u8",source_lang="km",target_lang="en",capture_seconds=300)
