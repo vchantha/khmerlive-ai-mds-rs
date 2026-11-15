@@ -12,7 +12,7 @@ from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.tasks import translate_media
 
-app=FastAPI(title="KhmerLive AI — Research MVP",version="0.1.0")
+app=FastAPI(title="KhmerLive AI — Offline Translation Research MVP",version="0.2.0")
 
 def authorize(x_api_key:str|None=Header(default=None)):
     if not x_api_key or x_api_key!=settings.api_key:
@@ -32,7 +32,17 @@ def ready():
 
 @app.get("/api/models",dependencies=[Depends(authorize)])
 def models():
-    return {"mode":settings.model_mode,"genuine_translation_available":False,"note":"Demo-only pipeline. No real Khmer ASR/MT/TTS is bundled."}
+    from app.real_inference import model_paths
+    configured=False
+    if settings.model_mode=="real_subtitles":
+        try:
+            model_paths(settings.whisper_model_path,settings.translation_model_path)
+            configured=True
+        except FileNotFoundError:
+            configured=False
+    return {"mode":settings.model_mode,"subtitle_translation_configured":configured,
+            "speech_dubbing_available":False,
+            "note":"Real subtitle mode requires local Whisper/M2M100 weights and an AI worker. Speech dubbing is not implemented."}
 
 @app.post("/api/media",status_code=201,dependencies=[Depends(authorize)])
 async def upload(file:UploadFile=File(...)):
@@ -68,10 +78,12 @@ class JobCreate(BaseModel):
 @app.post("/api/jobs",status_code=202,dependencies=[Depends(authorize)])
 def create_job(payload:JobCreate):
     if payload.source_lang==payload.target_lang:raise HTTPException(422,"Language pair must differ")
+    if settings.model_mode not in ("demo","real_subtitles"):
+        raise HTTPException(503,"Unsupported model mode")
     with session() as db:
         if db.get(MediaAsset,payload.media_id) is None:raise HTTPException(404,"Media not found")
         jid=str(uuid.uuid4())
-        job=TranslationJob(id=jid,media_id=payload.media_id,source_lang=payload.source_lang,target_lang=payload.target_lang,status="queued")
+        job=TranslationJob(id=jid,media_id=payload.media_id,source_lang=payload.source_lang,target_lang=payload.target_lang,status="queued",processing_mode=settings.model_mode)
         db.add(job);db.commit()
     try:translate_media.delay(jid)
     except Exception as exc:
@@ -91,6 +103,8 @@ class StreamJobCreate(BaseModel):
 def create_url_job(payload:StreamJobCreate):
     if payload.source_lang==payload.target_lang:
         raise HTTPException(422,"Language pair must differ")
+    if settings.model_mode not in ("demo","real_subtitles"):
+        raise HTTPException(503,"Unsupported model mode")
     try:
         url=validate_stream_url(payload.url)
         seconds=capture_seconds_valid(payload.capture_seconds)
@@ -107,7 +121,8 @@ def create_url_job(payload:StreamJobCreate):
                           source_kind="url",capture_seconds=seconds))
         db.add(TranslationJob(id=jid,media_id=mid,
                               source_lang=payload.source_lang,target_lang=payload.target_lang,
-                              status="queued",progress=0,stage="waiting to capture URL"))
+                              status="queued",progress=0,stage="waiting to capture URL",
+                              processing_mode=settings.model_mode))
         db.commit()
     try:
         translate_media.delay(jid)
@@ -132,6 +147,7 @@ def format_job(job,media):
         "created_at":job.created_at.isoformat() if job.created_at else None,
         "updated_at":job.updated_at.isoformat() if job.updated_at else None,
         "transcript":job.transcript,"translation":job.translation,
+        "processing_mode":job.processing_mode,"has_subtitles":bool(job.subtitle_key),
         "error":job.error,"has_output":bool(job.output_key),"mode":settings.model_mode,
     }
 
@@ -222,6 +238,7 @@ def retry_job(job_id:str):
         j.stage="queued for retry"
         j.error=None
         j.output_key=None
+        j.subtitle_key=None
         j.transcript=None
         j.translation=None
         db.commit()
@@ -235,6 +252,21 @@ def retry_job(job_id:str):
                 db.commit()
         raise HTTPException(503,"Queue dispatch failed") from exc
     return {"id":job_id,"status":"queued"}
+
+@app.get("/api/jobs/{job_id}/subtitles",dependencies=[Depends(authorize)])
+def download_subtitles(job_id:str):
+    with session() as db:
+        j=db.get(TranslationJob,job_id)
+        if j is None or not j.subtitle_key:
+            raise HTTPException(404,"Translated subtitles not available")
+        key=j.subtitle_key
+    try:
+        obj=client().get_object(Bucket=settings.minio_bucket,Key=key)
+    except Exception as exc:
+        raise HTTPException(502,"Subtitle storage unavailable") from exc
+    return StreamingResponse(obj["Body"].iter_chunks(chunk_size=65536),
+        media_type="application/x-subrip; charset=utf-8",
+        headers={"Content-Disposition":f'attachment; filename="{job_id}.srt"'})
 
 @app.get("/api/jobs/{job_id}/download",dependencies=[Depends(authorize)])
 def download(job_id:str):
