@@ -2,7 +2,7 @@ import hashlib
 import uuid
 from contextlib import contextmanager
 from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header,Query,Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel,Field
 from sqlalchemy import select,text,func,or_
 from app.db import SessionLocal
@@ -11,6 +11,8 @@ from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.tasks import translate_media
+from app.media_preview import issue_playback_token,check_playback_token,parse_byte_range,srt_to_webvtt,InvalidPlaybackToken,InvalidByteRange
+from starlette.background import BackgroundTask
 from app.auth import router as auth_router, actor_from_request
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -293,6 +295,87 @@ def retry_job(job_id:str,actor:dict=Depends(authorize)):
                 db.commit()
         raise HTTPException(503,"Queue dispatch failed") from exc
     return {"id":job_id,"status":"queued"}
+
+@app.get("/api/jobs/{job_id}/player-token")
+def player_token(job_id:str,actor:dict=Depends(authorize)):
+    """Mint an expiring, job-scoped playback grant for HTML5 video/track tags.
+
+    HTML video tags cannot attach X-API-Key. This grant avoids exposing the
+    global API key in a URL and is constrained to one authorized job.
+    """
+    with session() as db:
+        job=owned_job(db,job_id,actor)
+        if job is None or job.status!="completed" or not job.output_key:
+            raise HTTPException(404,"Playable video not available")
+        grant=issue_playback_token(job.id,job.owner_user_id,settings.auth_session_secret,180)
+        return {"token":grant,"expires_in":180,
+                "video_url":f"/api/jobs/{job.id}/preview?token={grant}",
+                "captions_url":f"/api/jobs/{job.id}/captions.vtt?token={grant}" if job.subtitle_key else None}
+
+def playback_job(job_id:str,token:str):
+    with session() as db:
+        job=db.get(TranslationJob,job_id)
+        if job is None or job.status!="completed" or not job.output_key:
+            raise HTTPException(404,"Video not available")
+        try:
+            check_playback_token(token,job_id,job.owner_user_id,settings.auth_session_secret)
+        except InvalidPlaybackToken as exc:
+            raise HTTPException(403,"Playback grant expired or invalid") from exc
+        return job.output_key,job.subtitle_key
+
+@app.get("/api/jobs/{job_id}/preview")
+def preview_video(job_id:str,request:Request,token:str=Query(min_length=20,max_length=2048)):
+    key,_=playback_job(job_id,token)
+    s3=client()
+    try:
+        head=s3.head_object(Bucket=settings.minio_bucket,Key=key)
+        size=int(head["ContentLength"])
+    except Exception as exc:
+        raise HTTPException(502,"Media is currently unavailable") from exc
+    try:
+        byte_range=parse_byte_range(request.headers.get("range"),size)
+    except InvalidByteRange as exc:
+        raise HTTPException(416,"Invalid byte range",
+                            headers={"Content-Range":f"bytes */{size}"}) from exc
+    request_args={"Bucket":settings.minio_bucket,"Key":key}
+    if byte_range is not None:
+        request_args["Range"]=byte_range.s3_range
+    try:
+        response=s3.get_object(**request_args)
+    except Exception as exc:
+        raise HTTPException(502,"Media playback unavailable") from exc
+    body=response["Body"]
+    headers={"Accept-Ranges":"bytes","Content-Length":str(byte_range.length if byte_range else size),
+             "Content-Disposition":"inline","Cache-Control":"private, no-store",
+             "Referrer-Policy":"no-referrer","X-Content-Type-Options":"nosniff"}
+    if byte_range:
+        headers["Content-Range"]=byte_range.content_range
+    return StreamingResponse(body.iter_chunks(chunk_size=1024*256),
+        status_code=206 if byte_range else 200,media_type="video/mp4",
+        headers=headers,background=BackgroundTask(body.close))
+
+@app.get("/api/jobs/{job_id}/captions.vtt")
+def preview_captions(job_id:str,token:str=Query(min_length=20,max_length=2048)):
+    _,key=playback_job(job_id,token)
+    if not key:
+        raise HTTPException(404,"Translated captions not available")
+    try:
+        obj=client().get_object(Bucket=settings.minio_bucket,Key=key)
+        body=obj["Body"]
+        try:
+            raw=body.read(2_000_001)
+        finally:
+            body.close()
+    except Exception as exc:
+        raise HTTPException(502,"Caption storage unavailable") from exc
+    if len(raw)>2_000_000:
+        raise HTTPException(413,"Captions too large")
+    try:
+        captions=srt_to_webvtt(raw.decode("utf-8"))
+    except (UnicodeError,ValueError) as exc:
+        raise HTTPException(422,"Invalid subtitle format") from exc
+    return PlainTextResponse(captions,media_type="text/vtt; charset=utf-8",
+        headers={"Cache-Control":"private, no-store","Referrer-Policy":"no-referrer"})
 
 @app.get("/api/jobs/{job_id}/subtitles",dependencies=[Depends(authorize)])
 def download_subtitles(job_id:str,actor:dict=Depends(authorize)):
