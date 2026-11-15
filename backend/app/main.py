@@ -269,7 +269,7 @@ def cancel_job(job_id:str,actor:dict=Depends(authorize)):
 @app.post("/api/jobs/{job_id}/retry",dependencies=[Depends(authorize)])
 def retry_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        j=db.scalar(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update())
+        j=db.scalar(only_owned(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
         if j is None:raise HTTPException(404,"Job not found")
         if j.status not in ("failed","dispatch_failed","cancelled"):
             raise HTTPException(409,"Only failed or cancelled jobs can be retried")
