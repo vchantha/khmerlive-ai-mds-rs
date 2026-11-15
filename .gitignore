@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+dist/
+*.mp4
+*.wav
+*.sqlite
+models/*
+!models/.gitkeep
