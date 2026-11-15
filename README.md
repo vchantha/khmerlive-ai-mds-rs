@@ -1,9 +1,51 @@
 # KhmerLive AI — Docker Compose Research MVP
 
-Research foundation for offline English–Khmer simultaneous speech translation.
+**Research:** Uncertainty-Aware Adaptive Speech Segmentation for Low-Latency Offline English–Khmer Simultaneous Translation. [Notion roadmap](https://app.notion.com/p/41931200c90381c9bd02d240f29d9392).
 
-**Status:** Demo infrastructure only. ASR/MT return explicitly labelled demo placeholders; exported MP4 is unchanged original audio/video. Actual model inference and live streaming are not implemented or tested.
+> **Important: Infrastructure DEMO, not a working Khmer translator.** ASR and MT return explicit demo placeholders, and FFmpeg re-muxes the original audio/video unchanged. Khmer AI models, TTS, adaptive streaming and measured accuracy are not yet implemented. Never represent the exported video as dubbed or translated. This repo is a reproducible *Phase 0–1 service foundation*, not a completed research result.
 
-See the full Docker Compose source, documentation and scripts in this repository after the initial code import.
+## Services
+- React + Vite interface (Nginx on `http://localhost:8080`)
+- FastAPI HTTP API (internal port 8000)
+- Celery worker with Redis queue
+- PostgreSQL 16 (durable media/job records, Alembic migration)
+- MinIO (durable media/object storage)
+- FFmpeg worker pipeline (audio extraction and MP4 passthrough)
 
-[Research roadmap (Notion)](https://app.notion.com/p/41931200c90381c9bd02d240f29d9392)
+## Ubuntu 24.04 quick start
+Install Docker Engine and Compose v2 from official Docker packages. Run:
+
+```bash
+bash scripts/init-env.sh
+# This generates coherent random PostgreSQL/MinIO/API secrets. Do not commit .env.
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
+bash scripts/smoke.sh
+```
+
+Open `http://localhost:8080`, paste `API_KEY` from `.env`, upload an MP4 with audio, choose language direction, submit, refresh and download a **pass-through video**. No real translation will occur.
+
+## API
+- `GET /api/health/live`, `GET /api/health/ready`
+- `GET /api/models` with `X-API-Key`
+- `POST /api/media` multipart file with `X-API-Key`
+- `POST /api/jobs` JSON `{ "media_id":"...", "source_lang":"en", "target_lang":"km" }`
+- `GET /api/jobs`, `GET /api/jobs/{id}`, `GET /api/jobs/{id}/download`
+
+## Tests
+```bash
+docker compose run --rm --no-deps api pytest -q
+```
+This checks contracts, not full infrastructure integration. For CI without Docker, `cd backend && pip install -r requirements.txt && pytest -q` (requires dependency download).
+
+## Offline / air gap
+Runtime uses only local DB/Redis/MinIO and keeps model network flags disabled; however **the initial Docker build needs internet** for Docker images, npm, APT and Python packages. To deploy air-gapped, first pre-build/pull all images on an online host, run `docker image save` into tarballs, copy them securely to the air-gapped host and `docker load`. Verify checksums, base-image versions, model licenses, and that no services call outside endpoints. Compose alone does not enforce a network egress firewall.
+
+## Security and scope
+The demo uses a single API key and does not provide per-user RBAC; it is for a trusted internal research environment, not exposed public internet. Bind web to localhost using host firewall or update Compose port mapping for local-only development; use HTTPS gateway in production. Container images are tagged and should be further pinned by digest for reproducible production deployments.
+
+## Limitations / next milestone
+- No real Khmer/English ASR, MT, TTS, or live streaming yet.
+- No production outbox/lease/replay, tenant isolation, user authentication, rate limits, virus scanning, model provenance validation or rigorous E2E benchmarking.
+- See `docs/REAL_MODELS.md` for a realistic Phase 2 model integration strategy.
