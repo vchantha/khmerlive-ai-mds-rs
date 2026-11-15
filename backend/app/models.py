@@ -20,6 +20,8 @@ class TranslationJob(Base):
     source_lang:Mapped[str]=mapped_column(String(2))
     target_lang:Mapped[str]=mapped_column(String(2))
     status:Mapped[str]=mapped_column(String(32),default="queued")
+    progress:Mapped[int]=mapped_column(default=0)
+    stage:Mapped[str|None]=mapped_column(String(64),nullable=True)
     error:Mapped[str|None]=mapped_column(Text,nullable=True)
     transcript:Mapped[str|None]=mapped_column(Text,nullable=True)
     translation:Mapped[str|None]=mapped_column(Text,nullable=True)
