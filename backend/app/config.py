@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
     max_upload_mb:int=1024
+    max_video_duration_seconds:int=600
     stream_url_allow_users:bool=False
     @model_validator(mode="after")
     def protect_session_secret(self):
