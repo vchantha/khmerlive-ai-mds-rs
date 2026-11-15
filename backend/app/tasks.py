@@ -10,6 +10,7 @@ from app.models import TranslationJob,MediaAsset
 from app.storage import client
 from app.adapters import get_adapters
 from app.real_inference import translate_audio, build_srt, TimedText
+from app.khmer_tts import build_dubbed_audio
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
@@ -156,11 +157,13 @@ def translate_media(self,job_id:str):
                         str(round(clip_seconds))+" seconds (limit "+
                         str(settings.max_video_duration_seconds)+"s)")
                 subtitle_path=root/"translated.srt"
+                rows_for_dubbing=None
                 if streamed_rows is not None:
                     # The streaming URL path has already produced real captions.
                     text=" ".join(row.source_text for row in streamed_rows)
                     translated=" ".join(row.target_text for row in streamed_rows)
                     subtitle_path.write_text(build_srt(streamed_rows),encoding="utf-8")
+                    rows_for_dubbing=streamed_rows
                 else:
                     set_state(db,job,"processing",progress=25,stage="extracting audio")
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
@@ -176,6 +179,7 @@ def translate_media(self,job_id:str):
                         text=" ".join(row.source_text for row in rows)
                         translated=" ".join(row.target_text for row in rows)
                         subtitle_path.write_text(build_srt(rows),encoding="utf-8")
+                        rows_for_dubbing=rows
                     else:
                         set_state(db,job,"processing",progress=45,stage="demo transcription")
                         text=asr.transcribe(audio,job.source_lang).text
@@ -186,15 +190,29 @@ def translate_media(self,job_id:str):
                 # Reuse the duration probed above; transcodes scale with length.
                 mux_timeout=max(1800,int(clip_seconds*1.5))
                 if mode=="real_subtitles":
-                    # Preserve original speech, add selectable translated subtitle track.
-                    subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
-                        "-i",str(source),"-i",str(subtitle_path),
-                        "-map","0:v:0","-map","0:a:0?","-map","1:0",
-                        *codec_args,
-                        "-c:s","mov_text",
+                    # EN→KM voice dub: replace the original English audio, never mix
+                    # it back in or silently claim a translated voice.
+                    dubbing=settings.enable_khmer_dubbing and job.target_lang=="km"
+                    audio_args=[]
+                    if dubbing:
+                        set_state(db,job,"processing",progress=70,stage="synthesizing Khmer voice")
+                        dubbed=root/"khmer-dub.wav"
+                        build_dubbed_audio(rows_for_dubbing or [],dubbed,clip_seconds,
+                                           settings.khmer_tts_model_path,settings.inference_device)
+                        check_cancel(db,job)
+                        audio_args=["-i",str(dubbed)]
+                    cmd=["ffmpeg","-v","error","-nostdin","-y",
+                         "-i",str(source),"-i",str(subtitle_path),*audio_args,
+                         "-map","0:v:0","-map",("2:a:0" if dubbing else "0:a:0?"),
+                         "-map","1:0",*codec_args]
+                    if dubbing:
+                        # Force AAC encoding even if source audio is AAC.
+                        cmd.extend(["-c:a","aac","-b:a","160k"])
+                    cmd.extend(["-c:s","mov_text",
                         "-metadata:s:s:0","language="+("khm" if job.target_lang=="km" else "eng"),
                         "-disposition:s:0","default","-movflags","+faststart",
-                        str(result)],check=True,timeout=mux_timeout)
+                        str(result)])
+                    subprocess.run(cmd,check=True,timeout=mux_timeout)
                 else:
                     # DEMO ONLY. No translation or dubbing.
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
@@ -211,6 +229,9 @@ def translate_media(self,job_id:str):
                     raise RuntimeError("Playable H.264 video stream was not created")
                 if mode=="real_subtitles" and not any(s.get("codec_type")=="subtitle" and s.get("codec_name")=="mov_text" for s in tracks):
                     raise RuntimeError("Translated subtitle stream was not attached to the MP4")
+                if mode=="real_subtitles" and settings.enable_khmer_dubbing and job.target_lang=="km":
+                    if not any(s.get("codec_type")=="audio" and s.get("codec_name")=="aac" for s in tracks):
+                        raise RuntimeError("Khmer-dubbed AAC audio stream was not created")
                 key=f"outputs/{job.id}.mp4"
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=85,stage="publishing output")
