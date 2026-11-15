@@ -336,7 +336,7 @@ def playback_job(job_id:str,token:str):
         return job.output_key,job.subtitle_key
 
 @app.get("/api/jobs/{job_id}/preview")
-def preview_video(job_id:str,request:Request,token:str=Query(min_length=20,max_length=2048)):
+def preview_video(job_id:str,request:Request,token:str=Query(min_length=20,max_length=2048),download:bool=False):
     key,_=playback_job(job_id,token)
     s3=client()
     try:
@@ -358,7 +358,8 @@ def preview_video(job_id:str,request:Request,token:str=Query(min_length=20,max_l
         raise HTTPException(502,"Media playback unavailable") from exc
     body=response["Body"]
     headers={"Accept-Ranges":"bytes","Content-Length":str(byte_range.length if byte_range else size),
-             "Content-Disposition":"inline","Cache-Control":"private, no-store",
+             "Content-Disposition":(f'attachment; filename="{job_id}.mp4"' if download else "inline"),
+             "Cache-Control":"private, no-store",
              "Referrer-Policy":"no-referrer","X-Content-Type-Options":"nosniff"}
     if byte_range:
         headers["Content-Range"]=byte_range.content_range
