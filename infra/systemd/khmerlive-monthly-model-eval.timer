@@ -1,0 +1,10 @@
+[Unit]
+Description=Run KhmerLive AI translation quality benchmarks monthly
+
+[Timer]
+OnCalendar=*-*-01 03:00:00
+Persistent=true
+Unit=khmerlive-monthly-model-eval.service
+
+[Install]
+WantedBy=timers.target
