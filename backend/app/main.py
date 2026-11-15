@@ -141,7 +141,7 @@ def dashboard():
         rows=db.execute(select(TranslationJob.status,func.count(TranslationJob.id)).group_by(TranslationJob.status)).all()
         counts=dict(rows)
     return {"total":sum(counts.values()),"queued":counts.get("queued",0),
-        "processing":counts.get("processing",0),"completed":counts.get("completed",0),
+        "processing":counts.get("processing",0)+counts.get("cancelling",0),"completed":counts.get("completed",0),
         "failed":counts.get("failed",0)+counts.get("dispatch_failed",0),
         "by_status":counts,"mode":settings.model_mode}
 
