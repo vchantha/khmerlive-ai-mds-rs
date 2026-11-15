@@ -9,6 +9,7 @@ from app.db import SessionLocal
 from app.models import MediaAsset,TranslationJob
 from app.storage import client
 from app.config import settings
+from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.tasks import translate_media
 
 app=FastAPI(title="KhmerLive AI — Research MVP",version="0.1.0")
@@ -79,10 +80,53 @@ def create_job(payload:JobCreate):
         raise HTTPException(503,"Queue temporarily unavailable") from exc
     return {"job_id":jid,"status":"queued","mode":settings.model_mode}
 
+
+class StreamJobCreate(BaseModel):
+    url:str=Field(min_length=8,max_length=2048)
+    source_lang:str=Field(pattern="^(en|km)$")
+    target_lang:str=Field(pattern="^(en|km)$")
+    capture_seconds:int=Field(default=30,ge=5,le=120)
+
+@app.post("/api/jobs/from-url",status_code=202,dependencies=[Depends(authorize)])
+def create_url_job(payload:StreamJobCreate):
+    if payload.source_lang==payload.target_lang:
+        raise HTTPException(422,"Language pair must differ")
+    try:
+        url=validate_stream_url(payload.url)
+        seconds=capture_seconds_valid(payload.capture_seconds)
+    except StreamURLRejected as ex:
+        raise HTTPException(422,str(ex)) from ex
+    mid=str(uuid.uuid4())
+    jid=str(uuid.uuid4())
+    # Store URL only in PostgreSQL, not in API job responses or logs.
+    with session() as db:
+        db.add(MediaAsset(id=mid,filename="URL Capture "+mid[:8]+".mp4",
+                          object_key="uploads/"+mid+".mp4",
+                          content_type="video/mp4",size_bytes=0,
+                          sha256="pending",source_url=url,
+                          source_kind="url",capture_seconds=seconds))
+        db.add(TranslationJob(id=jid,media_id=mid,
+                              source_lang=payload.source_lang,target_lang=payload.target_lang,
+                              status="queued",progress=0,stage="waiting to capture URL"))
+        db.commit()
+    try:
+        translate_media.delay(jid)
+    except Exception as exc:
+        with session() as db:
+            job=db.get(TranslationJob,jid)
+            if job:
+                job.status="dispatch_failed"
+                job.error="Queue dispatch failed"
+                db.commit()
+        raise HTTPException(503,"Queue dispatch failed") from exc
+    return {"job_id":jid,"status":"queued","source_kind":"url",
+            "capture_seconds":seconds,"mode":settings.model_mode}
+
 def format_job(job,media):
     return {
         "id":job.id,"media_id":job.media_id,"filename":media.filename,
-        "size_bytes":media.size_bytes,"status":job.status,
+        "size_bytes":media.size_bytes,"source_kind":media.source_kind,
+        "capture_seconds":media.capture_seconds,"status":job.status,
         "progress":job.progress or 0,"stage":job.stage,"cancel_requested":bool(job.cancel_requested),
         "source_lang":job.source_lang,"target_lang":job.target_lang,
         "created_at":job.created_at.isoformat() if job.created_at else None,
