@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
 from sqlalchemy import select,text,func,or_
 from app.db import SessionLocal
-from app.models import MediaAsset,TranslationJob
+from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity
 from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
@@ -178,6 +178,27 @@ def dashboard(actor:dict=Depends(authorize)):
         "processing":counts.get("processing",0)+counts.get("cancelling",0),"completed":counts.get("completed",0),
         "failed":counts.get("failed",0)+counts.get("dispatch_failed",0),
         "by_status":counts,"mode":settings.model_mode}
+
+@app.get("/api/users",dependencies=[Depends(authorize)])
+def list_registered_users(actor:dict=Depends(authorize),
+                          limit:int=Query(25,ge=1,le=100),offset:int=Query(0,ge=0)):
+    # Admin-only directory; ordinary social users can view only their own profile.
+    if not actor["admin"]:
+        raise HTTPException(403,"Admin access required for user directory")
+    with session() as db:
+        total=db.scalar(select(func.count(AppUser.id))) or 0
+        users=db.scalars(select(AppUser).order_by(AppUser.created_at.desc())
+                         .limit(limit).offset(offset)).all()
+        user_ids=[u.id for u in users]
+        identities=db.scalars(select(SocialIdentity).where(
+            SocialIdentity.user_id.in_(user_ids))).all() if user_ids else []
+        provider_map={}
+        for identity in identities:
+            provider_map.setdefault(identity.user_id,[]).append(identity.provider)
+        return {"total":total,"limit":limit,"offset":offset,
+                "items":[{"id":u.id,"display_name":u.display_name,"email":u.email,
+                          "created_at":u.created_at.isoformat() if u.created_at else None,
+                          "providers":provider_map.get(u.id,[])} for u in users]}
 
 @app.get("/api/system",dependencies=[Depends(authorize)])
 def system_status():
