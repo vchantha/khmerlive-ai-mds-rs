@@ -9,3 +9,7 @@ dist/
 *.sqlite
 models/*
 !models/.gitkeep
+
+# Private benchmarks and evaluated reports (contain customer speech/text)
+benchmarks/private/
+benchmarks/reports/
