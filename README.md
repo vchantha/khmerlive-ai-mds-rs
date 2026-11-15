@@ -78,6 +78,29 @@ docker compose run --rm --no-deps api pytest -q
 docker compose logs --tail=100 api worker web
 ```
 
+## Streaming video by URL (HTTP(S) / HLS)
+
+The redesigned **Start a new job** panel supports two inputs: **Upload MP4** and **Stream by URL**. The URL mode accepts approved public HTTP(S) MP4 and HLS `.m3u8` streams, captures a short 5–120 second excerpt (UI presets: 15, 30, 60, 120), saves the MP4 to object storage and adds a processing job to the **real PostgreSQL queue**. The generated demo output keeps the original audio; it is **not live translation**.
+
+URL mode is **disabled by default**. In your existing private server `.env`, set an explicit comma-separated allowlist of public domain names you control or are authorized to ingest, for example:
+
+```env
+STREAM_ALLOWED_HOSTS=media.example.org,cdn.example.org
+```
+
+Replace example domains with your actual stream hostnames. This list is an authorization boundary, **not** a complete network sandbox: FFmpeg may follow stream manifests and redirects that reference other destinations, so enforce outbound firewall/egress ACLs and deny private networks at the host/network layer. Do not allow untrusted public users to submit URLs. URL input rejects non-HTTP(S), credentials in URL authority, unusual ports, unlisted hosts and hosts with private DNS answers. Only ingest streams that you are permitted to access.
+
+Restart after updating `.env` and pulling the newest code:
+
+```bash
+git pull origin main
+docker compose up -d --build
+docker compose exec migrate alembic current || true
+docker compose logs --tail=80 api worker
+```
+
+The automatic migration `0004_stream_url` adds the source URL and capture settings to PostgreSQL, and captures use the existing S3-compatible storage. Stream URLs may contain secrets as query parameters: avoid authenticated/signed URLs in this MVP because the URL is stored in PostgreSQL. RTSP, RTMP, YouTube **webpage links**, DRM-protected services and continuous WebRTC/RTMP translation are **not supported**. Streaming input needs access to the source over your network; a fully air-gapped deployment can only access streams hosted on its permitted local network, which would require explicitly reviewed network policy.
+
 ## API
 - `GET /api/health/live`, `GET /api/health/ready`
 - `GET /api/models` with `X-API-Key`
