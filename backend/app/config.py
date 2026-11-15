@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     api_key:str="development_only_key"
     model_mode:str="demo"
     inference_device:str="cpu"
+    auth_session_secret:str="replace_with_generated_session_secret"
+    auth_public_base_url:str="http://localhost:8080"
+    auth_cookie_secure:bool=False
+    google_client_id:str=""
+    google_client_secret:str=""
+    facebook_client_id:str=""
+    facebook_client_secret:str=""
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
     max_upload_mb:int=1024
