@@ -19,13 +19,13 @@ oauth=OAuth()
 
 def providers():
     result=[]
-    for name in ("google","facebook"):
+    for name in ("google","facebook","github"):
         ready=bool(getattr(settings,f"{name}_client_id") and getattr(settings,f"{name}_client_secret"))
         result.append({"id":name,"name":name.capitalize(),"enabled":ready})
     return result
 
 def client_for(name:str):
-    if name not in ("google","facebook"):
+    if name not in ("google","facebook","github"):
         raise HTTPException(404,"Unknown login provider")
     if not getattr(settings,f"{name}_client_id") or not getattr(settings,f"{name}_client_secret"):
         raise HTTPException(503,f"{name.capitalize()} sign-in is not configured")
@@ -38,6 +38,11 @@ def client_for(name:str):
     if name=="google":
         params.update(server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
                       client_kwargs={"scope":"openid email profile"})
+    elif name=="github":
+        params.update(authorize_url="https://github.com/login/oauth/authorize",
+                      access_token_url="https://github.com/login/oauth/access_token",
+                      api_base_url="https://api.github.com/",
+                      client_kwargs={"scope":"read:user user:email"})
     else:
         params.update(authorize_url="https://www.facebook.com/v21.0/dialog/oauth",
                       access_token_url="https://graph.facebook.com/v21.0/oauth/access_token",
@@ -109,6 +114,14 @@ async def callback(request:Request,provider:str):
             name=str(profile.get("name") or "Google user")[:200]
             email=str(profile.get("email") or "")[:320] or None
             avatar=str(profile.get("picture") or "")[:1000] or None
+        elif provider=="github":
+            resp=await client.get("user",token=token)
+            resp.raise_for_status()
+            profile=resp.json()
+            subject=str(profile["id"])
+            name=str(profile.get("name") or profile.get("login") or "GitHub user")[:200]
+            email=str(profile.get("email") or "")[:320] or None
+            avatar=str(profile.get("avatar_url") or "")[:1000] or None
         else:
             resp=await client.get("me",params={"fields":"id,name,email,picture"},token=token)
             resp.raise_for_status()
