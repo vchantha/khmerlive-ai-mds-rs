@@ -107,7 +107,7 @@ def ensure_translation_ready(target_lang:str):
         except FileNotFoundError as exc:
             raise HTTPException(503,
                 "Offline ASR, translation or Khmer TTS model weights are not installed. "
-                "Download and validate the two models first.") from exc
+                "Download and validate all required offline models first.") from exc
     elif settings.model_mode!="demo":
         raise HTTPException(503,"Unsupported MODEL_MODE")
 
@@ -191,7 +191,7 @@ def format_job(job,media):
         "updated_at":job.updated_at.isoformat() if job.updated_at else None,
         "transcript":job.transcript,"translation":job.translation,
         "processing_mode":job.processing_mode,"has_subtitles":bool(job.subtitle_key),
-        "has_khmer_voice":bool(job.output_key and job.processing_mode=="real_subtitles" and job.target_lang=="km" and settings.enable_khmer_dubbing),
+        "has_khmer_voice":bool(job.output_key and job.output_key.endswith(".khmer-dubbed.mp4")),
         "error":job.error,"has_output":bool(job.output_key),"mode":settings.model_mode,
     }
 
