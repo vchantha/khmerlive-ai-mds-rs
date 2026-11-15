@@ -12,6 +12,8 @@ from huggingface_hub import HfApi, snapshot_download
 CANDIDATES = {
     "asr": ("Systran/faster-whisper-small", "mit"),
     "mt": ("facebook/m2m100_418M", "mit"),
+    # Research use only: CC-BY-NC-4.0 prohibits commercial use without rights.
+    "tts": ("facebook/mms-tts-khm", "cc-by-nc-4.0"),
 }
 
 def main():
@@ -19,6 +21,7 @@ def main():
     parser.add_argument("--output", default="models")
     parser.add_argument("--asr-revision", default=None, help="40-character Git commit SHA")
     parser.add_argument("--mt-revision", default=None, help="40-character Git commit SHA")
+    parser.add_argument("--tts-revision", default=None, help="40-character Git commit SHA")
     args = parser.parse_args()
     root = Path(args.output)
     root.mkdir(parents=True, exist_ok=True)
