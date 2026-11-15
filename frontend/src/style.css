@@ -56,3 +56,17 @@
  .account-profile{flex-wrap:wrap}
  .account-profile button{width:100%}
 }
+
+
+/* Secure HTML5 playback and translated caption review */
+.preview-ready{background:#101828;border-radius:10px;overflow:hidden;margin-bottom:12px;min-height:200px}
+.preview-video{display:block;width:100%;max-height:420px;background:#101828;aspect-ratio:16/9;object-fit:contain}
+.preview-banner{color:#e9efff;background:#263344;padding:9px 12px;font-size:11px;line-height:1.5}
+.preview-ready .preview{border-radius:0;min-height:200px}
+.preview-ready .preview small{max-width:100%;overflow-wrap:anywhere}
+.translation-review{margin:18px 0 7px;border:1px solid #d0d5dd;background:#f8fafc;border-radius:10px;overflow:hidden}
+.translation-review summary{padding:13px 12px;font-size:12px;font-weight:700;color:#344054;cursor:pointer}
+.translation-review>div{border-top:1px solid #e4e7ec;padding:12px;max-height:260px;overflow-y:auto}
+.translation-review strong{font-size:11px;color:#344054}
+.translation-review p{font-size:12px;color:#475467;line-height:1.7;white-space:pre-line;overflow-wrap:anywhere;margin:7px 0 16px}
+@media(max-width:760px){.preview-video{max-height:300px}}
