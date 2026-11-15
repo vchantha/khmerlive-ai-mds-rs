@@ -1,7 +1,7 @@
 import hashlib
 import uuid
 from contextlib import contextmanager
-from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header,Query
+from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header,Query,Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
 from sqlalchemy import select,text,func,or_
@@ -11,12 +11,27 @@ from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.tasks import translate_media
+from app.auth import router as auth_router, actor_from_request
+from starlette.middleware.sessions import SessionMiddleware
 
-app=FastAPI(title="KhmerLive AI — Offline Translation Research MVP",version="0.2.0")
+app=FastAPI(title="KhmerLive AI — Offline Translation Research MVP",version="0.3.0")
+app.add_middleware(SessionMiddleware,secret_key=settings.auth_session_secret,
+                   session_cookie="khmerlive_session",same_site="lax",
+                   https_only=settings.auth_cookie_secure,max_age=86400*14)
+app.include_router(auth_router)
 
-def authorize(x_api_key:str|None=Header(default=None)):
-    if not x_api_key or x_api_key!=settings.api_key:
-        raise HTTPException(status_code=401,detail="Invalid API key")
+def authorize(request:Request,x_api_key:str|None=Header(default=None)):
+    return actor_from_request(request,x_api_key)
+
+def only_owned(query, actor, table):
+    if actor["admin"]:
+        return query
+    return query.where(table.owner_user_id==actor["user_id"])
+
+def owned_job(db, job_id, actor):
+    q=only_owned(select(TranslationJob).where(TranslationJob.id==job_id),actor,TranslationJob)
+    return db.scalar(q)
+
 
 @contextmanager
 def session():
@@ -45,7 +60,7 @@ def models():
             "note":"Real subtitle mode requires local Whisper/M2M100 weights and an AI worker. Speech dubbing is not implemented."}
 
 @app.post("/api/media",status_code=201,dependencies=[Depends(authorize)])
-async def upload(file:UploadFile=File(...)):
+async def upload(file:UploadFile=File(...),actor:dict=Depends(authorize)):
     name=(file.filename or "upload.mp4").rsplit("/",1)[-1][:255]
     if not name.lower().endswith(".mp4") or file.content_type not in ("video/mp4","application/octet-stream"):
         raise HTTPException(415,"Only MP4 videos supported")
@@ -66,7 +81,7 @@ async def upload(file:UploadFile=File(...)):
         mid=str(uuid.uuid4());key=f"uploads/{mid}.mp4"
         client().upload_fileobj(tmp,settings.minio_bucket,key,ExtraArgs={"ContentType":"video/mp4"})
     with session() as db:
-        obj=MediaAsset(id=mid,filename=name,object_key=key,content_type="video/mp4",size_bytes=size,sha256=digest.hexdigest())
+        obj=MediaAsset(id=mid,filename=name,object_key=key,content_type="video/mp4",size_bytes=size,sha256=digest.hexdigest(),owner_user_id=actor["user_id"])
         db.add(obj);db.commit()
     return {"media_id":mid,"size_bytes":size,"sha256":digest.hexdigest()}
 
@@ -76,14 +91,16 @@ class JobCreate(BaseModel):
     target_lang:str=Field(pattern="^(en|km)$")
 
 @app.post("/api/jobs",status_code=202,dependencies=[Depends(authorize)])
-def create_job(payload:JobCreate):
+def create_job(payload:JobCreate,actor:dict=Depends(authorize)):
     if payload.source_lang==payload.target_lang:raise HTTPException(422,"Language pair must differ")
     if settings.model_mode not in ("demo","real_subtitles"):
         raise HTTPException(503,"Unsupported model mode")
     with session() as db:
-        if db.get(MediaAsset,payload.media_id) is None:raise HTTPException(404,"Media not found")
+        media=db.get(MediaAsset,payload.media_id)
+        if media is None or (not actor["admin"] and media.owner_user_id!=actor["user_id"]):
+            raise HTTPException(404,"Media not found")
         jid=str(uuid.uuid4())
-        job=TranslationJob(id=jid,media_id=payload.media_id,source_lang=payload.source_lang,target_lang=payload.target_lang,status="queued",processing_mode=settings.model_mode)
+        job=TranslationJob(id=jid,media_id=payload.media_id,source_lang=payload.source_lang,target_lang=payload.target_lang,status="queued",processing_mode=settings.model_mode,owner_user_id=actor["user_id"])
         db.add(job);db.commit()
     try:translate_media.delay(jid)
     except Exception as exc:
@@ -100,7 +117,7 @@ class StreamJobCreate(BaseModel):
     capture_seconds:int=Field(default=30,ge=5,le=120)
 
 @app.post("/api/jobs/from-url",status_code=202,dependencies=[Depends(authorize)])
-def create_url_job(payload:StreamJobCreate):
+def create_url_job(payload:StreamJobCreate,actor:dict=Depends(authorize)):
     if payload.source_lang==payload.target_lang:
         raise HTTPException(422,"Language pair must differ")
     if settings.model_mode not in ("demo","real_subtitles"):
@@ -117,12 +134,12 @@ def create_url_job(payload:StreamJobCreate):
         db.add(MediaAsset(id=mid,filename="URL Capture "+mid[:8]+".mp4",
                           object_key="uploads/"+mid+".mp4",
                           content_type="video/mp4",size_bytes=0,
-                          sha256="pending",source_url=url,
+                          sha256="pending",source_url=url,owner_user_id=actor["user_id"],
                           source_kind="url",capture_seconds=seconds))
         db.add(TranslationJob(id=jid,media_id=mid,
                               source_lang=payload.source_lang,target_lang=payload.target_lang,
                               status="queued",progress=0,stage="waiting to capture URL",
-                              processing_mode=settings.model_mode))
+                              processing_mode=settings.model_mode,owner_user_id=actor["user_id"]))
         db.commit()
     try:
         translate_media.delay(jid)
@@ -152,9 +169,10 @@ def format_job(job,media):
     }
 
 @app.get("/api/dashboard",dependencies=[Depends(authorize)])
-def dashboard():
+def dashboard(actor:dict=Depends(authorize)):
     with session() as db:
-        rows=db.execute(select(TranslationJob.status,func.count(TranslationJob.id)).group_by(TranslationJob.status)).all()
+        q=only_owned(select(TranslationJob.status,func.count(TranslationJob.id)),actor,TranslationJob)
+        rows=db.execute(q.group_by(TranslationJob.status)).all()
         counts=dict(rows)
     return {"total":sum(counts.values()),"queued":counts.get("queued",0),
         "processing":counts.get("processing",0)+counts.get("cancelling",0),"completed":counts.get("completed",0),
@@ -184,9 +202,10 @@ def system_status():
 
 @app.get("/api/jobs",dependencies=[Depends(authorize)])
 def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
-              status:str|None=Query(None),search:str|None=Query(None,max_length=200)):
+              status:str|None=Query(None),search:str|None=Query(None,max_length=200),
+              actor:dict=Depends(authorize)):
     with session() as db:
-        q=select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id)
+        q=only_owned(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id),actor,TranslationJob)
         if status and status!="all":
             if status=="active":q=q.where(TranslationJob.status.in_(["queued","processing","cancelling"]))
             elif status=="failed":q=q.where(TranslationJob.status.in_(["failed","dispatch_failed"]))
@@ -201,17 +220,18 @@ def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
         return {"items":[format_job(j,m) for j,m in rows],"total":total,"limit":limit,"offset":offset}
 
 @app.get("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
-def get_job(job_id:str):
+def get_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        row=db.execute(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id).where(TranslationJob.id==job_id)).first()
+        q=only_owned(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id).where(TranslationJob.id==job_id),actor,TranslationJob)
+        row=db.execute(q).first()
         if row is None:raise HTTPException(404,"Not found")
         return format_job(*row)
 
 
 @app.post("/api/jobs/{job_id}/cancel",dependencies=[Depends(authorize)])
-def cancel_job(job_id:str):
+def cancel_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        j=db.scalar(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update())
+        j=db.scalar(only_owned(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
         if j is None:raise HTTPException(404,"Job not found")
         if j.status not in ("queued","processing","cancelling"):
             raise HTTPException(409,"Job is not cancellable")
@@ -226,7 +246,7 @@ def cancel_job(job_id:str):
         return {"id":j.id,"status":j.status}
 
 @app.post("/api/jobs/{job_id}/retry",dependencies=[Depends(authorize)])
-def retry_job(job_id:str):
+def retry_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
         j=db.scalar(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update())
         if j is None:raise HTTPException(404,"Job not found")
@@ -254,9 +274,9 @@ def retry_job(job_id:str):
     return {"id":job_id,"status":"queued"}
 
 @app.get("/api/jobs/{job_id}/subtitles",dependencies=[Depends(authorize)])
-def download_subtitles(job_id:str):
+def download_subtitles(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        j=db.get(TranslationJob,job_id)
+        j=owned_job(db,job_id,actor)
         if j is None or not j.subtitle_key:
             raise HTTPException(404,"Translated subtitles not available")
         key=j.subtitle_key
@@ -269,9 +289,9 @@ def download_subtitles(job_id:str):
         headers={"Content-Disposition":f'attachment; filename="{job_id}.srt"'})
 
 @app.get("/api/jobs/{job_id}/download",dependencies=[Depends(authorize)])
-def download(job_id:str):
+def download(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        j=db.get(TranslationJob,job_id)
+        j=owned_job(db,job_id,actor)
         if not j or not j.output_key:raise HTTPException(404,"Output not found")
         key=j.output_key
     try:response=client().get_object(Bucket=settings.minio_bucket,Key=key)
