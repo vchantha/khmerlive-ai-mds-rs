@@ -54,7 +54,7 @@ Open `http://localhost:8080`, paste `API_KEY` from `.env`, upload an MP4 with au
 
 ## Dashboard UI / queue monitoring
 
-The redesigned dark-mode interface is served on `http://localhost:8080`. It provides:
+The redesigned light enterprise dashboard interface is served on `http://localhost:8080`. It provides:
 - Dashboard counters computed from **actual PostgreSQL jobs**, with no sample metrics.
 - MP4 upload drag-and-drop, source-language selector, API-key session dialog, and real upload progress.
 - Live queue with server-side search, status filtering, pagination and 8-second auto-refresh.
@@ -100,6 +100,60 @@ docker compose logs --tail=80 api worker
 ```
 
 The automatic migration `0004_stream_url` adds the source URL and capture settings to PostgreSQL, and captures use the existing S3-compatible storage. Stream URLs may contain secrets as query parameters: avoid authenticated/signed URLs in this MVP because the URL is stored in PostgreSQL. RTSP, RTMP, YouTube **webpage links**, DRM-protected services and continuous WebRTC/RTMP translation are **not supported**. Streaming input needs access to the source over your network; a fully air-gapped deployment can only access streams hosted on its permitted local network, which would require explicitly reviewed network policy.
+
+
+## Real English ↔ Khmer subtitle translation (optional, model weights required)
+
+The service is still configured in `demo` mode by default for safe upgrades.
+A separate Compose override (`compose.real.yaml`) adds **Whisper ASR + M2M100 translation**,
+outputs UTF-8 translated SRT files and an MP4 containing a selectable subtitle track.
+**Audio remains unchanged. Khmer voice dubbing, alignment, production-grade streaming ASR and model-quality validation are NOT implemented.**
+
+1. On a **network-connected staging machine** with sufficient disk/RAM, install:
+   `python3 -m pip install 'huggingface-hub==0.30.2'`.
+2. From repository root run `python3 scripts/download-models.py --output models`.
+   This resolves model repositories to immutable revisions, writes model hashes and downloads
+   `Systran/faster-whisper-small` and `facebook/m2m100_418M` locally.
+   **Review exact model licenses, upstream terms, provenance and the model revisions before any business use.**
+   Evaluate Khmer and English accuracy independently; do not assume a usable result from this unbenchmarked model pair.
+3. Check `models/asr/model.bin`, `models/mt/config.json` and `models/manifest.lock.json` exist. Transfer the entire model bundle securely to the target computer. Do not commit weights or `.env` into Git.
+4. Enable local inference with:
+
+```bash
+docker compose -f compose.yaml -f compose.real.yaml up -d --build
+docker compose -f compose.yaml -f compose.real.yaml ps -a
+docker compose -f compose.yaml -f compose.real.yaml run --rm --no-deps api pytest -q
+```
+
+5. Log into the UI, upload a short English MP4 containing **clearly spoken audio**, wait for Completed and download the MP4 and SRT. Select **English** as spoken language. Subtitle tracks are selectable by the player; they are **not burned-in captions**.
+   For a local WAV inference test, use `scripts/selftest-real.py` in a worker with the WAV mounted inside its filesystem (audio path, models and dependencies must exist).
+6. Benchmark word error rate, chrF++, Khmer native-speaker acceptability, timing and offline network behavior before calling this feature accurate or release-ready.
+
+**Safety:** No internet model download occurs inside the inference workers, but building Docker images and staging model files require network access unless separately packaged. Neither GPU inference nor real ASR/MT has been validated on the user's Ubuntu hardware. Model download alone does not prove correct translation.
+
+## Users, Google / Facebook / GitHub social login, and responsive navigation
+
+The **Users & Social** page supports optional account creation by Google, Facebook or GitHub OAuth, linking a second provider to an existing account, and sign-out. Signed-in users see only their own jobs, while the legacy shared API key is reserved for trusted local administrator use. On the same page an administrator using the API key can view the registered user directory.
+
+**All social providers default to disabled** until OAuth applications, client IDs/secrets and callback URLs have been created with the external identity providers. See [Social authentication setup](docs/SOCIAL_AUTH.md) for exact callback URLs and security limitations. UI does not simulate a successful login.
+
+The sidebar can be **collapsed/expanded** on desktop, with a hamburger-controlled **slide-out drawer** and overlay on tablet/mobile. Current navigation state is remembered locally. The layout follows the uploaded light UI design kit.
+
+**Upgrade existing data without deleting volumes:**
+
+```bash
+git pull origin main
+# Add AUTH_SESSION_SECRET and OAuth provider credentials to your existing .env (optional).
+# Create a strong secret with: python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+docker compose up -d --build
+docker compose ps -a
+docker compose run --rm --no-deps api pytest -q
+curl -s http://localhost:8080/api/auth/providers
+curl -s http://localhost:8080/api/auth/me
+```
+
+Migration `0006_user_social_auth` retains earlier jobs and adds nullable user ownership.
+Old jobs without an owner remain admin-key-visible only. **Never run `docker compose down -v` on existing production data.**
 
 ## API
 - `GET /api/health/live`, `GET /api/health/ready`
