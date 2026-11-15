@@ -13,7 +13,7 @@ from app.real_inference import translate_audio, build_srt, TimedText
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
-celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=600)
+celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=3600,task_soft_time_limit=3300)
 
 class CancelledJob(Exception):
     pass
@@ -121,6 +121,17 @@ def translate_media(self,job_id:str):
                 else:
                     s3.download_file(settings.minio_bucket,media.object_key,str(source))
                 check_cancel(db,job)
+                if source.stat().st_size>settings.max_upload_mb*1024*1024:
+                    raise ValueError("Captured media exceeds configured MAX_UPLOAD_MB")
+                import json
+                metadata=subprocess.run(["ffprobe","-v","error",
+                    "-show_entries","format=duration","-of","json",str(source)],
+                    capture_output=True,text=True,check=True,timeout=30)
+                clip_seconds=float(json.loads(metadata.stdout)["format"]["duration"])
+                if clip_seconds>settings.max_video_duration_seconds:
+                    raise ValueError("Video is too long for this worker: "+
+                        str(round(clip_seconds))+" seconds (limit "+
+                        str(settings.max_video_duration_seconds)+"s)")
                 subtitle_path=root/"translated.srt"
                 if streamed_rows is not None:
                     # The streaming URL path has already produced real captions.
@@ -131,7 +142,7 @@ def translate_media(self,job_id:str):
                     set_state(db,job,"processing",progress=25,stage="extracting audio")
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
                         "-i",str(source),"-map","0:a:0","-vn","-ac","1",
-                        "-ar","16000",str(audio)],check=True,timeout=120)
+                        "-ar","16000",str(audio)],check=True,timeout=600)
                     check_cancel(db,job)
                     if mode=="real_subtitles":
                         set_state(db,job,"processing",progress=45,stage="recognizing and translating speech")
@@ -158,7 +169,7 @@ def translate_media(self,job_id:str):
                         "-c:s","mov_text",
                         "-metadata:s:s:0","language="+("khm" if job.target_lang=="km" else "eng"),
                         "-disposition:s:0","default","-movflags","+faststart",
-                        str(result)],check=True,timeout=600)
+                        str(result)],check=True,timeout=1800)
                 else:
                     # DEMO ONLY. No translation or dubbing.
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
