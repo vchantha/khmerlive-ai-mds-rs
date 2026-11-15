@@ -1,3 +1,14 @@
+## Khmer voice dubbing (new)
+
+English→Khmer real-model jobs can now replace English speech with an offline
+synthetic Khmer voice and include Khmer subtitles. Read
+[Khmer dubbing deployment and license requirements](docs/KHMER_DUBBING.md).
+The Khmer MMS TTS checkpoint is **non-commercial CC-BY-NC-4.0** and model
+weights must be downloaded separately. Existing completed videos are not
+retroactively dubbed. Default Docker Compose remains **demo**; use
+`docker compose -f compose.yaml -f compose.real.yaml up -d --build`.
+No end-to-end Khmer speech synthesis on the user's machine has been verified.
+
 # KhmerLive AI — Docker Compose Research MVP
 
 **Research:** Uncertainty-Aware Adaptive Speech Segmentation for Low-Latency Offline English–Khmer Simultaneous Translation. [Notion roadmap](https://app.notion.com/p/41931200c90381c9bd02d240f29d9392).
