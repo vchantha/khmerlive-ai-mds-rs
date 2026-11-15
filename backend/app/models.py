@@ -30,5 +30,7 @@ class TranslationJob(Base):
     transcript:Mapped[str|None]=mapped_column(Text,nullable=True)
     translation:Mapped[str|None]=mapped_column(Text,nullable=True)
     output_key:Mapped[str|None]=mapped_column(String(500),nullable=True)
+    subtitle_key:Mapped[str|None]=mapped_column(String(500),nullable=True)
+    processing_mode:Mapped[str]=mapped_column(String(32),default="demo",server_default="demo")
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())
