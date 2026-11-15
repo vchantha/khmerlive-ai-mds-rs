@@ -10,3 +10,49 @@
 .url-source>.field-label{margin-top:12px}
 .url-source select{height:36px;margin-bottom:8px}
 @media(max-width:480px){.source-picker{display:flex;width:100%}.source-picker button{flex:1;padding:9px 5px;font-size:11px}}
+
+
+/* Account management + collapsible adaptive navigation */
+.nav-toggle{width:35px;height:35px;border:1px solid #e4e7ec;border-radius:9px;background:#fff;color:#344054;font-size:18px;display:grid;place-items:center;flex:none}
+.sidebar-collapse{display:flex;gap:8px;align-items:center;margin:0 0 18px auto;border:1px solid #d0d5dd;border-radius:9px;background:#fff;padding:7px 11px;color:#475467;font-size:12px}
+.sidebar-collapsed .body-layout{grid-template-columns:72px minmax(0,1fr)}
+.sidebar-collapsed .sidebar{padding:20px 9px}
+.sidebar-collapsed .sidebar .nav-label,.sidebar-collapsed .sidebar .sidebar-divider,.sidebar-collapsed .sidebar-collapse span,.sidebar-collapsed .sidebar nav button b,.sidebar-collapsed .sidebar nav button i{display:none}
+.sidebar-collapsed .sidebar nav button{font-size:0;justify-content:center;padding:0;gap:0}
+.sidebar-collapsed .sidebar nav button span{font-size:20px;width:auto}
+.sidebar-collapsed .sidebar-collapse{justify-content:center;margin:0 auto 20px;width:42px}
+.accounts-card{max-width:900px;padding:27px}
+.account-heading{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:25px}
+.account-heading h2{font-size:20px;margin:0 0 7px}
+.account-heading p{color:#667085;font-size:12px;margin:0}
+.account-profile{display:flex;align-items:center;gap:15px;padding:16px;border:1px solid #e4e7ec;border-radius:12px;background:#f9fafb;margin-bottom:25px}
+.account-profile>div{flex:1;min-width:0}
+.account-profile strong,.account-profile small{display:block;overflow-wrap:anywhere}
+.account-profile strong{font-size:16px;margin-bottom:4px}
+.account-profile small{color:#667085;font-size:11px;margin-bottom:4px}
+.profile-avatar{display:grid;place-items:center;flex:none;height:46px;width:46px;border-radius:50%;background:#2f5bea;color:#fff;font-size:18px;font-weight:800}
+.accounts-card h3{font-size:13px;color:#344054;margin:22px 0 12px}
+.account-hint{background:#f0f5ff;border:1px solid #cddcfe;border-radius:11px;padding:17px;line-height:1.7;font-size:12px;margin:14px 0 24px}
+.social-list{display:grid;gap:10px}
+.social-row{display:flex;gap:13px;align-items:center;padding:13px;border:1px solid #e4e7ec;border-radius:10px}
+.social-row>span:nth-child(2){flex:1;color:#667085;font-size:12px}
+.provider-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.provider-card{display:flex;flex-direction:column;gap:12px;padding:19px;border:1px solid #e4e7ec;border-radius:12px}
+.provider-card strong{font-size:15px}
+.provider-card small{color:#667085;font-size:11px}
+.provider-card button{margin-top:auto}
+.account-footnote{margin:20px 0 0;font-size:11px;color:#667085;line-height:1.65}
+.mobile-scrim{display:none}
+@media(max-width:760px){
+ .body-layout,.sidebar-collapsed .body-layout{grid-template-columns:1fr}
+ .sidebar,.sidebar-collapsed .sidebar{position:fixed;top:62px;bottom:0;left:0;z-index:22;width:242px;transform:translateX(-110%);transition:transform .2s ease;background:#fff;padding:23px 15px;overflow:auto;box-shadow:10px 0 30px #0002}
+ .app-shell.nav-open .sidebar,.app-shell.nav-open.sidebar-collapsed .sidebar{transform:translateX(0)}
+ .sidebar .nav-label,.sidebar-collapsed .sidebar .nav-label,.sidebar .sidebar-divider,.sidebar-collapsed .sidebar .sidebar-divider{display:block}
+ .sidebar nav button,.sidebar-collapsed .sidebar nav button{font-size:13px;justify-content:flex-start;padding:0 12px;gap:12px}
+ .sidebar nav button span,.sidebar-collapsed .sidebar nav button span{font-size:17px;width:18px}
+ .sidebar-collapse,.sidebar-collapsed .sidebar-collapse{display:none}
+ .mobile-scrim{position:fixed;display:block;inset:62px 0 0;z-index:21;border:0;background:#1018287a;width:100%;height:calc(100vh - 62px)}
+ .provider-actions{grid-template-columns:1fr}
+ .account-profile{flex-wrap:wrap}
+ .account-profile button{width:100%}
+}
