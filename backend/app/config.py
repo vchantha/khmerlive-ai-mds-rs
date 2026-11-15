@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
     max_upload_mb:int=1024
+    stream_url_allow_users:bool=False
     @model_validator(mode="after")
     def protect_session_secret(self):
         if self.auth_session_secret in ("replace_with_generated_session_secret","change_this_auth_session_secret"):
