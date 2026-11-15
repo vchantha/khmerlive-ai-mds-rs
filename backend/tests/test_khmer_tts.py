@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 from pathlib import Path
 import wave
-import numpy as np
 import pytest
+np=pytest.importorskip("numpy",reason="NumPy is installed only in real model image")
 from app.khmer_tts import require_tts_model,build_dubbed_audio,resample_to_length
 
 def test_missing_tts_model_rejected(tmp_path):
