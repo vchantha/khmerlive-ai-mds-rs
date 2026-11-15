@@ -47,16 +47,18 @@ def client_for(name:str):
     return oauth.create_client(name)
 
 def actor_from_request(request:Request, x_api_key:str|None=None):
+    # Prefer a signed-in identity even when an old API key is cached by the browser.
+    # This prevents an ordinary user session from accidentally taking admin scope.
+    user_id=request.session.get("user_id")
+    if user_id:
+        with SessionLocal() as db:
+            if db.get(AppUser,user_id) is None:
+                request.session.clear()
+                raise HTTPException(401,"Session expired; please sign in")
+        return {"admin":False,"user_id":user_id}
     if x_api_key and x_api_key==settings.api_key:
         return {"admin":True,"user_id":None}
-    user_id=request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(401,"Sign in or provide your API key")
-    with SessionLocal() as db:
-        if db.get(AppUser,user_id) is None:
-            request.session.clear()
-            raise HTTPException(401,"Session expired; please sign in")
-    return {"admin":False,"user_id":user_id}
+    raise HTTPException(401,"Sign in or provide your API key")
 
 @router.get("/providers")
 def list_providers():
