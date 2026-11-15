@@ -1,4 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
+import hashlib
 
 class Settings(BaseSettings):
     model_config=SettingsConfigDict(env_file=".env",extra="ignore")
@@ -21,4 +23,13 @@ class Settings(BaseSettings):
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
     max_upload_mb:int=1024
+    @model_validator(mode="after")
+    def protect_session_secret(self):
+        if self.auth_session_secret in ("replace_with_generated_session_secret","change_this_auth_session_secret"):
+            # Older installations have no AUTH_SESSION_SECRET yet. Derive a stable
+            # fallback from their private random API key; set a dedicated key in .env.
+            self.auth_session_secret=hashlib.sha256((self.api_key+"|khmerlive-auth-session-v1").encode()).hexdigest()
+        if len(self.auth_session_secret)<32:
+            raise ValueError("AUTH_SESSION_SECRET must contain at least 32 characters")
+        return self
 settings=Settings()
