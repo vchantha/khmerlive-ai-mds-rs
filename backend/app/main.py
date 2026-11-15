@@ -131,6 +131,8 @@ class StreamJobCreate(BaseModel):
 
 @app.post("/api/jobs/from-url",status_code=202,dependencies=[Depends(authorize)])
 def create_url_job(payload:StreamJobCreate,actor:dict=Depends(authorize)):
+    if not actor["admin"] and not settings.stream_url_allow_users:
+        raise HTTPException(403,"URL stream ingestion is restricted to trusted administrators")
     if payload.source_lang==payload.target_lang:
         raise HTTPException(422,"Language pair must differ")
     ensure_translation_ready()
