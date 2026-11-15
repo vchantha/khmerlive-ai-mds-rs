@@ -147,7 +147,7 @@ def create_url_job(payload:StreamJobCreate,actor:dict=Depends(authorize)):
         raise HTTPException(403,"URL stream ingestion is restricted to trusted administrators")
     if payload.source_lang==payload.target_lang:
         raise HTTPException(422,"Language pair must differ")
-    ensure_translation_ready()
+    ensure_translation_ready(payload.target_lang)
     try:
         url=validate_stream_url(payload.url)
         seconds=capture_seconds_valid(payload.capture_seconds)
