@@ -128,7 +128,8 @@ def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
     with session() as db:
         q=select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id)
         if status and status!="all":
-            if status=="failed":q=q.where(TranslationJob.status.in_(["failed","dispatch_failed"]))
+            if status=="active":q=q.where(TranslationJob.status.in_(["queued","processing","cancelling"]))
+            elif status=="failed":q=q.where(TranslationJob.status.in_(["failed","dispatch_failed"]))
             elif status in ("queued","processing","completed","dispatch_failed"):
                 q=q.where(TranslationJob.status==status)
             else:raise HTTPException(422,"Unsupported job status")
