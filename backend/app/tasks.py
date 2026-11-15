@@ -9,6 +9,7 @@ from app.db import SessionLocal
 from app.models import TranslationJob,MediaAsset
 from app.storage import client
 from app.adapters import get_adapters
+from app.real_inference import translate_audio, build_srt
 from app.stream_urls import validate_stream_url
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
 celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=600)
@@ -41,7 +42,11 @@ def translate_media(self,job_id:str):
         set_state(db,job,"processing",progress=5,stage="starting")
         media=db.get(MediaAsset,job.media_id)
         try:
-            asr,mt=get_adapters()
+            mode=job.processing_mode
+            if mode not in ("demo","real_subtitles"):
+                raise ValueError("Unsupported processing mode: "+mode)
+            if mode=="demo":
+                asr,mt=get_adapters()
             with tempfile.TemporaryDirectory() as td:
                 root=Path(td)
                 source=root/"input.mp4"
@@ -82,18 +87,46 @@ def translate_media(self,job_id:str):
                 set_state(db,job,"processing",progress=25,stage="extracting audio")
                 subprocess.run(["ffmpeg","-v","error","-nostdin","-y","-i",str(source),"-map","0:a:0","-vn","-ac","1","-ar","16000",str(audio)],check=True,timeout=120)
                 check_cancel(db,job)
-                set_state(db,job,"processing",progress=45,stage="demo transcription")
-                text=asr.transcribe(audio,job.source_lang).text
-                translated=mt.translate(text,job.source_lang,job.target_lang)
+                subtitle_path=root/"translated.srt"
+                if mode=="real_subtitles":
+                    set_state(db,job,"processing",progress=45,stage="recognizing and translating speech")
+                    rows=translate_audio(audio,job.source_lang,job.target_lang,
+                                         settings.whisper_model_path,
+                                         settings.translation_model_path,
+                                         settings.inference_device)
+                    text=" ".join(row.source_text for row in rows)
+                    translated=" ".join(row.target_text for row in rows)
+                    subtitle_path.write_text(build_srt(rows),encoding="utf-8")
+                else:
+                    set_state(db,job,"processing",progress=45,stage="demo transcription")
+                    text=asr.transcribe(audio,job.source_lang).text
+                    translated=mt.translate(text,job.source_lang,job.target_lang)
                 check_cancel(db,job)
-                set_state(db,job,"processing",progress=65,stage="remuxing video")
-                # DEMO MODE: pass video through, do not pretend audio has been dubbed.
-                subprocess.run(["ffmpeg","-v","error","-nostdin","-y","-i",str(source),"-map","0:v:0?","-map","0:a:0?","-c","copy",str(result)],check=True,timeout=120)
+                set_state(db,job,"processing",progress=65,stage="muxing subtitles" if mode=="real_subtitles" else "remuxing demo video")
+                if mode=="real_subtitles":
+                    # Preserve original speech, add selectable translated subtitle track.
+                    subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
+                        "-i",str(source),"-i",str(subtitle_path),
+                        "-map","0:v:0","-map","0:a:0?","-map","1:0",
+                        "-c:v","copy","-c:a","copy","-c:s","mov_text",
+                        "-metadata:s:s:0","language="+("khm" if job.target_lang=="km" else "eng"),
+                        "-disposition:s:0","default","-movflags","+faststart",
+                        str(result)],check=True,timeout=180)
+                else:
+                    # DEMO ONLY. No translation or dubbing.
+                    subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
+                        "-i",str(source),"-map","0:v:0?","-map","0:a:0?",
+                        "-c","copy",str(result)],check=True,timeout=120)
                 key=f"outputs/{job.id}.mp4"
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=85,stage="publishing output")
                 s3.upload_file(str(result),settings.minio_bucket,key,ExtraArgs={"ContentType":"video/mp4"})
                 check_cancel(db,job)
+                if mode=="real_subtitles":
+                    subtitle_key=f"outputs/{job.id}.srt"
+                    s3.upload_file(str(subtitle_path),settings.minio_bucket,subtitle_key,
+                                   ExtraArgs={"ContentType":"application/x-subrip"})
+                    job.subtitle_key=subtitle_key
                 job.transcript=text
                 job.translation=translated
                 job.output_key=key
