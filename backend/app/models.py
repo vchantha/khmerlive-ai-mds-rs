@@ -11,6 +11,9 @@ class MediaAsset(Base):
     content_type:Mapped[str]=mapped_column(String(100))
     size_bytes:Mapped[int]=mapped_column(BigInteger)
     sha256:Mapped[str]=mapped_column(String(64))
+    source_url:Mapped[str|None]=mapped_column(Text,nullable=True)
+    source_kind:Mapped[str]=mapped_column(String(16),default="upload",server_default="upload")
+    capture_seconds:Mapped[int|None]=mapped_column(nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
 
 class TranslationJob(Base):
