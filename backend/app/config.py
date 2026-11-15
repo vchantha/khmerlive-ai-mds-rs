@@ -12,5 +12,5 @@ class Settings(BaseSettings):
     model_mode:str="demo"
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
-    max_upload_mb:int=100
+    max_upload_mb:int=1024
 settings=Settings()
