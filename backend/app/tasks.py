@@ -1,4 +1,4 @@
-import os
+import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,6 +9,7 @@ from app.db import SessionLocal
 from app.models import TranslationJob,MediaAsset
 from app.storage import client
 from app.adapters import get_adapters
+from app.stream_urls import validate_stream_url
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
 celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=600)
 
@@ -47,7 +48,36 @@ def translate_media(self,job_id:str):
                 audio=root/"input.wav"
                 result=root/"output.mp4"
                 s3=client()
-                s3.download_file(settings.minio_bucket,media.object_key,str(source))
+                if media.source_kind=="url":
+                    check_cancel(db,job)
+                    set_state(db,job,"processing",progress=10,stage="capturing URL stream")
+                    # Restrict URL schemes, user-configured allowed hosts, and public DNS.
+                    validate_stream_url(media.source_url)
+                    seconds=int(media.capture_seconds or 30)
+                    cmd=["ffmpeg","-hide_banner","-loglevel","error","-nostdin","-y",
+                         "-rw_timeout","15000000",
+                         "-protocol_whitelist","http,https,tcp,tls,crypto",
+                         "-i",media.source_url,
+                         "-t",str(seconds),
+                         "-map","0:v:0?","-map","0:a:0?",
+                         "-c:v","libx264","-preset","ultrafast",
+                         "-pix_fmt","yuv420p","-c:a","aac",
+                         "-movflags","+faststart","-fs",str(1024*1024*1024),
+                         str(source)]
+                    subprocess.run(cmd,check=True,timeout=max(100,seconds*4+60))
+                    if not source.exists() or source.stat().st_size<1024:
+                        raise RuntimeError("Stream yielded no playable MP4")
+                    # URL content is retained in object storage for replay, not silently re-fetched.
+                    s3.upload_file(str(source),settings.minio_bucket,media.object_key,ExtraArgs={"ContentType":"video/mp4"})
+                    digest=hashlib.sha256()
+                    with source.open("rb") as stream:
+                        for block in iter(lambda:stream.read(1024*1024),b""):
+                            digest.update(block)
+                    media.sha256=digest.hexdigest()
+                    media.size_bytes=source.stat().st_size
+                    db.commit()
+                else:
+                    s3.download_file(settings.minio_bucket,media.object_key,str(source))
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=25,stage="extracting audio")
                 subprocess.run(["ffmpeg","-v","error","-nostdin","-y","-i",str(source),"-map","0:a:0","-vn","-ac","1","-ar","16000",str(audio)],check=True,timeout=120)
