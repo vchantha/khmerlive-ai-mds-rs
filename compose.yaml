@@ -55,7 +55,10 @@ services:
     networks: [backend]
   migrate:
     build: ./backend
-    command: ["alembic", "upgrade", "head"]
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
     env_file: .env
     depends_on:
       db: {condition: service_healthy}
