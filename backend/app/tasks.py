@@ -13,7 +13,30 @@ from app.real_inference import translate_audio, build_srt, TimedText
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
-celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=3600,task_soft_time_limit=3300)
+celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=settings.job_time_limit_seconds,task_soft_time_limit=max(60,settings.job_time_limit_seconds-300))
+
+def output_codec_args(source:Path)->list[str]:
+    """Stream-copy when the input is already browser-playable (H.264 yuv420p + AAC).
+
+    Re-encoding a long, already-compatible video with libx264 costs minutes of
+    CPU and adds nothing; only transcode streams that actually need it.
+    """
+    import json
+    probed=subprocess.run(["ffprobe","-v","error","-show_entries",
+        "stream=codec_type,codec_name,pix_fmt","-of","json",str(source)],
+        check=True,capture_output=True,text=True,timeout=30)
+    streams=json.loads(probed.stdout).get("streams",[])
+    video=next((s for s in streams if s.get("codec_type")=="video"),None)
+    audio=next((s for s in streams if s.get("codec_type")=="audio"),None)
+    if video and video.get("codec_name")=="h264" and video.get("pix_fmt")=="yuv420p":
+        vargs=["-c:v","copy"]
+    else:
+        vargs=["-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p"]
+    if audio is None or audio.get("codec_name")=="aac":
+        aargs=["-c:a","copy"]
+    else:
+        aargs=["-c:a","aac","-b:a","128k"]
+    return vargs+aargs
 
 class CancelledJob(Exception):
     pass
@@ -78,7 +101,7 @@ def translate_media(self,job_id:str):
                             try:
                                 chunk_rows=translate_audio(piece_audio,job.source_lang,job.target_lang,
                                     settings.whisper_model_path,settings.translation_model_path,
-                                    settings.inference_device)
+                                    settings.inference_device,settings.asr_cpu_threads)
                             except ValueError as exc:
                                 if "No intelligible speech" not in str(exc):
                                     raise
@@ -149,7 +172,7 @@ def translate_media(self,job_id:str):
                         rows=translate_audio(audio,job.source_lang,job.target_lang,
                                              settings.whisper_model_path,
                                              settings.translation_model_path,
-                                             settings.inference_device)
+                                             settings.inference_device,settings.asr_cpu_threads)
                         text=" ".join(row.source_text for row in rows)
                         translated=" ".join(row.target_text for row in rows)
                         subtitle_path.write_text(build_srt(rows),encoding="utf-8")
@@ -159,24 +182,25 @@ def translate_media(self,job_id:str):
                         translated=mt.translate(text,job.source_lang,job.target_lang)
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=65,stage="muxing subtitles" if mode=="real_subtitles" else "remuxing demo video")
+                codec_args=output_codec_args(source)
+                # Reuse the duration probed above; transcodes scale with length.
+                mux_timeout=max(1800,int(clip_seconds*1.5))
                 if mode=="real_subtitles":
                     # Preserve original speech, add selectable translated subtitle track.
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
                         "-i",str(source),"-i",str(subtitle_path),
                         "-map","0:v:0","-map","0:a:0?","-map","1:0",
-                        "-c:v","libx264","-preset","veryfast","-crf","23",
-                        "-pix_fmt","yuv420p","-c:a","aac","-b:a","128k",
+                        *codec_args,
                         "-c:s","mov_text",
                         "-metadata:s:s:0","language="+("khm" if job.target_lang=="km" else "eng"),
                         "-disposition:s:0","default","-movflags","+faststart",
-                        str(result)],check=True,timeout=1800)
+                        str(result)],check=True,timeout=mux_timeout)
                 else:
                     # DEMO ONLY. No translation or dubbing.
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
                         "-i",str(source),"-map","0:v:0?","-map","0:a:0?",
-                        "-c:v","libx264","-preset","veryfast","-crf","23",
-                        "-pix_fmt","yuv420p","-c:a","aac","-b:a","128k",
-                        "-movflags","+faststart",str(result)],check=True,timeout=600)
+                        *codec_args,
+                        "-movflags","+faststart",str(result)],check=True,timeout=mux_timeout)
                 # Verify output is a valid MP4 with browser-decodable H.264 video.
                 import json
                 probed=subprocess.run(["ffprobe","-v","error","-show_entries",

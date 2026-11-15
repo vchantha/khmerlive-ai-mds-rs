@@ -45,15 +45,22 @@ def build_srt(items: list[TimedText]) -> str:
     return "\n".join(parts) + ("\n" if parts else "")
 
 class OfflineWhisper:
-    def __init__(self, path: Path, device: str = "cpu", compute_type: str = "int8"):
+    def __init__(self, path: Path, device: str = "cpu", compute_type: str = "int8",
+                 cpu_threads: int = 0):
+        import os
         from faster_whisper import WhisperModel
+        # CTranslate2 defaults to 4 threads; use every core unless told otherwise.
+        threads = cpu_threads or (os.cpu_count() or 4)
         self._model = WhisperModel(str(path), device=device, compute_type=compute_type,
-                                   local_files_only=True)
+                                   cpu_threads=threads, local_files_only=True)
 
     def transcribe(self, wav_path: Path, language: str) -> list[TimedText]:
         segments, info = self._model.transcribe(
             str(wav_path), language=language, task="transcribe",
-            beam_size=5, vad_filter=False, condition_on_previous_text=False
+            beam_size=5, condition_on_previous_text=False,
+            # Skip silence/music instead of decoding it: large speedup on long
+            # media and fewer hallucinated segments in non-speech regions.
+            vad_filter=True, vad_parameters={"min_silence_duration_ms": 500}
         )
         results: list[TimedText] = []
         for s in segments:
@@ -100,14 +107,14 @@ class OfflineM2M100:
         return result
 
 @lru_cache(maxsize=2)
-def load_engines(asr_dir: str, mt_dir: str, device: str):
+def load_engines(asr_dir: str, mt_dir: str, device: str, cpu_threads: int = 0):
     asr, mt = model_paths(asr_dir, mt_dir)
     compute = "float16" if device == "cuda" else "int8"
-    return OfflineWhisper(asr, device, compute), OfflineM2M100(mt, device)
+    return OfflineWhisper(asr, device, compute, cpu_threads), OfflineM2M100(mt, device)
 
 def translate_audio(wav_path: Path, src: str, dst: str, asr_dir: str,
-                    mt_dir: str, device: str = "cpu") -> list[TimedText]:
-    whisper, translator = load_engines(asr_dir, mt_dir, device)
+                    mt_dir: str, device: str = "cpu", cpu_threads: int = 0) -> list[TimedText]:
+    whisper, translator = load_engines(asr_dir, mt_dir, device, cpu_threads)
     segments = whisper.transcribe(wav_path, src)
     if not segments:
         raise ValueError("No intelligible speech segments detected; no subtitle output")

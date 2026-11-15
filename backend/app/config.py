@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     max_upload_mb:int=1024
     max_video_duration_seconds:int=600
     stream_url_allow_users:bool=False
+    # Hard Celery limit per job; a soft limit fires 5 min earlier so the job is marked failed cleanly.
+    job_time_limit_seconds:int=3600
+    # CTranslate2 threads for Whisper on CPU (0 = library default, which uses only 4 cores).
+    asr_cpu_threads:int=0
     @model_validator(mode="after")
     def protect_session_secret(self):
         if self.auth_session_secret in ("replace_with_generated_session_secret","change_this_auth_session_secret"):
