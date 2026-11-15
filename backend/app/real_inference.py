@@ -4,6 +4,7 @@ Model weights must be provisioned in /models before enabling real_subtitles.
 No network model resolution happens in these adapters.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 @dataclass(frozen=True)
@@ -98,14 +99,19 @@ class OfflineM2M100:
                           for s, t in zip(batch, decoded, strict=True))
         return result
 
-def translate_audio(wav_path: Path, src: str, dst: str, asr_dir: str,
-                    mt_dir: str, device: str = "cpu") -> list[TimedText]:
+@lru_cache(maxsize=2)
+def load_engines(asr_dir: str, mt_dir: str, device: str):
     asr, mt = model_paths(asr_dir, mt_dir)
     compute = "float16" if device == "cuda" else "int8"
-    segments = OfflineWhisper(asr, device, compute).transcribe(wav_path, src)
+    return OfflineWhisper(asr, device, compute), OfflineM2M100(mt, device)
+
+def translate_audio(wav_path: Path, src: str, dst: str, asr_dir: str,
+                    mt_dir: str, device: str = "cpu") -> list[TimedText]:
+    whisper, translator = load_engines(asr_dir, mt_dir, device)
+    segments = whisper.transcribe(wav_path, src)
     if not segments:
         raise ValueError("No intelligible speech segments detected; no subtitle output")
-    result = OfflineM2M100(mt, device).translate(segments, src, dst)
+    result = translator.translate(segments, src, dst)
     if not any(s.target_text.strip() for s in result):
         raise ValueError("Translation model produced no text")
     return result
