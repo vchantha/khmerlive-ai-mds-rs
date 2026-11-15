@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Download pinned, inspectable local assets on an ONLINE staging machine.
+
+Do not run on offline/production host. Review license and use permissions.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+from huggingface_hub import HfApi, snapshot_download
+
+CANDIDATES = {
+    "asr": ("Systran/faster-whisper-small", "mit"),
+    "mt": ("facebook/m2m100_418M", "mit"),
+}
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default="models")
+    parser.add_argument("--asr-revision", default=None, help="40-character Git commit SHA")
+    parser.add_argument("--mt-revision", default=None, help="40-character Git commit SHA")
+    args = parser.parse_args()
+    root = Path(args.output)
+    root.mkdir(parents=True, exist_ok=True)
+    api = HfApi()
+    manifest = {"format":1,"models":[]}
+    for key, (repo, license_name) in CANDIDATES.items():
+        revision = getattr(args, key + "_revision")
+        if not revision:
+            revision = api.model_info(repo).sha
+        if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
+            raise ValueError("Revision must be a full immutable Git commit SHA")
+        target = root / key
+        target.mkdir(parents=True, exist_ok=True)
+        print("Downloading", repo, "@", revision, "to", target)
+        snapshot_download(repo_id=repo, revision=revision, local_dir=str(target),
+                          ignore_patterns=["*.ot", "*.h5", ".gitattributes"])
+        files = {}
+        for p in sorted(target.rglob("*")):
+            if not p.is_file() or ".cache" in p.parts:
+                continue
+            digest = hashlib.sha256()
+            with p.open("rb") as inp:
+                for chunk in iter(lambda: inp.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            files[str(p.relative_to(target))] = digest.hexdigest()
+        manifest["models"].append({"id":repo,"component":key,"revision":revision,
+                                     "card_license":license_name,"sha256":files})
+    (root / "manifest.lock.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print("Done. Review model cards/licenses before distributing weights.")
+    print("Lock manifest:", root / "manifest.lock.json")
+
+if __name__ == "__main__":
+    main()
