@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     google_client_secret:str=""
     facebook_client_id:str=""
     facebook_client_secret:str=""
+    github_client_id:str=""
+    github_client_secret:str=""
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
     max_upload_mb:int=1024
