@@ -9,8 +9,11 @@
 - FastAPI HTTP API (internal port 8000)
 - Celery worker with Redis queue
 - PostgreSQL 16 (durable media/job records, Alembic migration)
-- MinIO (durable media/object storage)
+- PGSTY SILO, a maintained MinIO-compatible S3 server (durable object storage; service retains the `minio` hostname for app compatibility)
 - FFmpeg worker pipeline (audio extraction and MP4 passthrough)
+
+## Fix for MinIO / Quay 401 (Nov 2026)
+The upstream historical `quay.io/minio/*` images now return 401 to anonymous pulls. This Compose stack uses `docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z`, a community-maintained MinIO-compatible fork. A fresh install should run `docker compose pull` before `up`. Existing S3 data migration must be validated and backed up before upgrading an existing volume. Image pull and runtime compatibility still need verification on your host.
 
 ## Ubuntu 24.04 quick start
 Install Docker Engine and Compose v2 from official Docker packages. Run:
@@ -19,6 +22,8 @@ Install Docker Engine and Compose v2 from official Docker packages. Run:
 bash scripts/init-env.sh
 # This generates coherent random PostgreSQL/MinIO/API secrets. Do not commit .env.
 docker compose config --quiet
+docker compose pull db redis minio minio-init
+# CI and Dockerfile build may still require an internet connection.
 docker compose up --build -d
 docker compose ps
 bash scripts/smoke.sh
