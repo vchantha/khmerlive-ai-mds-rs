@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     github_client_secret:str=""
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
+    khmer_tts_model_path:str="/models/tts"
+    enable_khmer_dubbing:bool=True
     max_upload_mb:int=1024
     max_video_duration_seconds:int=600
     stream_url_allow_users:bool=False
