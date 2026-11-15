@@ -1,0 +1,16 @@
+# Use together with compose.yaml, after local models have been provisioned:
+# docker compose -f compose.yaml -f compose.real.yaml up -d --build
+services:
+  api:
+    environment:
+      MODEL_MODE: real_subtitles
+      INFERENCE_DEVICE: cpu
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.real
+    environment:
+      MODEL_MODE: real_subtitles
+      INFERENCE_DEVICE: cpu
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
