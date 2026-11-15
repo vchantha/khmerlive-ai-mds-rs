@@ -15,6 +15,27 @@
 ## Fix for MinIO / Quay 401 (Nov 2026)
 The upstream historical `quay.io/minio/*` images now return 401 to anonymous pulls. This Compose stack uses `docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z`, a community-maintained MinIO-compatible fork. A fresh install should run `docker compose pull` before `up`. Existing S3 data migration must be validated and backed up before upgrading an existing volume. Image pull and runtime compatibility still need verification on your host.
 
+## Upload size / HTTP 413 troubleshooting
+
+The Nginx gateway accepts up to 2 GiB request bodies; FastAPI separately enforces `MAX_UPLOAD_MB` (default **1024 MiB** on fresh installations). Existing `.env` files are **not automatically updated** when you pull a new commit.
+
+If uploading a file larger than your configured limit, edit the existing `.env` (never commit it) to include:
+
+```env
+MAX_UPLOAD_MB=1024
+```
+
+Then rebuild the gateway and restart services so both limits apply:
+
+```bash
+git pull origin main
+docker compose up -d --build --force-recreate web api worker
+docker compose exec web nginx -T 2>&1 | grep client_max_body_size
+docker compose exec api python -c 'from app.config import settings; print("MAX_UPLOAD_MB =", settings.max_upload_mb)'
+```
+
+If a 413 persists, check `docker compose logs --tail=100 web api` and any **external ingress/reverse proxy** which may have a smaller request body limit. Large uploads need adequate disk space for multipart spooling and S3 storage. Demo mode does **not** perform real translation.
+
 ## Ubuntu 24.04 quick start
 Install Docker Engine and Compose v2 from official Docker packages. Run:
 
