@@ -106,7 +106,15 @@ function App(){
   setError('');try{await req('/api/jobs/'+j.id+'/'+which,{method:'POST'});setNotice(which==='retry'?'Retry requested. Job was re-queued.':'Cancellation requested. Check status for confirmation.');await refresh()}catch(e){setError(String(e))}
  };
  const downloadSubtitles=async(j:Job)=>{try{const r=await fetch('/api/jobs/'+j.id+'/subtitles',{headers:{'X-API-Key':key}});if(!r.ok)throw new Error('Subtitles unavailable: '+r.status);const url=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=url;a.download=j.filename.replace(/\.mp4$/i,'')+'-translated.srt';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000)}catch(e){setError(String(e))}};
- const download=async(j:Job)=>{try{const r=await fetch('/api/jobs/'+j.id+'/download',{headers:{'X-API-Key':key}});if(!r.ok)throw new Error('Download failed '+r.status);const url=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=url;a.download=downloadName(j.filename);a.click();setTimeout(()=>URL.revokeObjectURL(url),30000)}catch(e){setError(String(e))}};
+ const download=async(j:Job)=>{try{
+  // The browser downloads directly from the S3 streaming proxy; avoid loading
+  // large MP4 files into a memory-hungry JavaScript Blob.
+  const p=await req<{video_url:string}>('/api/jobs/'+j.id+'/player-token');
+  const anchor=document.createElement('a');
+  anchor.href=p.video_url+'&download=1';
+  anchor.download=downloadName(j.filename);
+  document.body.appendChild(anchor);anchor.click();anchor.remove();
+ }catch(e){setError(String(e))}};
  const isReal=modelInfo?.mode==='real_subtitles';
  const modelsMissing=isReal&&modelInfo?.subtitle_translation_configured===false;
  const operating=Object.values(services).filter(v=>v==='online').length;
