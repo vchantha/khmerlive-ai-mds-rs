@@ -4,3 +4,4 @@ transformers==4.51.3
 sentencepiece==0.2.0
 huggingface-hub==0.30.2
 safetensors==0.5.3
+sacrebleu==2.5.1
