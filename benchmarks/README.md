@@ -41,6 +41,22 @@ On the trusted Ubuntu machine you may use a rootless cron/systemd timer for the 
 
 This is **monthly model evaluation**, not a monthly paid model subscription, continuous retraining, or proof of perfect translation. If you want monthly retraining/fine-tuning, gather opt-in labeled audio, review training rights, add a separate training workflow and evaluate against a strictly held-out set before deployment.
 
+### Optional Ubuntu systemd user timer
+
+The repository includes an opt-in service/timer pair under `infra/systemd/`. The timer runs on the first day of each month at **03:00 server-local time**, but it is **not automatically enabled by a Git pull**. After installing real models and private human-reviewed sample files, run from the repository root:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp infra/systemd/khmerlive-monthly-model-eval.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now khmerlive-monthly-model-eval.timer
+systemctl --user list-timers
+# Test the command manually first (may be slow):
+bash scripts/run-monthly-model-eval.sh
+```
+
+The service assumes the repository exists at `~/khmerlive-ai-mds-rs` and your user can access Docker. Adjust `WorkingDirectory` and `ExecStart` in the copied service file if the actual project path differs. If model weights or private ground-truth data are absent, the job **fails explicitly** and must not be interpreted as a pass. Reports remain in a Git-ignored private directory.
+
 ## Model release quality gates
 
 Record exact ASR/MT model revisions and file hashes, held-out source CER/WER, target chrF++ scores, semantic critical-error counts, Khmer human reviewer feedback, processing latency, and tested hardware. Do not publish a release solely because a model file was downloaded or a container reported Healthy.
