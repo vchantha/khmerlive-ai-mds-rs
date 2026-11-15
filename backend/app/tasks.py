@@ -108,15 +108,29 @@ def translate_media(self,job_id:str):
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
                         "-i",str(source),"-i",str(subtitle_path),
                         "-map","0:v:0","-map","0:a:0?","-map","1:0",
-                        "-c:v","copy","-c:a","copy","-c:s","mov_text",
+                        "-c:v","libx264","-preset","veryfast","-crf","23",
+                        "-pix_fmt","yuv420p","-c:a","aac","-b:a","128k",
+                        "-c:s","mov_text",
                         "-metadata:s:s:0","language="+("khm" if job.target_lang=="km" else "eng"),
                         "-disposition:s:0","default","-movflags","+faststart",
-                        str(result)],check=True,timeout=180)
+                        str(result)],check=True,timeout=600)
                 else:
                     # DEMO ONLY. No translation or dubbing.
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
                         "-i",str(source),"-map","0:v:0?","-map","0:a:0?",
-                        "-c","copy",str(result)],check=True,timeout=120)
+                        "-c:v","libx264","-preset","veryfast","-crf","23",
+                        "-pix_fmt","yuv420p","-c:a","aac","-b:a","128k",
+                        "-movflags","+faststart",str(result)],check=True,timeout=600)
+                # Verify output is a valid MP4 with browser-decodable H.264 video.
+                import json
+                probed=subprocess.run(["ffprobe","-v","error","-show_entries",
+                    "stream=codec_name,codec_type","-of","json",str(result)],
+                    check=True,capture_output=True,text=True,timeout=30)
+                tracks=json.loads(probed.stdout).get("streams",[])
+                if not any(s.get("codec_type")=="video" and s.get("codec_name")=="h264" for s in tracks):
+                    raise RuntimeError("Playable H.264 video stream was not created")
+                if mode=="real_subtitles" and not any(s.get("codec_type")=="subtitle" and s.get("codec_name")=="mov_text" for s in tracks):
+                    raise RuntimeError("Translated subtitle stream was not attached to the MP4")
                 key=f"outputs/{job.id}.mp4"
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=85,stage="publishing output")
