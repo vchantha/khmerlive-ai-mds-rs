@@ -1,0 +1,9 @@
+[Unit]
+Description=KhmerLive AI monthly EN-KM model quality evaluation
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/khmerlive-ai-mds-rs
+ExecStart=/bin/bash %h/khmerlive-ai-mds-rs/scripts/run-monthly-model-eval.sh
+TimeoutStartSec=14400
