@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     minio_secret_key:str="khmerlive"
     api_key:str="development_only_key"
     model_mode:str="demo"
+    inference_device:str="cpu"
     whisper_model_path:str="/models/asr"
     translation_model_path:str="/models/mt"
     max_upload_mb:int=1024
