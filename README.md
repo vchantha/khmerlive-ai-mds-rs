@@ -52,6 +52,32 @@ bash scripts/smoke.sh
 
 Open `http://localhost:8080`, paste `API_KEY` from `.env`, upload an MP4 with audio, choose language direction, submit, refresh and download a **pass-through video**. No real translation will occur.
 
+## Dashboard UI / queue monitoring
+
+The redesigned dark-mode interface is served on `http://localhost:8080`. It provides:
+- Dashboard counters computed from **actual PostgreSQL jobs**, with no sample metrics.
+- MP4 upload drag-and-drop, source-language selector, API-key session dialog, and real upload progress.
+- Live queue with server-side search, status filtering, pagination and 8-second auto-refresh.
+- Persisted worker progress checkpoints (5/25/45/65/85/100%), stage labels, job errors and download.
+- Job detail panel, completed results, and real-time API, PostgreSQL, Redis, S3 and worker status checks (worker ping can be unknown).
+- Responsive layout. Demo mode remains explicit; video preview is deliberately a placeholder and no translation results are fabricated.
+
+**Upgrade an existing deployment without deleting persistent data:**
+
+```bash
+git pull origin main
+docker compose up -d --build
+docker compose ps -a
+curl -fsS http://localhost:8080/api/health/ready
+```
+
+The `migrate` service applies Alembic revision `0002_job_progress` to existing PostgreSQL records, setting previously completed jobs to 100%. Do **not** run `docker compose down -v`. Access the UI on port 8080 (or configured `WEB_PORT`) and set the API key from your local `.env`.
+
+```bash
+docker compose run --rm --no-deps api pytest -q
+docker compose logs --tail=100 api worker web
+```
+
 ## API
 - `GET /api/health/live`, `GET /api/health/ready`
 - `GET /api/models` with `X-API-Key`
