@@ -232,7 +232,7 @@ def translate_media(self,job_id:str):
                 if mode=="real_subtitles" and settings.enable_khmer_dubbing and job.target_lang=="km":
                     if not any(s.get("codec_type")=="audio" and s.get("codec_name")=="aac" for s in tracks):
                         raise RuntimeError("Khmer-dubbed AAC audio stream was not created")
-                key=f"outputs/{job.id}.mp4"
+                key=(f"outputs/{job.id}.khmer-dubbed.mp4" if mode=="real_subtitles" and settings.enable_khmer_dubbing and job.target_lang=="km" else f"outputs/{job.id}.mp4")
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=85,stage="publishing output")
                 s3.upload_file(str(result),settings.minio_bucket,key,ExtraArgs={"ContentType":"video/mp4"})
