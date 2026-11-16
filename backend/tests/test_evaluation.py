@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 from app import evaluation as ev
 
-ROOT = Path(__file__).resolve().parents[2]
+BACKEND = Path(__file__).resolve().parents[1]
+ROOT = BACKEND.parent
+BUILDER = ROOT / "scripts/build-eval-set.py"
+# The API image contains only backend/; the builder tests run in the LLM adapter workflow (full checkout).
+needs_builder = pytest.mark.skipif(not BUILDER.is_file(), reason="scripts/ not present (backend-only image)")
 
 
 def test_normalize_removes_zero_width_space_and_collapses():
@@ -73,13 +77,14 @@ def _fake_flores(tmp_path):
 
 
 def _builder(monkeypatch, tmp_path):
-    spec = importlib.util.spec_from_file_location("build_eval_set", ROOT / "scripts/build-eval-set.py")
+    spec = importlib.util.spec_from_file_location("build_eval_set", BUILDER)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "ROOT", tmp_path)
     return mod
 
 
+@needs_builder
 def test_builder_freezes_set_and_refuses_overwrite(monkeypatch, tmp_path):
     mod = _builder(monkeypatch, tmp_path)
     tar = _fake_flores(tmp_path)
@@ -98,6 +103,7 @@ def test_builder_freezes_set_and_refuses_overwrite(monkeypatch, tmp_path):
         mod.cmd_flores(args())
 
 
+@needs_builder
 def test_builder_rejects_unpinned_tarball(monkeypatch, tmp_path):
     mod = _builder(monkeypatch, tmp_path)
     tar = _fake_flores(tmp_path)
@@ -105,6 +111,7 @@ def test_builder_rejects_unpinned_tarball(monkeypatch, tmp_path):
         mod.cmd_flores(type("A", (), dict(tarball=str(tar), name="t2", exclude=[], allow_other_tarball=False)))
 
 
+@needs_builder
 def test_builder_excludes_training_sentences(monkeypatch, tmp_path):
     mod = _builder(monkeypatch, tmp_path)
     tar = _fake_flores(tmp_path)
@@ -115,6 +122,7 @@ def test_builder_excludes_training_sentences(monkeypatch, tmp_path):
     assert [r["source"] for r in rows] == ["Test 12 one."] and card["excluded_training_overlap"] == 1
 
 
+@needs_builder
 def test_edited_heldout_file_is_refused(monkeypatch, tmp_path):
     mod = _builder(monkeypatch, tmp_path)
     tar = _fake_flores(tmp_path)
@@ -192,7 +200,7 @@ def test_human_eval_is_blind_and_dedupes_identical_outputs():
 
 # ---- training never sees evaluation sentences ---------------------------
 def _finetune():
-    spec = importlib.util.spec_from_file_location("finetune_mt", ROOT / "backend/training/finetune_mt.py")
+    spec = importlib.util.spec_from_file_location("finetune_mt", BACKEND / "training/finetune_mt.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
