@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     mt_beam_size:int=4
     # Parallel LLM post-edit requests (match OLLAMA_NUM_PARALLEL). 1 = sequential.
     llm_concurrency:int=1
+    # polish (default): minimal edits of the machine draft. translate: the LLM translates the English
+    # itself (draft as hint + context). Both enforce glossary terms. On the zoo test translate was not better.
+    llm_mode:str="polish"
     # Drop Whisper from GPU memory after each use (~1 s reload) so TTS/LLM fit on small GPUs.
     asr_release_after_use:bool=False
     # Load the post-edit LLM into memory when the worker starts, so the first job doesn't wait for it.

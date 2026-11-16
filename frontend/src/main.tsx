@@ -3,11 +3,11 @@ import {createRoot} from 'react-dom/client';
 import './style.css';
 import {Job,Metrics,ModelInfo,SystemData,Account,Provider,req,setApiKey,getApiKey,saveKey,clearKey,baseName,asDate} from './api';
 import {Icon,Logo,Avatar,ConfirmHost} from './ui';
-import {Ctx,Login,Dashboard,NewTranslation,JobPage,Jobs,System,Datasets,Users,Settings,SearchDialog,Videos,Trash} from './pages';
+import {Ctx,Login,Dashboard,NewTranslation,JobPage,Jobs,System,Datasets,Users,Settings,SearchDialog,Videos,Trash,Glossary} from './pages';
 
 const emptyMetrics:Metrics={total:0,queued:0,processing:0,completed:0,failed:0};
 const WORK:[string,string,string][]=[['/dashboard','dashboard','Dashboard'],['/new','translate','New translation'],['/jobs','jobs','Jobs'],['/videos','video','Videos']];
-const ADMIN:[string,string,string][]=[['/system','health','System health'],['/datasets','datasets','Datasets'],['/users','users','Users'],['/settings','settings','Settings']];
+const ADMIN:[string,string,string][]=[['/system','health','System health'],['/datasets','datasets','Datasets'],['/glossary','book','Glossary'],['/users','users','Users'],['/settings','settings','Settings']];
 const readRoute=()=>location.hash.replace(/^#/,'')||'/dashboard';
 const store={get:(k:string)=>{try{return localStorage.getItem(k)||''}catch{return ''}},set:(k:string,v:string)=>{try{localStorage.setItem(k,v)}catch{}}};
 
@@ -84,6 +84,7 @@ function App(){
   case '/videos':page=<Videos key={route} ctx={ctx}/>;break;
   case '/trash':page=<Trash ctx={ctx}/>;break;
   case '/datasets':page=<Datasets ctx={ctx}/>;break;
+  case '/glossary':page=<Glossary ctx={ctx}/>;break;
   case '/users':page=<Users ctx={ctx}/>;break;
   case '/settings':page=<Settings ctx={ctx} theme={theme} setTheme={setTheme} onSignOut={()=>void signOut()}/>;break;
   default:page=<Dashboard ctx={ctx}/>;

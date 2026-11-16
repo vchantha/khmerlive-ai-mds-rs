@@ -432,3 +432,9 @@ kbd{font-family:inherit;font-size:11px;padding:1px 6px;border:1px solid var(--li
  .review-lines li{grid-template-columns:1fr}.rv-meta{flex-direction:row;align-items:center}.rv-act{flex-direction:row}
  .ft-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
+
+/* Glossary */
+.gl-form{display:grid;grid-template-columns:1fr 1fr 1.4fr auto;gap:12px;align-items:end;margin-bottom:20px}
+.gl-form .field{display:flex;flex-direction:column;gap:6px;font-size:13.5px;color:var(--ink2)}.gl-form .field small{color:var(--muted)}
+.gl-form .btn{height:44px}
+@media (max-width:860px){.gl-form{grid-template-columns:1fr}}

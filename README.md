@@ -126,6 +126,24 @@ better. To get the old engine back, set `MT_ENGINE=transformers` in `.env`.
 We also tested asking the LLM (qwen3:4b) to correct the transcripts. It made them **worse**
 (4.43% → 5.30% WER; it also "corrected" words that were already right), so it isn't part of the pipeline.
 
+### Glossary: fix words the model keeps getting wrong
+
+Open **Glossary** (Administration) and add terms such as *elephant → ដំរី*. When an English line
+contains a term (whole word, plurals too: *elephants*), the LLM post-editor must use your Khmer word. If its
+answer doesn't contain the word, it is asked once more. Lines that still miss it show
+`edited (missing term: …)` in the job's **Pipeline log → LLM tasks**. This works right away, with no
+training. It needs LLM post-editing enabled (`LLM_POSTEDIT_ENABLED=true`) and applies to new jobs.
+
+Tested on "Me at the zoo": without the glossary, M2M100 turned *elephants* into អ៊ីនធឺណិត (*internet*) and
+the LLM kept it; with *elephant → ដំរី* the line says ដំរី. The glossary can only fix words the speech
+recognizer heard correctly. If the English line itself is wrong (e.g. *trunks* heard as *fronts*), fix it in
+**Review translation**.
+
+`LLM_MODE` sets how the LLM works: `polish` (default) makes small edits to the machine draft;
+`translate` has the LLM translate the English itself, using the draft only as a hint and the neighbouring
+lines as context. On the zoo test, `translate` gave the better first line and a worse third line, so
+`polish` stays the default until more reviewed lines show otherwise.
+
 ### Improving translation with your own corrections (fine-tuning)
 
 The translation model (M2M100) makes word-level mistakes, for example "elephants" → "internet".

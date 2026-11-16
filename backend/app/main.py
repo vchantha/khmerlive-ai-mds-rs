@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel,Field
 from sqlalchemy import select,text,func,or_,delete
 from app.db import SessionLocal
-from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity,JobEvent,TranslationCorrection
+from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity,JobEvent,TranslationCorrection,GlossaryTerm
 from app.joblog import log_event
 from app.storage import client
 from app.config import settings
@@ -81,8 +81,11 @@ def owned_job(db, job_id, actor):
     return db.scalar(q)
 
 def require_admin(actor):
+    require_admin_for("the Trash",actor)
+
+def require_admin_for(what:str,actor):
     if not actor["admin"]:
-        raise HTTPException(403,"Admin access required for the Trash")
+        raise HTTPException(403,f"Admin access required to change {what}")
 
 
 @contextmanager
@@ -520,6 +523,54 @@ def correction_dataset(format:str=Query("summary",pattern="^(summary|jsonl)$"),a
     return {"pairs":len(rows),"edited":sum(1 for c,_ in rows if not c.approved_unchanged),
             "approved_unchanged":sum(1 for c,_ in rows if c.approved_unchanged),
             "jobs":len({c.job_id for c,_ in rows}),"by_language_pair":by_pair,"recommended_minimum":RECOMMENDED_PAIRS}
+
+# ---------------- Glossary (required terminology) ----------------
+
+class GlossaryIn(BaseModel):
+    source_term:str=Field(min_length=1,max_length=200)
+    target_term:str=Field(min_length=1,max_length=200)
+    note:str|None=Field(default=None,max_length=500)
+    source_lang:str=Field(default="en",pattern="^(en|km)$")
+    target_lang:str=Field(default="km",pattern="^(en|km)$")
+
+def _glossary_out(g):
+    return {"id":g.id,"source_term":g.source_term,"target_term":g.target_term,"note":g.note,
+            "source_lang":g.source_lang,"target_lang":g.target_lang,"created_by":g.created_by,
+            "created_at":g.created_at.isoformat() if g.created_at else None}
+
+@app.get("/api/glossary",dependencies=[Depends(authorize)])
+def list_glossary(search:str|None=Query(None,max_length=200)):
+    with session() as db:
+        q=select(GlossaryTerm)
+        if term:=search_term(search):
+            q=q.where(or_(GlossaryTerm.source_term.ilike(term,escape="\\"),GlossaryTerm.target_term.ilike(term,escape="\\")))
+        return {"items":[_glossary_out(g) for g in db.scalars(q.order_by(func.lower(GlossaryTerm.source_term)))]}
+
+@app.post("/api/glossary",status_code=201,dependencies=[Depends(authorize)])
+def add_glossary(payload:GlossaryIn,actor:dict=Depends(authorize)):
+    require_admin_for("the glossary",actor)
+    if payload.source_lang==payload.target_lang:raise HTTPException(422,"Language pair must differ")
+    src=" ".join(payload.source_term.split()).lower() if payload.source_lang=="en" else payload.source_term.strip()
+    dst=payload.target_term.strip()
+    if payload.target_lang=="km" and not any("\u1780"<=ch<="\u17ff" for ch in dst):
+        raise HTTPException(422,"The Khmer term must contain Khmer script")
+    with session() as db:
+        g=db.scalar(select(GlossaryTerm).where(GlossaryTerm.source_lang==payload.source_lang,
+            GlossaryTerm.target_lang==payload.target_lang,GlossaryTerm.source_term==src))
+        if g is None:
+            g=GlossaryTerm(source_lang=payload.source_lang,target_lang=payload.target_lang,source_term=src);db.add(g)
+        g.target_term=dst;g.note=payload.note;g.created_by=actor_label(actor)
+        db.commit();db.refresh(g)
+        return _glossary_out(g)
+
+@app.delete("/api/glossary/{term_id}",dependencies=[Depends(authorize)])
+def delete_glossary(term_id:int,actor:dict=Depends(authorize)):
+    require_admin_for("the glossary",actor)
+    with session() as db:
+        g=db.get(GlossaryTerm,term_id)
+        if g is None:raise HTTPException(404,"Term not found")
+        db.delete(g);db.commit()
+    return {"id":term_id,"deleted":True}
 
 @app.delete("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
 def delete_job(job_id:str,actor:dict=Depends(authorize)):

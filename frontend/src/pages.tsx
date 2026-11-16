@@ -1,5 +1,5 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,JobEvent,Segment,CorrectionSummary,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Job,JobEvent,Segment,CorrectionSummary,GlossaryItem,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
 import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb,confirmDialog} from './ui';
 
 export type Ctx={
@@ -752,6 +752,44 @@ function FineTuneCard({ctx}:{ctx:Ctx}){
   <div className="review-progress"><Bar value={pct}/><span>{s.pairs>=s.recommended_minimum?'Enough data to fine-tune':`${s.recommended_minimum-s.pairs} more lines recommended before fine-tuning (${s.recommended_minimum}+)`}</span></div>
   <p className="hint">Then run <code>./scripts/finetune-mt.sh</code> on the server. It trains, compares against the current model on videos it hasn't seen, and switches over only if the new model is better. <code>--rollback</code> undoes it.</p>
  </section>;
+}
+
+/* ================= Glossary ================= */
+export function Glossary({ctx}:{ctx:Ctx}){
+ const [items,setItems]=useState<GlossaryItem[]|null>(null),[q,setQ]=useState('');
+ const [en,setEn]=useState(''),[km,setKm]=useState(''),[note,setNote]=useState(''),[busy,setBusy]=useState(false);
+ const load=async()=>{try{setItems((await req<{items:GlossaryItem[]}>('/api/glossary')).items)}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[]);
+ const add=async(e:React.FormEvent)=>{e.preventDefault();if(!en.trim()||!km.trim())return;setBusy(true);
+  try{const exists=items?.some(i=>i.source_term===en.trim().toLowerCase());
+   await req('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_term:en,target_term:km,note:note||null})});
+   ctx.notify(exists?'Term updated':'Term added');setEn('');setKm('');setNote('');void load()}
+  catch(err){ctx.notify(errText(err),'err')}finally{setBusy(false)}};
+ const remove=async(g:GlossaryItem)=>{
+  if(!await confirmDialog({tone:'danger',title:'Remove this term?',message:<>“<b>{g.source_term}</b> → <span className="km">{g.target_term}</span>” will no longer be enforced in new translations.</>,
+   details:['Videos already translated keep their current text.'],confirmLabel:'Remove term',cancelLabel:'Keep term'}))return;
+  try{await req('/api/glossary/'+g.id,{method:'DELETE'});ctx.notify('Term removed');void load()}catch(e){ctx.notify(errText(e),'err')}};
+ const shown=(items||[]).filter(i=>!q||i.source_term.includes(q.toLowerCase())||i.target_term.includes(q));
+ return <>
+  <Head title="Glossary" sub="Words that must always be translated a certain way. When an English line contains a term, the LLM uses your Khmer word (plurals match too: elephant → elephants)."/>
+  {ctx.isAdmin?<form className="card pad gl-form" onSubmit={e=>void add(e)}>
+   <label className="field"><span>English term</span><input value={en} onChange={e=>setEn(e.target.value)} placeholder="elephant" maxLength={200} required/></label>
+   <label className="field"><span>Khmer</span><input className="km" value={km} onChange={e=>setKm(e.target.value)} placeholder="ដំរី" maxLength={200} required/></label>
+   <label className="field"><span>Note <small>(optional)</small></span><input value={note} onChange={e=>setNote(e.target.value)} placeholder="animal, not the Internet" maxLength={500}/></label>
+   <button className="btn btn-primary" disabled={busy||!en.trim()||!km.trim()}><Icon name="plus"/>{items?.some(i=>i.source_term===en.trim().toLowerCase())?'Update term':'Add term'}</button>
+  </form>:<div className="alert alert-info">Only administrators can change the glossary.</div>}
+  <section className="card">
+   <div className="card-h pad-x pt"><h2>{items?items.length+' term'+(items.length===1?'':'s'):'Terms'}</h2>
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search glossary"/></label></div>
+   <div className="table-wrap"><table className="table"><thead><tr><th>English</th><th>Khmer</th><th>Note</th><th>Added</th><th><span className="sr">Actions</span></th></tr></thead><tbody>
+    {shown.map(g=><tr key={g.id} className="no-click"><td><b>{g.source_term}</b></td><td className="km">{g.target_term}</td><td className="muted">{g.note||'—'}</td>
+     <td className="nowrap">{asDate(g.created_at)}</td>
+     <td className="act">{ctx.isAdmin&&<button className="btn btn-ghost btn-sm btn-icon btn-danger-text" aria-label={'Remove '+g.source_term} title="Remove" onClick={()=>void remove(g)}><Icon name="trash" size={16}/></button>}</td></tr>)}
+    {items&&!shown.length&&<tr><td colSpan={5}><div className="empty"><b>{items.length?'No terms match':'No terms yet'}</b><span>Add words the translation keeps getting wrong, e.g. elephant → ដំរី.</span></div></td></tr>}
+    {!items&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
+   </tbody></table></div>
+  </section>
+ </>;
 }
 
 /* ================= Users ================= */

@@ -389,11 +389,18 @@ def _translate_media(job_id:str):
                         clock.mark("llm_postedit")
                         set_state(db,job,"processing",progress=60,stage="offline LLM translation post-editing")
                         llm_tasks:list=[]
-                        rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang,report=llm_tasks)
+                        try:
+                            from app.glossary import load_terms
+                            glossary=load_terms(job.source_lang,job.target_lang)
+                        except Exception as exc:
+                            logger.warning("Glossary unavailable: %s",exc);glossary=[]
+                        rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang,
+                                                       report=llm_tasks,terms=glossary)
                         log_llm_tasks(job.id,llm_tasks)
                         counts={}
                         for t in llm_tasks:counts[t["status"]]=counts.get(t["status"],0)+1
                         clock.note(model=settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
+                                   mode=settings.llm_mode,glossary_terms=len(glossary),
                                    lines=len(llm_tasks),results=counts,parallel=settings.llm_concurrency)
                         translated=" ".join(row.target_text for row in rows_for_dubbing)
                         subtitle_path.write_text(build_srt(rows_for_dubbing),encoding="utf-8")

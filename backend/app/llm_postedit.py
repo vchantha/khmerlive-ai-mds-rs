@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _THINK_OPEN = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
 
+# "translate" (default): the LLM translates the English itself, using the machine draft only as a
+# possibly-wrong hint, neighbouring lines for context and the glossary for required terms.
+TRANSLATE_PROMPT = (
+    "You translate English video speech into natural spoken Khmer for dubbing, the way a native "
+    "Khmer speaker would say it aloud (casual when the English is casual). Translate the meaning of "
+    "the English line exactly and keep every noun, name and number. The previous and next lines are "
+    "context only; do not translate them. The machine draft may contain wrong words: never copy a "
+    "word that does not match the English. If required_terms are given you must use those Khmer "
+    "words. Keep it short enough to say in the available time. Reply with only the Khmer line."
+)
+
+# "polish" (previous behaviour): minimal fluency edits of the machine draft.
 SYSTEM_PROMPT = (
     "You are a careful English-to-Khmer translation post-editor for video dubbing. "
     "Improve Khmer fluency without adding or deleting facts, numbers, names, or meaning. "
@@ -92,8 +104,9 @@ def _task(index, row, status, started, output=None, error=None):
             "error": str(error)[:300] if error else None}
 
 
-def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None = None):
-    """report: optional list that receives one dict per line (english, draft, output, status, seconds, error)."""
+def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None = None, terms: list | None = None):
+    """report: optional list that receives one dict per line (english, draft, output, status, seconds, error).
+    terms: glossary terms (app.glossary.Term) the LLM must use where the English contains them."""
     """Return unchanged rows unless explicitly enabled for English→Khmer."""
     if not (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) or source_lang != "en" or target_lang != "km":
         return rows
@@ -118,7 +131,7 @@ def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None 
 
     concurrency = max(1, int(getattr(settings, "llm_concurrency", 1) or 1))
     if concurrency > 1:
-        return _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency, report)
+        return _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency, report, terms)
 
     with httpx.Client(timeout=cfg["timeout"], trust_env=False) as client:
         for index, row in enumerate(rows):
@@ -136,17 +149,14 @@ def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None 
                 if not cfg["fail_open"]:
                     raise RuntimeError(msg)
                 break
-            payload = _payload(cfg, row)
             started = time.monotonic()
             try:
-                response = client.post(endpoint + "/chat/completions", json=payload,
-                                       timeout=min(cfg["timeout"], remaining))
-                response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-                edited[index] = replace(row, target_text=_clean_output(content, row.target_text))
+                text, miss = _ask(client, endpoint, cfg, rows, index, terms, min(cfg["timeout"], remaining))
+                edited[index] = replace(row, target_text=text)
                 stats["edited"] += 1
                 if report is not None:
-                    report.append(_task(index, row, "edited", started, edited[index].target_text))
+                    report.append(_task(index, row, "edited" if not miss else "edited (missing term: "
+                                        + ", ".join(t.source for t in miss) + ")", started, text))
             except httpx.ConnectError as exc:
                 if report is not None:
                     report.append(_task(index, row, "failed (server unreachable)", started, error=exc))
@@ -171,23 +181,63 @@ def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None 
     return edited
 
 
-def _payload(cfg, row) -> dict:
-    return {
-        "model": cfg["model"],
-        "temperature": 0,
-        "max_tokens": cfg["max_tokens"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps({
-                "english": row.source_text,
-                "draft_khmer": row.target_text,
-                "available_duration_ms": row.end_ms - row.start_ms,
-            }, ensure_ascii=False)},
-        ],
-    }
+def _mode() -> str:
+    return getattr(settings, "llm_mode", "polish") or "polish"
 
 
-def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency, report=None):
+def _payload(cfg, row, rows=None, index=None, terms=None, insist=None) -> dict:
+    if _mode() == "translate":
+        rows = rows or [row]
+        i = index if index is not None else 0
+        user = {"english": row.source_text,
+                "previous_line": rows[i - 1].source_text if i > 0 else "",
+                "next_line": rows[i + 1].source_text if i + 1 < len(rows) else "",
+                "machine_draft_may_be_wrong": row.target_text,
+                "available_seconds": round((row.end_ms - row.start_ms) / 1000, 1)}
+        if terms:
+            user["required_terms"] = {t.source: t.target for t in terms}
+        messages = [{"role": "system", "content": TRANSLATE_PROMPT},
+                    {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
+        if insist:
+            messages.append({"role": "user", "content": "Your answer must contain these Khmer words: "
+                             + ", ".join(f"{t.target} ({t.source})" for t in insist) + ". Reply with only the Khmer line."})
+    else:
+        user = {"english": row.source_text, "draft_khmer": row.target_text,
+                "available_duration_ms": row.end_ms - row.start_ms}
+        system = SYSTEM_PROMPT
+        if terms:
+            user["required_terms"] = {t.source: t.target for t in terms}
+            system += (" The draft may mistranslate the English words listed in required_terms; "
+                       "replace them with the given Khmer words.")
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
+    if insist and _mode() != "translate":
+        messages.append({"role": "user", "content": "Your answer must contain these Khmer words: "
+                         + ", ".join(f"{t.target} ({t.source})" for t in insist) + ". Reply with only the Khmer line."})
+    return {"model": cfg["model"], "temperature": 0, "max_tokens": cfg["max_tokens"], "messages": messages}
+
+
+def _ask(client, endpoint, cfg, rows, index, terms, timeout):
+    """One line: request, guard, and (glossary) one retry if a required term is missing.
+
+    Returns (text, missing_terms)."""
+    from app.glossary import terms_for, missing_terms
+    row = rows[index]
+    required = terms_for(row.source_text, terms) if terms else []
+    r = client.post(endpoint + "/chat/completions", json=_payload(cfg, row, rows, index, required), timeout=timeout)
+    r.raise_for_status()
+    text = _clean_output(r.json()["choices"][0]["message"]["content"], row.target_text)
+    miss = missing_terms(text, required)
+    if miss:
+        r = client.post(endpoint + "/chat/completions", json=_payload(cfg, row, rows, index, required, insist=miss), timeout=timeout)
+        r.raise_for_status()
+        retry = _clean_output(r.json()["choices"][0]["message"]["content"], row.target_text)
+        if len(missing_terms(retry, required)) < len(miss):
+            text, miss = retry, missing_terms(retry, required)
+    return text, miss
+
+
+def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency, report=None, terms=None):
     """Same per-segment requests and guards as the sequential path, N at a time.
 
     The server batches concurrent requests (Ollama: OLLAMA_NUM_PARALLEL; vLLM:
@@ -207,10 +257,7 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             raise TimeoutError("budget")
-        r = client.post(endpoint + "/chat/completions", json=_payload(cfg, rows[index]),
-                        timeout=min(cfg["timeout"], remaining))
-        r.raise_for_status()
-        return _clean_output(r.json()["choices"][0]["message"]["content"], rows[index].target_text)
+        return _ask(client, endpoint, cfg, rows, index, terms, min(cfg["timeout"], remaining))
 
     def note(index, status, output=None, error=None):
         if report is not None:
@@ -239,9 +286,10 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
             for fut in done:
                 index = pending.pop(fut)
                 try:
-                    edited[index] = replace(rows[index], target_text=fut.result())
+                    text, miss = fut.result()
+                    edited[index] = replace(rows[index], target_text=text)
                     stats["edited"] += 1
-                    note(index, "edited", edited[index].target_text)
+                    note(index, "edited" if not miss else "edited (missing term: " + ", ".join(t.source for t in miss) + ")", text)
                 except TimeoutError:
                     stats["skipped_budget"] += 1
                     note(index, "skipped (time budget)")

@@ -6,6 +6,7 @@ export type LLMInfo={enabled:boolean;provider:string;model:string;endpoint:strin
 export type JobEvent={id:number;at:string|null;stage:string;level:'info'|'warning'|'error';message:string;seconds:number|null;data:Record<string,unknown>|null};
 export type Segment={index:number;start_ms:number;end_ms:number;source:string;machine:string|null;llm:string|null;final:string;corrected:string|null;approved_unchanged:boolean};
 export type CorrectionSummary={pairs:number;edited:number;approved_unchanged:number;jobs:number;by_language_pair:Record<string,number>;recommended_minimum:number};
+export type GlossaryItem={id:number;source_term:string;target_term:string;note:string|null;source_lang:string;target_lang:string;created_by:string|null;created_at:string|null};
 export type MediaItem={id:string;filename:string;size_bytes:number;source_kind:'upload'|'url'|'youtube';source_url:string|null;capture_seconds:number|null;created_at:string|null;jobs:number;active:number;completed:number};
 export type TrashItem={kind:'job'|'video';id:string;filename:string;source_kind:string;size_bytes:number;status:Status|null;jobs:number|null;media_id:string;owner_user_id:string|null;owner_name:string|null;deleted_by:string|null;deleted_by_name:string|null;deleted_at:string|null};
 export type YouTubeInfo={id:string;title?:string;duration?:number;uploader?:string;height?:number;is_live?:boolean;thumbnail?:string;trimmed_to_seconds?:number|null};

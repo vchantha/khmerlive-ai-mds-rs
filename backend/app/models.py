@@ -99,3 +99,17 @@ class TranslationCorrection(Base):
     created_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())
+
+
+class GlossaryTerm(Base):
+    """Required terminology for translation (e.g. elephant -> ដំរី), applied by the LLM post-editor."""
+    __tablename__="glossary_terms"
+    __table_args__=(UniqueConstraint("source_lang","target_lang","source_term",name="uq_glossary_term"),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    source_lang:Mapped[str]=mapped_column(String(2))
+    target_lang:Mapped[str]=mapped_column(String(2))
+    source_term:Mapped[str]=mapped_column(String(200))
+    target_term:Mapped[str]=mapped_column(String(200))
+    note:Mapped[str|None]=mapped_column(String(500),nullable=True)
+    created_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
