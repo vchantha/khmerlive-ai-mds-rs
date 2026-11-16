@@ -15,7 +15,7 @@ from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.youtube import is_youtube_host,youtube_video_id,canonical_url,fetch_info,YouTubeURLRejected
 from app.tasks import translate_media
-from app.llm_postedit import llm_status
+from app.llm_postedit import llm_status,llm_smoke_test
 from app.media_preview import issue_playback_token,check_playback_token,parse_byte_range,srt_to_webvtt,InvalidPlaybackToken,InvalidByteRange
 from starlette.background import BackgroundTask
 from app.auth import router as auth_router, actor_from_request
@@ -351,6 +351,12 @@ def host_metrics():
         out["disk_used_bytes"]=du.used;out["disk_total_bytes"]=du.total
     except OSError:pass
     return out
+
+@app.post("/api/system/llm/smoke")
+def llm_smoke(actor:dict=Depends(authorize)):
+    """Admin: run one real post-edit request through the output guards (model readiness, not just liveness)."""
+    require_admin_for("the LLM smoke test",actor)
+    return llm_smoke_test()
 
 @app.get("/api/system",dependencies=[Depends(authorize)])
 def system_status():

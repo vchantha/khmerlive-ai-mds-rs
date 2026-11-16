@@ -38,7 +38,7 @@ def log_llm_tasks(job_id:str,tasks:list[dict]):
     try:
         with SessionLocal() as db:
             for t in tasks:
-                level="info" if t.get("status")=="edited" else "warning"
+                level="info" if t.get("status") in ("edited","unchanged") else "warning"
                 db.add(JobEvent(job_id=job_id,stage="llm",level=level,
                                 message=f"Line {t.get('index',0)+1}: {t.get('status')}",
                                 seconds=t.get("seconds"),data=json.dumps(_clip(t),ensure_ascii=False,default=str)))

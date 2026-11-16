@@ -10,6 +10,7 @@ Failure handling:
 - A total wall-clock budget bounds how long post-editing may delay a job;
   segments left when it runs out keep their original translation.
 """
+import hashlib
 import json
 import logging
 import re
@@ -66,16 +67,94 @@ def strip_reasoning(text: str) -> str:
     return text.strip()
 
 
-def _clean_output(content, draft: str) -> str:
+# Khmer block (U+1780–U+17FF) and Khmer Symbols (U+19E0–U+19FF).
+def _is_khmer(ch: str) -> bool:
+    return "\u1780" <= ch <= "\u17ff" or "\u19e0" <= ch <= "\u19ff"
+
+# Dependent vowels, signs and the coeng (U+17B6–U+17D3, U+17DD) cannot start a cluster.
+def _is_khmer_dependent(ch: str) -> bool:
+    return "\u17b6" <= ch <= "\u17d3" or ch == "\u17dd"
+
+_KHMER_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+_WRAPPER_LABEL = re.compile(r"^(?:khmer|translation|revised(?: khmer)?(?: translation)?|answer|ខ្មែរ|ការបកប្រែ)\s*[:：]\s*",
+                            re.IGNORECASE)
+_QUOTES = "\"'“”‘’«»`"
+
+
+def numbers_in(text: str) -> set[str]:
+    """Numbers written with Arabic or Khmer digits, normalized ("1,000" and "១០០០" → "1000")."""
+    found = set()
+    for n in _NUMBER.findall((text or "").translate(_KHMER_DIGITS)):
+        # "1,000" groups thousands; "2.5" keeps its decimal point.
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", n):
+            n = n.replace(",", "")
+        found.add(n.rstrip(".,"))
+    return found
+
+
+def _unwrap(text: str) -> str:
+    """Drop formatting a chat model may wrap the line in: code fences, a label, quotes."""
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```") and len(text) >= 6:
+        text = text[3:-3].strip()
+        if "\n" in text and not any(_is_khmer(c) for c in text.split("\n", 1)[0]):
+            text = text.split("\n", 1)[1].strip()   # ```khmer language tag line
+    text = _WRAPPER_LABEL.sub("", text).strip()
+    if len(text) >= 2 and text[0] in _QUOTES and text[-1] in _QUOTES:
+        text = text[1:-1].strip()
+    return text
+
+
+def validate_khmer_line(result: str, source: str, draft: str) -> None:
+    """Reject outputs that are malformed or that change facts the draft preserved.
+
+    These are safety guards, not a quality score: a line that passes still needs
+    human review (adequacy, fluency), and Khmer script alone proves nothing.
+    """
+    if not result:
+        raise PostEditError("LLM returned an empty line")
+    if "\n" in result:
+        raise PostEditError("LLM returned several lines instead of one")
+    if "\ufffd" in result or any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 for c in result):
+        raise PostEditError("LLM output contains invalid or control characters")
+    khmer = sum(1 for c in result if _is_khmer(c))
+    latin = sum(1 for c in result if c.isascii() and c.isalpha())
+    if khmer == 0:
+        raise PostEditError("LLM response does not contain Khmer script")
+    if latin > khmer:
+        raise PostEditError("LLM response is mostly Latin script, not Khmer")
+    if _is_khmer_dependent(result[0]):
+        raise PostEditError("LLM output starts with a Khmer dependent sign (malformed text)")
+    if len(result) > max(150, len(draft) * 3):
+        raise PostEditError("LLM returned excessively long output")
+    if len(draft) >= 20 and len(result) < len(draft) * 0.35:
+        raise PostEditError("LLM output is much shorter than the draft (likely dropped content)")
+    if source and result.strip().lower() == source.strip().lower():
+        raise PostEditError("LLM echoed the English source")
+    # Numbers: never drop a number the draft kept, never invent one.
+    src, drf, out = numbers_in(source), numbers_in(draft), numbers_in(result)
+    dropped = sorted((src & drf) - out)
+    if dropped:
+        raise PostEditError("LLM dropped or changed number(s): " + ", ".join(dropped))
+    invented = sorted(out - src - drf)
+    if invented:
+        raise PostEditError("LLM introduced number(s) not in the source: " + ", ".join(invented))
+
+
+def _clean_output(content, draft: str, source: str = "") -> str:
     if not isinstance(content, str):
         raise PostEditError("LLM response content must be text")
-    result = strip_reasoning(content)
-    # Basic output guard; human evaluation remains necessary.
-    if not result or len(result) > max(150, len(draft) * 3):
-        raise PostEditError("LLM returned empty or excessively long output")
-    if not any("ក" <= ch <= "៿" for ch in result):
-        raise PostEditError("LLM response does not contain Khmer script")
+    result = _unwrap(strip_reasoning(content))
+    validate_khmer_line(result, source, draft)
     return result
+
+
+def prompt_version(mode: str | None = None) -> str:
+    """Short hash of the prompt in use, stored with results so experiments are reproducible."""
+    mode = mode or _mode()
+    text = TRANSLATE_PROMPT if mode == "translate" else SYSTEM_PROMPT
+    return f"{mode}-{hashlib.sha256(text.encode()).hexdigest()[:10]}"
 
 
 def _resolve_config():
@@ -87,6 +166,7 @@ def _resolve_config():
             timeout=float(settings.llm_timeout_seconds),
             max_tokens=settings.llm_max_tokens,
             fail_open=settings.llm_fail_open,
+            retries=max(0, int(getattr(settings, "llm_max_retries", 0) or 0)),
         )
     return dict(
         provider="vllm",
@@ -95,6 +175,7 @@ def _resolve_config():
         timeout=float(settings.vllm_timeout_seconds),
         max_tokens=settings.vllm_max_tokens,
         fail_open=settings.vllm_fail_open,
+        retries=max(0, int(getattr(settings, "llm_max_retries", 0) or 0)),
     )
 
 
@@ -105,13 +186,17 @@ def _task(index, row, status, started, output=None, error=None):
 
 
 def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None = None, terms: list | None = None):
-    """report: optional list that receives one dict per line (english, draft, output, status, seconds, error).
-    terms: glossary terms (app.glossary.Term) the LLM must use where the English contains them."""
-    """Return unchanged rows unless explicitly enabled for English→Khmer."""
+    """Return unchanged rows unless explicitly enabled for English→Khmer.
+
+    report: optional list that receives one dict per line (english, draft, output, status, seconds, error).
+    terms: glossary terms (app.glossary.Term) the LLM must use where the English contains them.
+    """
     if not (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) or source_lang != "en" or target_lang != "km":
         return rows
     cfg = _resolve_config()
     provider = cfg["provider"]
+    if provider == "none":
+        return rows   # LLM_PROVIDER=none: keep the machine translation, no network call.
     try:
         if provider not in {"ollama", "vllm"}:
             raise ValueError("Unsupported offline LLM provider")
@@ -151,12 +236,11 @@ def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None 
                 break
             started = time.monotonic()
             try:
-                text, miss = _ask(client, endpoint, cfg, rows, index, terms, min(cfg["timeout"], remaining))
+                text, miss = _ask(client, endpoint, cfg, rows, index, terms, min(cfg["timeout"], remaining), deadline)
                 edited[index] = replace(row, target_text=text)
                 stats["edited"] += 1
                 if report is not None:
-                    report.append(_task(index, row, "edited" if not miss else "edited (missing term: "
-                                        + ", ".join(t.source for t in miss) + ")", started, text))
+                    report.append(_task(index, row, _status(row, text, miss), started, text))
             except httpx.ConnectError as exc:
                 if report is not None:
                     report.append(_task(index, row, "failed (server unreachable)", started, error=exc))
@@ -217,21 +301,52 @@ def _payload(cfg, row, rows=None, index=None, terms=None, insist=None) -> dict:
     return {"model": cfg["model"], "temperature": 0, "max_tokens": cfg["max_tokens"], "messages": messages}
 
 
-def _ask(client, endpoint, cfg, rows, index, terms, timeout):
+def _status(row, text, miss) -> str:
+    base = "unchanged" if text == row.target_text else "edited"
+    return base if not miss else f"{base} (missing term: " + ", ".join(t.source for t in miss) + ")"
+
+
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _complete(client, endpoint, cfg, payload, timeout, deadline=None) -> str:
+    """POST one chat completion, retrying transient failures (timeouts, 429, 5xx).
+
+    Connection refusals are not retried (the caller stops: the server is down), nor are
+    rejected outputs (temperature 0 would return the same text). Retries never exceed
+    the job's post-editing deadline.
+    """
+    attempts = 1 + cfg.get("retries", 0)
+    for attempt in range(attempts):
+        try:
+            r = client.post(endpoint + "/chat/completions", json=payload, timeout=timeout)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+            transient = isinstance(exc, httpx.TimeoutException) or exc.response.status_code in _RETRY_STATUS
+            left = None if deadline is None else deadline - time.monotonic()
+            if not transient or attempt == attempts - 1 or (left is not None and left <= 1):
+                raise
+            if left is not None:
+                timeout = min(timeout, left)
+            logger.info("Retrying LLM request after %s (attempt %d/%d)", type(exc).__name__, attempt + 2, attempts)
+            time.sleep(min(0.5 * (attempt + 1), 2.0))
+    raise RuntimeError("unreachable")
+
+
+def _ask(client, endpoint, cfg, rows, index, terms, timeout, deadline=None):
     """One line: request, guard, and (glossary) one retry if a required term is missing.
 
     Returns (text, missing_terms)."""
     from app.glossary import terms_for, missing_terms
     row = rows[index]
     required = terms_for(row.source_text, terms) if terms else []
-    r = client.post(endpoint + "/chat/completions", json=_payload(cfg, row, rows, index, required), timeout=timeout)
-    r.raise_for_status()
-    text = _clean_output(r.json()["choices"][0]["message"]["content"], row.target_text)
+    content = _complete(client, endpoint, cfg, _payload(cfg, row, rows, index, required), timeout, deadline)
+    text = _clean_output(content, row.target_text, row.source_text)
     miss = missing_terms(text, required)
     if miss:
-        r = client.post(endpoint + "/chat/completions", json=_payload(cfg, row, rows, index, required, insist=miss), timeout=timeout)
-        r.raise_for_status()
-        retry = _clean_output(r.json()["choices"][0]["message"]["content"], row.target_text)
+        content = _complete(client, endpoint, cfg, _payload(cfg, row, rows, index, required, insist=miss), timeout, deadline)
+        retry = _clean_output(content, row.target_text, row.source_text)
         if len(missing_terms(retry, required)) < len(miss):
             text, miss = retry, missing_terms(retry, required)
     return text, miss
@@ -257,7 +372,7 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             raise TimeoutError("budget")
-        return _ask(client, endpoint, cfg, rows, index, terms, min(cfg["timeout"], remaining))
+        return _ask(client, endpoint, cfg, rows, index, terms, min(cfg["timeout"], remaining), deadline)
 
     def note(index, status, output=None, error=None):
         if report is not None:
@@ -289,7 +404,7 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
                     text, miss = fut.result()
                     edited[index] = replace(rows[index], target_text=text)
                     stats["edited"] += 1
-                    note(index, "edited" if not miss else "edited (missing term: " + ", ".join(t.source for t in miss) + ")", text)
+                    note(index, _status(rows[index], text, miss), text)
                 except TimeoutError:
                     stats["skipped_budget"] += 1
                     note(index, "skipped (time budget)")
@@ -393,7 +508,11 @@ def llm_status(probe_timeout: float = 1.0) -> dict:
     out = {"enabled": enabled, "provider": provider, "model": model,
            "endpoint": cfg["base_url"], "server": "unknown", "model_available": None,
            "available_models": [], "status": "off", "detail": None,
-           "processor": None, "gpu_percent": None}
+           "processor": None, "gpu_percent": None, "prompt_version": prompt_version(),
+           "mode": _mode()}
+    if provider == "none":
+        out.update(status="off", server="not used", detail="LLM_PROVIDER=none: machine translation is used unchanged")
+        return out
     try:
         if provider not in {"ollama", "vllm"}:
             raise ValueError("Unsupported offline LLM provider")
@@ -423,6 +542,9 @@ def llm_status(probe_timeout: float = 1.0) -> dict:
     out.update(server="online", available_models=names, model_available=available)
     if enabled:
         out["status"] = "ready" if available else "model_missing"
+        if not available:
+            out["detail"] = (f"Model '{model}' is not on the {provider} server. Weights are never downloaded "
+                             "automatically offline; provision them first (see docs/OFFLINE_OLLAMA.md / OFFLINE_VLLM.md).")
     out.update(_processor_status(provider, endpoint, model, probe_timeout) if available else {})
     return out
 
@@ -452,3 +574,44 @@ def _processor_status(provider: str, endpoint: str, model: str, probe_timeout: f
             pct = max(0, min(100, round(100 * vram / size)))
             return {"processor": "gpu" if pct == 100 else "cpu" if pct == 0 else "split", "gpu_percent": pct}
     return {"processor": "idle", "gpu_percent": None}
+
+
+SMOKE_SOURCE = "The course has 12 lessons."
+SMOKE_DRAFT = "វគ្គសិក្សានេះមាន 12 មេរៀន។"
+
+
+def llm_smoke_test(timeout: float | None = None) -> dict:
+    """Readiness beyond "the server answers": run one real post-edit through the same guards.
+
+    Returns ok, seconds, output, error, provider, model and prompt_version. Used by
+    `python -m app.llm_postedit --smoke` and the admin smoke-test endpoint.
+    """
+    status = llm_status()
+    out = {"ok": False, "provider": status["provider"], "model": status["model"],
+           "prompt_version": status["prompt_version"], "status": status["status"],
+           "seconds": None, "output": None, "error": None}
+    if status["status"] != "ready":
+        out["error"] = status.get("detail") or f"LLM is not ready (status: {status['status']})"
+        return out
+    cfg = _resolve_config()
+    endpoint = validate_local_endpoint(cfg["base_url"])
+    timeout = float(timeout or cfg["timeout"])
+
+    class _Row:
+        start_ms, end_ms, source_text, target_text = 0, 2500, SMOKE_SOURCE, SMOKE_DRAFT
+    started = time.monotonic()
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            text, _ = _ask(client, endpoint, cfg, [_Row], 0, None, timeout)
+        out.update(ok=True, output=text)
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    out["seconds"] = round(time.monotonic() - started, 3)
+    return out
+
+
+if __name__ == "__main__":   # python -m app.llm_postedit [--smoke]
+    import sys
+    result = llm_smoke_test() if "--smoke" in sys.argv else llm_status()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    sys.exit(0 if result.get("ok", result.get("status") == "ready") else 1)

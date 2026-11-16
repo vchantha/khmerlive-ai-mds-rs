@@ -329,8 +329,9 @@ function JobLogs({ctx,job}:{ctx:Ctx;job:Job}){
  useEffect(()=>{if(!open||!isActive(job.status))return;const t=setInterval(()=>void load(),3000);return()=>clearInterval(t)},[open,job.status,job.id]);
  const steps=(events||[]).filter(e=>e.stage!=='llm');
  const llm=(events||[]).filter(e=>e.stage==='llm').map(e=>({...(e.data as Record<string,unknown>),level:e.level,id:e.id}) as {id:number;index:number;english:string;draft:string;output:string|null;status:string;seconds:number|null;error:string|null;level:string});
+ const ok=(t:{status:string})=>t.status==='edited'||t.status==='unchanged';
  const changed=llm.filter(t=>t.status==='edited'&&t.output!==t.draft).length;
- const shown=llm.filter(t=>(filter==='all'||(filter==='changed'?t.status==='edited':t.status!=='edited'))&&(!q||[t.english,t.draft,t.output].some(x=>x&&x.toLowerCase().includes(q.toLowerCase()))));
+ const shown=llm.filter(t=>(filter==='all'||(filter==='changed'?t.status==='edited'&&t.output!==t.draft:!(t.status==='edited'&&t.output!==t.draft)))&&(!q||[t.english,t.draft,t.output].some(x=>x&&x.toLowerCase().includes(q.toLowerCase()))));
  const download=()=>saveBlob(new Blob([JSON.stringify(events||[],null,2)],{type:'application/json'}),'job-'+shortId(job.id)+'-log.json');
  return <section className="card logs">
   <button className="logs-toggle" aria-expanded={open} onClick={()=>setOpen(v=>!v)}>
@@ -354,12 +355,12 @@ function JobLogs({ctx,job}:{ctx:Ctx;job:Job}){
      <span className="logs-dur">{fmtSec(e.seconds)}</span>
     </li>)}</ol>:<div className="empty"><b>No log entries yet</b><span>Jobs processed before this update have no step log.</span></div>)}
    {events&&tab==='llm'&&(llm.length?<>
-    <p className="hint">{llm.length} lines sent to the LLM · {changed} changed · {llm.filter(t=>t.status!=='edited').length} kept the machine translation · avg {fmtSec(llm.reduce((a,t)=>a+(t.seconds||0),0)/llm.length)} per line</p>
+    <p className="hint">{llm.length} lines sent to the LLM · {changed} changed · {llm.length-changed} kept the machine translation · avg {fmtSec(llm.reduce((a,t)=>a+(t.seconds||0),0)/llm.length)} per line</p>
     <div className="table-wrap"><table className="table logs-llm"><thead><tr><th>#</th><th>English</th><th>Machine draft</th><th>LLM output</th><th>Result</th><th>Time</th></tr></thead><tbody>
      {shown.map(t=><tr key={t.id} className="no-click">
       <td className="nowrap">{t.index+1}</td><td>{t.english}</td><td className="km">{t.draft}</td>
       <td className="km">{t.output??<span className="muted">—</span>}</td>
-      <td><span className={'badge badge-'+(t.status==='edited'?'ok':'warn')} title={t.error||undefined}>{t.status==='edited'?(t.output===t.draft?'Unchanged':'Edited'):t.status}</span>{t.error&&<small className="clip" title={t.error}>{t.error}</small>}</td>
+      <td><span className={'badge badge-'+(ok(t)?'ok':'warn')} title={t.error||undefined}>{ok(t)?(t.output===t.draft?'Unchanged':'Edited'):t.status}</span>{t.error&&<small className="clip" title={t.error}>{t.error}</small>}</td>
       <td className="nowrap">{fmtSec(t.seconds)}</td></tr>)}
      {!shown.length&&<tr><td colSpan={6}><div className="empty"><b>No lines match</b></div></td></tr>}
     </tbody></table></div></>

@@ -20,6 +20,34 @@ the checks required before we call a release ready.
 Real processing runs only with `MODEL_MODE=real_subtitles`; demo mode is not dubbed translation.
 The named `real_subtitles` mode may also dub Khmer if `ENABLE_KHMER_DUBBING=true`.
 
+### LLM output guards and readiness (2026-11-17)
+
+Every LLM line passes `validate_khmer_line` (`backend/app/llm_postedit.py`) before it can replace
+the M2M100 draft; a rejected line keeps the draft and is logged as `kept original (rejected output)`
+with the reason. The guards reject: empty, multi-line, control/U+FFFD characters, no Khmer script,
+mostly-Latin output, a leading Khmer dependent sign, an echo of the English, output >3× or <35% of
+the draft length, and **any number the draft kept that the LLM dropped or changed, or a number it
+invented** (Khmer digits ០–៩ count as the same number). Code fences, quotes and "Khmer:" labels
+are stripped first.
+
+Measured on the target machine (Qwen3-4B-Instruct via Ollama 0.12.10, temperature 0): for
+"The course has 12 lessons and costs 50 dollars." the LLM changed `50 ដុល្លារ` to `5 ដុល្លារ` in
+2 of 2 runs. Before this guard the corrupted line was accepted as "edited"; now it is rejected and
+the correct draft is dubbed. The guards are safety checks, not a quality metric: lines that pass
+still need human adequacy/fluency review.
+
+- Lines returned identical to the draft are logged `unchanged`, not `edited`, so E1 statistics
+  count real edits only.
+- `LLM_MAX_RETRIES` (default 1) retries timeouts and HTTP 429/5xx within the job's time budget;
+  connection refusals (server down) and rejected outputs are not retried.
+- `LLM_PROVIDER=none` keeps the machine translation without any network call.
+- `prompt_version` (hash of the active prompt) is stored in the job's `timings.llm` with provider,
+  model and mode, and in the pipeline log, so results can be tied to the exact prompt.
+- Readiness: `/api/system` reports `ready` only when the server answers **and** the configured
+  model is installed. A real inference check runs through the same guards:
+  `docker compose exec worker python -m app.llm_postedit --smoke` (exit 0 = pass) or
+  `POST /api/system/llm/smoke` (admin only).
+
 ## B. Infrastructure responsibilities
 
 - React frontend and FastAPI are the user-facing application.

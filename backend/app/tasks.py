@@ -18,7 +18,7 @@ from app.storage import client
 from app.adapters import get_adapters
 from app.real_inference import translate_audio, build_srt, TimedText
 from app.khmer_tts import build_dubbed_audio
-from app.llm_postedit import postedit_rows,unload_llm,preload_llm
+from app.llm_postedit import postedit_rows,unload_llm,preload_llm,prompt_version
 from app.joblog import log_event,log_llm_tasks
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
@@ -400,7 +400,7 @@ def _translate_media(job_id:str):
                         counts={}
                         for t in llm_tasks:counts[t["status"]]=counts.get(t["status"],0)+1
                         clock.note(model=settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
-                                   mode=settings.llm_mode,glossary_terms=len(glossary),
+                                   mode=settings.llm_mode,prompt_version=prompt_version(),glossary_terms=len(glossary),
                                    lines=len(llm_tasks),results=counts,parallel=settings.llm_concurrency)
                         translated=" ".join(row.target_text for row in rows_for_dubbing)
                         subtitle_path.write_text(build_srt(rows_for_dubbing),encoding="utf-8")
@@ -485,6 +485,11 @@ def _translate_media(job_id:str):
                 info={"seconds":stages,"media_seconds":round(clip_seconds,1),"segments":timings.get("segments"),
                       "mt_engine":timings.get("mt_engine"),"devices":{k:settings.device_for(k) for k in ("asr","mt","tts")},
                       "cpu_threads":settings.threads_per_job()}
+                if machine_rows is not None and (settings.llm_postedit_enabled or settings.vllm_postedit_enabled):
+                    # Provenance for research: which LLM/prompt produced the "llm" column of job.segments.
+                    info["llm"]={"provider":settings.llm_provider if settings.llm_postedit_enabled else "vllm",
+                                 "model":settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
+                                 "mode":settings.llm_mode,"prompt_version":prompt_version()}
                 job.timings=json.dumps(info)
                 logger.info("Job %s finished in %.1fs for %.0fs of media: %s",job.id,stages["total"],clip_seconds,stages)
                 set_state(db,job,"completed",progress=100,stage="completed")

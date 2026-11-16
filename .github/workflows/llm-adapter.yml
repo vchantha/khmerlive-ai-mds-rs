@@ -5,6 +5,7 @@ on:
       - "backend/app/config.py"
       - "backend/app/llm_postedit.py"
       - "backend/tests/test_llm_postedit.py"
+      - "backend/tests/test_llm_guards.py"
       - "compose.ollama.yaml"
       - "compose.vllm.yaml"
       - ".github/workflows/llm-adapter.yml"
@@ -21,11 +22,11 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install "pytest==8.3.5" "httpx==0.28.1" "pydantic-settings==2.8.1"
       - name: Check Python syntax
-        run: python -m compileall -q backend/app/llm_postedit.py backend/app/config.py backend/tests/test_llm_postedit.py backend/app/tasks.py
+        run: python -m compileall -q backend/app/llm_postedit.py backend/app/config.py backend/tests/test_llm_postedit.py backend/tests/test_llm_guards.py backend/app/tasks.py
       - name: Run offline LLM adapter tests
         env:
           PYTHONPATH: backend
-        run: python -m pytest -q backend/tests/test_llm_postedit.py
+        run: python -m pytest -q backend/tests/test_llm_postedit.py backend/tests/test_llm_guards.py
       - name: Check Ollama Compose config
         run: |
           cp .env.example .env

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     khmer_tts_model_path:str="/models/tts"
     enable_khmer_dubbing:bool=True
     llm_postedit_enabled:bool=False
+    # ollama | vllm | none (none = keep the machine translation; no LLM call)
     llm_provider:str="ollama"
     llm_base_url:str="http://ollama:11434/v1"
     llm_model:str="qwen3:4b-instruct"
@@ -34,6 +35,8 @@ class Settings(BaseSettings):
     llm_max_tokens:int=256
     llm_fail_open:bool=True
     llm_total_budget_seconds:float=900.0
+    # Extra attempts per line after a transient failure (timeout, HTTP 429/5xx). 0 = no retry.
+    llm_max_retries:int=1
     vllm_postedit_enabled:bool=False
     vllm_base_url:str="http://vllm:8000/v1"
     vllm_model:str="khmerlive-postedit"

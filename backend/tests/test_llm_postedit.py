@@ -123,21 +123,21 @@ def _scripted_client(replies):
 
 def test_one_bad_segment_keeps_other_edits(monkeypatch):
     monkeypatch.setattr(llm_postedit, "settings", _ollama_settings())
-    Client, calls = _scripted_client(["ក១", "English only", "ក៣"])
+    Client, calls = _scripted_client(["កខ", "English only", "គឃ"])
     monkeypatch.setattr(llm_postedit.httpx, "Client", Client)
     rows = [Row(0, 900, "a", "ក"), Row(900, 1800, "b", "ខ"), Row(1800, 2700, "c", "គ")]
     edited = llm_postedit.postedit_rows(rows, "en", "km")
-    assert [r.target_text for r in edited] == ["ក១", "ខ", "ក៣"]
+    assert [r.target_text for r in edited] == ["កខ", "ខ", "គឃ"]
     assert len(calls) == 3
 
 
 def test_segment_timeout_only_reverts_that_segment(monkeypatch):
     import httpx
     monkeypatch.setattr(llm_postedit, "settings", _ollama_settings())
-    Client, _ = _scripted_client([httpx.ReadTimeout("slow"), "ក២"])
+    Client, _ = _scripted_client([httpx.ReadTimeout("slow"), "កគ"])
     monkeypatch.setattr(llm_postedit.httpx, "Client", Client)
     rows = [Row(0, 900, "a", "ក"), Row(900, 1800, "b", "ខ")]
-    assert [r.target_text for r in llm_postedit.postedit_rows(rows, "en", "km")] == ["ក", "ក២"]
+    assert [r.target_text for r in llm_postedit.postedit_rows(rows, "en", "km")] == ["ក", "កគ"]
 
 
 def test_unreachable_server_stops_after_first_attempt(monkeypatch):
@@ -162,10 +162,10 @@ def test_budget_exhaustion_leaves_remaining_segments(monkeypatch):
     monkeypatch.setattr(llm_postedit, "settings", _ollama_settings(llm_total_budget_seconds=100))
     clock = iter([0.0, 0.0, 200.0, 200.0])
     monkeypatch.setattr(llm_postedit.time, "monotonic", lambda: next(clock))
-    Client, calls = _scripted_client(["ក១", "ក២"])
+    Client, calls = _scripted_client(["កខ", "កគ"])
     monkeypatch.setattr(llm_postedit.httpx, "Client", Client)
     rows = [Row(0, 900, "a", "ក"), Row(900, 1800, "b", "ខ")]
-    assert [r.target_text for r in llm_postedit.postedit_rows(rows, "en", "km")] == ["ក១", "ខ"]
+    assert [r.target_text for r in llm_postedit.postedit_rows(rows, "en", "km")] == ["កខ", "ខ"]
     assert len(calls) == 1
     assert calls[0]["timeout"] <= 30
 
