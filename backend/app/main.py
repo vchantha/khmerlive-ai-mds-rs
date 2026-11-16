@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel,Field
 from sqlalchemy import select,text,func,or_,delete
 from app.db import SessionLocal
-from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity,JobEvent
+from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity,JobEvent,TranslationCorrection
 from app.joblog import log_event
 from app.storage import client
 from app.config import settings
@@ -430,6 +430,97 @@ def job_events(job_id:str,stage:str|None=Query(None,max_length=40),actor:dict=De
         return {"items":[{"id":e.id,"at":e.created_at.isoformat() if e.created_at else None,"stage":e.stage,
                           "level":e.level,"message":e.message,"seconds":e.seconds,"data":data(e.data)} for e in rows]}
 
+# ---------------- Translation corrections (fine-tuning data) ----------------
+
+MAX_LINE_CHARS=1000
+RECOMMENDED_PAIRS=300
+
+def _segments(job)->list:
+    import json
+    try:return json.loads(job.segments) if job.segments else []
+    except ValueError:return []
+
+@app.get("/api/jobs/{job_id}/segments",dependencies=[Depends(authorize)])
+def job_segments(job_id:str,actor:dict=Depends(authorize)):
+    """Subtitle lines with English, machine draft, LLM output, final text and any human correction."""
+    with session() as db:
+        job=owned_job(db,job_id,actor)
+        if job is None:raise HTTPException(404,"Job not found")
+        fixes={c.segment_index:c for c in db.scalars(select(TranslationCorrection).where(TranslationCorrection.job_id==job_id))}
+        items=[]
+        for i,seg in enumerate(_segments(job)):
+            c=fixes.get(i)
+            items.append({"index":i,**seg,"corrected":c.corrected_text if c else None,
+                          "approved_unchanged":bool(c and c.approved_unchanged)})
+        return {"items":items,"source_lang":job.source_lang,"target_lang":job.target_lang,
+                "available":bool(job.segments),"verified":len(fixes)}
+
+class CorrectionItem(BaseModel):
+    index:int=Field(ge=0)
+    # null/empty removes the correction; otherwise the verified translation of this line.
+    corrected_text:str|None=Field(default=None,max_length=MAX_LINE_CHARS)
+
+class CorrectionsPayload(BaseModel):
+    items:list[CorrectionItem]=Field(max_length=2000)
+
+@app.put("/api/jobs/{job_id}/corrections",dependencies=[Depends(authorize)])
+def save_corrections(job_id:str,payload:CorrectionsPayload,actor:dict=Depends(authorize)):
+    with session() as db:
+        job=owned_job(db,job_id,actor)
+        if job is None:raise HTTPException(404,"Job not found")
+        segs=_segments(job)
+        if not segs:raise HTTPException(409,"This job has no stored lines. Run it again to enable corrections.")
+        existing={c.segment_index:c for c in db.scalars(select(TranslationCorrection).where(
+            TranslationCorrection.job_id==job_id).with_for_update())}
+        saved=removed=0
+        for item in payload.items:
+            if item.index>=len(segs):raise HTTPException(422,f"Line {item.index+1} does not exist")
+            text=(item.corrected_text or "").strip()
+            c=existing.get(item.index)
+            if not text:
+                if c:db.delete(c);removed+=1
+                continue
+            if job.target_lang=="km" and not any("\u1780"<=ch<="\u17ff" for ch in text):
+                raise HTTPException(422,f"Line {item.index+1}: the Khmer translation must contain Khmer script")
+            seg=segs[item.index]
+            if c is None:
+                c=TranslationCorrection(job_id=job_id,segment_index=item.index,start_ms=seg["start_ms"],end_ms=seg["end_ms"],
+                    source_lang=job.source_lang,target_lang=job.target_lang,source_text=seg["source"],
+                    machine_text=seg.get("machine"),llm_text=seg.get("llm"),corrected_text=text)
+                db.add(c)
+            c.corrected_text=text
+            c.approved_unchanged=text==(seg.get("final") or "").strip()
+            c.created_by=actor_label(actor)
+            saved+=1
+        db.commit()
+        total=db.scalar(select(func.count()).select_from(TranslationCorrection).where(TranslationCorrection.job_id==job_id))
+    log_event(job_id,"job",f"Translation review saved: {saved} line(s) verified"+(f", {removed} cleared" if removed else ""),
+              by=actor_label(actor))
+    return {"saved":saved,"removed":removed,"verified":total}
+
+def _owned_corrections(actor):
+    q=(select(TranslationCorrection,TranslationJob).join(TranslationJob,TranslationCorrection.job_id==TranslationJob.id)
+       .where(TranslationJob.deleted_at.is_(None)))
+    return only_owned(q,actor,TranslationJob)
+
+@app.get("/api/dataset/corrections",dependencies=[Depends(authorize)])
+def correction_dataset(format:str=Query("summary",pattern="^(summary|jsonl)$"),actor:dict=Depends(authorize)):
+    """Verified line pairs. format=jsonl downloads the fine-tuning dataset."""
+    import json
+    with session() as db:
+        rows=db.execute(_owned_corrections(actor).order_by(TranslationCorrection.job_id,TranslationCorrection.segment_index)).all()
+    if format=="jsonl":
+        body="".join(json.dumps({"job_id":c.job_id,"segment":c.segment_index,"source_lang":c.source_lang,"target_lang":c.target_lang,
+                                 "source":c.source_text,"target":c.corrected_text,"machine":c.machine_text,"llm":c.llm_text,
+                                 "edited":not c.approved_unchanged},ensure_ascii=False)+"\n" for c,_ in rows)
+        return PlainTextResponse(body,media_type="application/jsonl",
+                                 headers={"Content-Disposition":'attachment; filename="khmerlive-corrections.jsonl"'})
+    by_pair={}
+    for c,_ in rows:by_pair[f"{c.source_lang}-{c.target_lang}"]=by_pair.get(f"{c.source_lang}-{c.target_lang}",0)+1
+    return {"pairs":len(rows),"edited":sum(1 for c,_ in rows if not c.approved_unchanged),
+            "approved_unchanged":sum(1 for c,_ in rows if c.approved_unchanged),
+            "jobs":len({c.job_id for c,_ in rows}),"by_language_pair":by_pair,"recommended_minimum":RECOMMENDED_PAIRS}
+
 @app.delete("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
 def delete_job(job_id:str,actor:dict=Depends(authorize)):
     """Move a finished, failed or cancelled job to the Trash. Files are kept until an admin purges it."""
@@ -560,12 +651,14 @@ def _purge(db,kind,row)->list:
     """Hard-delete a trashed row (a video takes all of its jobs). Returns storage keys to remove."""
     if kind=="job":
         db.execute(delete(JobEvent).where(JobEvent.job_id==row.id))
+        db.execute(delete(TranslationCorrection).where(TranslationCorrection.job_id==row.id))
         keys=[row.output_key,row.subtitle_key];db.delete(row);return keys
     jobs=db.scalars(select(TranslationJob).where(TranslationJob.media_id==row.id)).all()
     if any(j.deleted_at is None for j in jobs):
         raise HTTPException(409,"Restore or trash this video's remaining jobs first")
     keys=[row.object_key]+[k for j in jobs for k in (j.output_key,j.subtitle_key)]
     db.execute(delete(JobEvent).where(JobEvent.job_id.in_([j.id for j in jobs])))
+    db.execute(delete(TranslationCorrection).where(TranslationCorrection.job_id.in_([j.id for j in jobs])))
     db.execute(delete(TranslationJob).where(TranslationJob.media_id==row.id))
     db.delete(row);return keys
 
@@ -650,6 +743,7 @@ def retry_job(job_id:str,actor:dict=Depends(authorize)):
         j.progress=0
         j.stage="queued for retry"
         j.timings=None
+        j.segments=None
         log_event(j.id,"job","Retry requested",by=actor_label(actor))
         j.error=None
         j.output_key=None

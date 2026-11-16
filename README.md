@@ -126,6 +126,32 @@ better. To get the old engine back, set `MT_ENGINE=transformers` in `.env`.
 We also tested asking the LLM (qwen3:4b) to correct the transcripts. It made them **worse**
 (4.43% → 5.30% WER; it also "corrected" words that were already right), so it isn't part of the pipeline.
 
+### Improving translation with your own corrections (fine-tuning)
+
+The translation model (M2M100) makes word-level mistakes, for example "elephants" → "internet".
+You can teach it your content and style:
+
+1. **Review.** Open a finished job and expand **Review translation**. For each line, either fix the
+   Khmer or click **Correct** if it's already right, then **Save** (Ctrl+Enter). The play button on
+   each line jumps the video there. Only lines you saved become training data.
+2. **Track progress.** The **Datasets** page shows how many lines are verified. Collect **300+ lines**
+   from several videos before training (the script refuses with fewer than 100).
+3. **Train.** On the server, run:
+   ```bash
+   ./scripts/finetune-mt.sh              # train, evaluate, deploy only if better
+   ./scripts/finetune-mt.sh --no-deploy  # train and evaluate only
+   ./scripts/finetune-mt.sh --rollback   # back to the original model
+   ```
+   The script trains a LoRA adapter on the GPU (it pauses the worker meanwhile; queued jobs wait). It then
+   scores the old and new models on **videos held out from training** (chrF++) and switches
+   `MT_CT2_PATH` only if the new model scores at least 1 point higher. Each run's report, with
+   example translations, is saved at `models/mt-ft-<date>/report.json`.
+
+Notes: the first run needs Internet once (it installs the PEFT library into the training container).
+Jobs processed before this feature can't be reviewed; run the video again to review it. Fix the
+translation of what was said; if the English line itself is wrong (a speech-recognition error), translate
+what the speaker actually said.
+
 ### Khmer voice (dubbing) behaviour
 
 Each Khmer line is spoken at **natural speed and pitch**, starting at its subtitle time.

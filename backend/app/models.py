@@ -38,6 +38,8 @@ class TranslationJob(Base):
     processing_mode:Mapped[str]=mapped_column(String(32),default="demo",server_default="demo")
     # JSON: seconds per pipeline stage, devices and engines used (performance tuning).
     timings:Mapped[str|None]=mapped_column(Text,nullable=True)
+    # JSON list of subtitle lines: start_ms, end_ms, source, machine (MT draft), llm, final.
+    segments:Mapped[str|None]=mapped_column(Text,nullable=True)
     owner_user_id:Mapped[str|None]=mapped_column(ForeignKey("app_users.id"),nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())
@@ -75,3 +77,25 @@ class JobEvent(Base):
     message:Mapped[str]=mapped_column(Text)
     seconds:Mapped[float|None]=mapped_column(Float,nullable=True)
     data:Mapped[str|None]=mapped_column(Text,nullable=True)   # JSON details
+
+
+class TranslationCorrection(Base):
+    """A human-verified translation of one subtitle line: training data for fine-tuning."""
+    __tablename__="translation_corrections"
+    __table_args__=(UniqueConstraint("job_id","segment_index",name="uq_correction_job_segment"),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    job_id:Mapped[str]=mapped_column(ForeignKey("translation_jobs.id",ondelete="CASCADE"),index=True)
+    segment_index:Mapped[int]=mapped_column(Integer)
+    start_ms:Mapped[int]=mapped_column(Integer)
+    end_ms:Mapped[int]=mapped_column(Integer)
+    source_lang:Mapped[str]=mapped_column(String(2))
+    target_lang:Mapped[str]=mapped_column(String(2))
+    source_text:Mapped[str]=mapped_column(Text)
+    machine_text:Mapped[str|None]=mapped_column(Text,nullable=True)
+    llm_text:Mapped[str|None]=mapped_column(Text,nullable=True)
+    corrected_text:Mapped[str]=mapped_column(Text)
+    # True when the reviewer accepted the existing translation unchanged.
+    approved_unchanged:Mapped[bool]=mapped_column(default=False,server_default="false")
+    created_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+    updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())

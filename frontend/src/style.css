@@ -408,3 +408,27 @@ kbd{font-family:inherit;font-size:11px;padding:1px 6px;border:1px solid var(--li
  .logs-steps time,.logs-stage{grid-column:1/2}
  .logs-bar .input-icon{width:100%}
 }
+
+/* Review translation */
+.review{margin-top:20px;overflow:hidden}
+.review-progress{display:flex;align-items:center;gap:12px;margin:0 0 14px;font-size:13.5px;color:var(--ink3)}.review-progress .bar{flex:1;max-width:320px}
+.check{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;color:var(--ink2);cursor:pointer}
+.review-lines{list-style:none;margin:0;padding:0}
+.review-lines li{display:grid;grid-template-columns:110px 1fr auto;gap:14px;padding:12px 0;border-bottom:1px solid var(--line);align-items:start}
+.review-lines li.rv-unsaved{background:linear-gradient(90deg,var(--primary-soft),transparent 60%)}
+.rv-meta{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.rv-en{margin:0 0 6px;font-size:14.5px;color:var(--ink)}
+.rv-mt{margin:0 0 6px;font-size:13px;color:var(--ink3)}.rv-mt i{font-style:normal;color:var(--muted)}
+.rv-km{width:100%;min-height:52px;resize:vertical;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:8px 10px;font-size:16px;line-height:1.6;font-family:inherit}
+.rv-km:focus{outline:2px solid var(--focus);outline-offset:0;border-color:transparent}
+.rv-act{display:flex;flex-direction:column;gap:6px;min-width:96px}
+.review-save{position:sticky;bottom:0;display:flex;align-items:center;justify-content:flex-end;gap:10px;margin:12px -20px -20px;padding:12px 20px;background:var(--card);border-top:1px solid var(--line);font-size:13.5px;color:var(--ink3)}
+.review-save span{margin-right:auto}.review-save.on span{color:var(--primary);font-weight:600}
+.review-save kbd{margin-left:6px;background:transparent;color:inherit;border-color:currentColor;opacity:.7}
+.ft-card{margin-bottom:20px}.ft-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}
+.ft-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0}
+.ft-stats div{border:1px solid var(--line);border-radius:10px;padding:12px}.ft-stats b{display:block;font-size:22px}.ft-stats small{color:var(--ink3);font-size:13px}
+@media (max-width:720px){
+ .review-lines li{grid-template-columns:1fr}.rv-meta{flex-direction:row;align-items:center}.rv-act{flex-direction:row}
+ .ft-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+}

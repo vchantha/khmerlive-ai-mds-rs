@@ -1,5 +1,5 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,JobEvent,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Job,JobEvent,Segment,CorrectionSummary,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
 import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb,confirmDialog} from './ui';
 
 export type Ctx={
@@ -443,11 +443,81 @@ function Review({ctx,job,onPipeline}:{ctx:Ctx;job:Job;onPipeline:()=>void}){
     {job.has_subtitles?<>
      <div className="pad-x"><label className="input-icon"><Icon name="search"/><input placeholder={'Search '+lang(job.target_lang)} value={q} onChange={e=>setQ(e.target.value)} aria-label="Search subtitles"/></label></div>
      <ol className="lines">{lines===null?<li><span className="sk w80"/></li>:shown.map((l,i)=><li key={i}><button className="ts" onClick={()=>seek(l.start)} title="Play from here">{l.start}</button><p className={job.target_lang==='km'?'km':''}>{l.text}</p></li>)}{lines&&!shown.length&&<li className="muted">No matching lines.</li>}</ol>
-     <p className="lines-foot">Click a time to jump there. Line editing isn't available yet — download the SRT to edit.</p>
+     <p className="lines-foot">Click a time to jump there. To fix the translation, use <b>Review translation</b> below. Your corrections also train a better model.</p>
     </>:<div className="pad"><div className="tp"><p className="tp-en">{job.transcript||'No transcript'}</p><p className="tp-km km">{job.translation||''}</p></div></div>}
    </section>
   </div>
+  <TranslationReview ctx={ctx} job={job} seek={(ms:number)=>{if(video.current){video.current.currentTime=ms/1000;void video.current.play().catch(()=>{})}}}/>
  </>;
+}
+
+/* ---------- Review translation: verified lines become fine-tuning data ---------- */
+const clock=(ms:number)=>{const s=Math.floor(ms/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+function TranslationReview({ctx,job,seek}:{ctx:Ctx;job:Job;seek:(ms:number)=>void}){
+ const [open,setOpen]=useState(false);
+ const [data,setData]=useState<{items:Segment[];available:boolean;verified:number}|null>(null);
+ const [draft,setDraft]=useState<Record<number,string>>({});      // unsaved edits / approvals
+ const [busy,setBusy]=useState(false),[showMt,setShowMt]=useState(false),[only,setOnly]=useState<'all'|'todo'>('all');
+ const load=async()=>{try{setData(await req('/api/jobs/'+job.id+'/segments'));setDraft({})}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{if(open&&!data)void load()},[open]);
+ const dirty=Object.keys(draft).length;
+ useEffect(()=>{if(!dirty)return;const h=(e:BeforeUnloadEvent)=>{e.preventDefault()};window.addEventListener('beforeunload',h);return()=>window.removeEventListener('beforeunload',h)},[dirty]);
+ const current=(s:Segment)=>draft[s.index]??s.corrected??s.final;
+ const state=(s:Segment)=>draft[s.index]!==undefined?'unsaved':s.corrected!=null?(s.approved_unchanged?'approved':'edited'):'todo';
+ const save=async()=>{
+  if(!dirty)return;setBusy(true);
+  try{const r=await req<{saved:number;verified:number}>('/api/jobs/'+job.id+'/corrections',{method:'PUT',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items:Object.entries(draft).map(([i,t])=>({index:Number(i),corrected_text:t}))})});
+   ctx.notify(r.saved+' line'+(r.saved===1?'':'s')+' saved · '+r.verified+' verified in this video');await load()}
+  catch(e){ctx.notify(errText(e),'err')}finally{setBusy(false)}};
+ const approveRest=async()=>{
+  const rest=(data?.items||[]).filter(s=>state(s)==='todo');if(!rest.length)return;
+  if(!await confirmDialog({tone:'primary',icon:'check',title:`Mark ${rest.length} line${rest.length===1?'':'s'} as correct?`,
+   message:<>Only do this if you've read them. These lines are used <b>as-is</b> to train the translation model, so wrong lines teach it mistakes.</>,
+   confirmLabel:'Mark as correct',cancelLabel:'Go back'}))return;
+  setDraft(d=>{const n={...d};rest.forEach(s=>{n[s.index]=s.final});return n})};
+ const items=(data?.items||[]).filter(s=>only==='all'||state(s)==='todo'||state(s)==='unsaved');
+ const verified=(data?.items||[]).filter(s=>s.corrected!=null).length,total=data?.items.length||0;
+ return <section className="card review">
+  <button className="logs-toggle" aria-expanded={open} onClick={()=>setOpen(v=>!v)}>
+   <Icon name="translate"/><span><b>Review translation</b><small>Correct or confirm each line. Verified lines train a better translation model{data?` · ${verified}/${total} verified`:''}</small></span><Icon name={open?'chevron-up':'chevron-down'} size={18}/>
+  </button>
+  {open&&<div className="logs-body">
+   {!data&&<span className="sk w80"/>}
+   {data&&!data.available&&<div className="empty"><b>Line review isn't available for this job</b><span>It was processed before line storage was added. Run the video again to review it.</span></div>}
+   {data&&data.available&&<>
+    <div className="review-progress"><Bar value={total?verified*100/total:0}/><span>{verified} of {total} lines verified</span></div>
+    <div className="logs-bar">
+     <Seg label="Show" value={only} onChange={setOnly} items={[['all','All lines'],['todo','Not reviewed']]}/>
+     <div className="toolbar-r">
+      <label className="check"><input type="checkbox" checked={showMt} onChange={e=>setShowMt(e.target.checked)}/> Show machine draft &amp; LLM</label>
+      <button className="btn btn-outline btn-sm" onClick={()=>void approveRest()}><Icon name="check" size={15}/>Mark rest as correct</button>
+     </div>
+    </div>
+    <ol className="review-lines">{items.map(s=>{const st=state(s);return <li key={s.index} className={'rv-'+st}>
+     <div className="rv-meta"><button className="ts" onClick={()=>seek(s.start_ms)} title="Play this line">{clock(s.start_ms)}</button>
+      <span className={'badge badge-'+(st==='todo'?'muted':st==='unsaved'?'run':'ok')}>{st==='todo'?'Not reviewed':st==='unsaved'?'Unsaved':st==='approved'?'Correct':'Corrected'}</span></div>
+     <div className="rv-body">
+      <p className="rv-en">{s.source}</p>
+      {showMt&&<p className="rv-mt km"><i>Machine:</i> {s.machine||'—'}{s.llm&&<><br/><i>LLM:</i> {s.llm}</>}</p>}
+      <textarea className={'rv-km'+(job.target_lang==='km'?' km':'')} rows={2} value={current(s)} aria-label={'Translation of line '+(s.index+1)}
+       onChange={e=>{const v=e.target.value;setDraft(d=>({...d,[s.index]:v}))}}
+       onKeyDown={e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();void save()}}}/>
+     </div>
+     <div className="rv-act">
+      {st==='todo'&&<button className="btn btn-outline btn-sm" title="The translation is correct" onClick={()=>setDraft(d=>({...d,[s.index]:s.final}))}><Icon name="check" size={15}/>Correct</button>}
+      {st==='unsaved'&&<button className="btn btn-ghost btn-sm" onClick={()=>setDraft(d=>{const n={...d};delete n[s.index];return n})}>Undo</button>}
+     </div>
+    </li>})}
+    {!items.length&&<li className="muted pad">All lines are reviewed. Thank you!</li>}</ol>
+    <div className={'review-save'+(dirty?' on':'')}>
+     <span>{dirty?`${dirty} unsaved change${dirty===1?'':'s'}`:'All changes saved'}</span>
+     <button className="btn btn-ghost btn-sm" disabled={!dirty||busy} onClick={()=>setDraft({})}>Discard</button>
+     <button className="btn btn-primary btn-sm" disabled={!dirty||busy} onClick={()=>void save()}>{busy?'Saving…':'Save'} <kbd>Ctrl ↵</kbd></button>
+    </div>
+   </>}
+  </div>}
+ </section>;
 }
 
 /* ================= Jobs (with library grid) ================= */
@@ -658,12 +728,30 @@ export function Datasets({ctx}:{ctx:Ctx}){
  const rows=ctx.jobs.filter(j=>j.status==='completed'&&j.transcript&&j.translation&&j.processing_mode==='real_subtitles');
  const exportJsonl=()=>saveBlob(new Blob([rows.map(j=>JSON.stringify({job_id:j.id,source_lang:j.source_lang,target_lang:j.target_lang,source:j.transcript,target:j.translation})).join('\n')+'\n'],{type:'application/jsonl'}),'khmerlive-parallel-text.jsonl');
  return <>
+  <FineTuneCard ctx={ctx}/>
   <Head title="Datasets" sub="Parallel English ⇔ Khmer text produced by finished real-mode jobs."><button className="btn btn-primary" disabled={!rows.length} onClick={exportJsonl}><Icon name="download"/>Export JSONL</button></Head>
   <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Pair</th><th>Source text</th><th>Translation</th></tr></thead><tbody>
    {rows.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}><td><b>{baseName(j.filename)}</b><small className="mono">{shortId(j.id)}</small></td><td>{j.source_lang.toUpperCase()}→{j.target_lang.toUpperCase()}</td><td className="clip">{j.transcript}</td><td className="clip km">{j.translation}</td></tr>)}
    {!rows.length&&<tr><td colSpan={4}><div className="empty"><b>No parallel text yet</b><span>Demo-mode jobs only produce placeholder text, so they're excluded.</span></div></td></tr>}
   </tbody></table></div></section>
  </>;
+}
+
+function FineTuneCard({ctx}:{ctx:Ctx}){
+ const [s,setS]=useState<CorrectionSummary|null>(null);
+ useEffect(()=>{req<CorrectionSummary>('/api/dataset/corrections').then(setS).catch(e=>ctx.notify(errText(e),'err'))},[]);
+ if(!s)return null;
+ const pct=Math.min(100,s.pairs*100/s.recommended_minimum);
+ return <section className="card pad ft-card">
+  <div className="ft-head"><div><h2>Fine-tuning data</h2><p className="hint top">Lines you verified in <b>Review translation</b> on each job. They're used to fine-tune the translation model for your videos.</p></div>
+   <button className="btn btn-outline" disabled={!s.pairs} onClick={()=>void downloadBlob('/api/dataset/corrections?format=jsonl','khmerlive-corrections.jsonl').catch(e=>ctx.notify(errText(e),'err'))}><Icon name="download"/>Training JSONL</button></div>
+  <div className="ft-stats">
+   <div><b>{s.pairs}</b><small>verified lines</small></div><div><b>{s.edited}</b><small>corrected</small></div>
+   <div><b>{s.approved_unchanged}</b><small>confirmed correct</small></div><div><b>{s.jobs}</b><small>videos</small></div>
+  </div>
+  <div className="review-progress"><Bar value={pct}/><span>{s.pairs>=s.recommended_minimum?'Enough data to fine-tune':`${s.recommended_minimum-s.pairs} more lines recommended before fine-tuning (${s.recommended_minimum}+)`}</span></div>
+  <p className="hint">Then run <code>./scripts/finetune-mt.sh</code> on the server. It trains, compares against the current model on videos it hasn't seen, and switches over only if the new model is better. <code>--rollback</code> undoes it.</p>
+ </section>;
 }
 
 /* ================= Users ================= */

@@ -347,12 +347,14 @@ def _translate_media(job_id:str):
                         str(settings.max_video_duration_seconds)+"s)")
                 subtitle_path=root/"translated.srt"
                 rows_for_dubbing=None
+                machine_rows=None
                 if streamed_rows is not None:
                     # The streaming URL path has already produced real captions.
                     text=" ".join(row.source_text for row in streamed_rows)
                     translated=" ".join(row.target_text for row in streamed_rows)
                     subtitle_path.write_text(build_srt(streamed_rows),encoding="utf-8")
                     rows_for_dubbing=streamed_rows
+                    machine_rows=list(streamed_rows)
                 else:
                     clock.mark("extract_audio")
                     set_state(db,job,"processing",progress=25,stage="extracting audio")
@@ -373,6 +375,7 @@ def _translate_media(job_id:str):
                         translated=" ".join(row.target_text for row in rows)
                         subtitle_path.write_text(build_srt(rows),encoding="utf-8")
                         rows_for_dubbing=rows
+                        machine_rows=list(rows)
                         clock.note(segments=len(rows),asr_seconds=timings.get("asr"),translate_seconds=timings.get("translate"),
                                    asr_device=settings.device_for("asr"),mt_device=settings.device_for("mt"),
                                    mt_engine=timings.get("mt_engine"),media_seconds=round(clip_seconds,1))
@@ -461,6 +464,12 @@ def _translate_media(job_id:str):
                 job.transcript=text
                 job.translation=translated
                 job.output_key=key
+                if machine_rows is not None and rows_for_dubbing is not None:
+                    llm_used=rows_for_dubbing is not machine_rows and any(
+                        a.target_text!=b.target_text for a,b in zip(machine_rows,rows_for_dubbing))
+                    job.segments=json.dumps([{"start_ms":m.start_ms,"end_ms":m.end_ms,"source":m.source_text,
+                        "machine":m.target_text,"llm":f.target_text if llm_used else None,"final":f.target_text}
+                        for m,f in zip(machine_rows,rows_for_dubbing)],ensure_ascii=False)
                 stages=clock.finish()
                 if "asr_translate" in stages and "asr" in timings:
                     # Split the combined stage using the engines' own measurements.
