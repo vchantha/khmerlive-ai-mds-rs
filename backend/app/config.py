@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     translation_model_path:str="/models/mt"
     khmer_tts_model_path:str="/models/tts"
     enable_khmer_dubbing:bool=True
+    vllm_postedit_enabled:bool=False
+    vllm_base_url:str="http://vllm:8000/v1"
+    vllm_model:str="khmerlive-postedit"
+    vllm_timeout_seconds:float=60.0
+    vllm_max_tokens:int=256
+    vllm_fail_open:bool=True
     max_upload_mb:int=1024
     max_video_duration_seconds:int=600
     stream_url_allow_users:bool=False
