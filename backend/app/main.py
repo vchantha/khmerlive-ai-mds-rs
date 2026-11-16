@@ -10,6 +10,7 @@ from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity
 from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
+from app.youtube import is_youtube_host,youtube_video_id,canonical_url,YouTubeURLRejected
 from app.tasks import translate_media
 from app.media_preview import issue_playback_token,check_playback_token,parse_byte_range,srt_to_webvtt,InvalidPlaybackToken,InvalidByteRange
 from starlette.background import BackgroundTask
@@ -147,24 +148,34 @@ def create_url_job(payload:StreamJobCreate,actor:dict=Depends(authorize)):
         raise HTTPException(403,"URL stream ingestion is restricted to trusted administrators")
     if payload.source_lang==payload.target_lang:
         raise HTTPException(422,"Language pair must differ")
-    ensure_translation_ready()
+    ensure_translation_ready(payload.target_lang)
+    youtube_id=None
     try:
-        url=validate_stream_url(payload.url)
-        seconds=capture_seconds_valid(payload.capture_seconds)
-    except StreamURLRejected as ex:
+        if is_youtube_host(payload.url):
+            if not settings.youtube_enabled:
+                raise HTTPException(403,"YouTube ingestion is disabled on this server (YOUTUBE_ENABLED=false)")
+            youtube_id=youtube_video_id(payload.url)
+            # Only the canonical single-video URL is stored and handed to yt-dlp.
+            url=canonical_url(youtube_id)
+            seconds=None
+        else:
+            url=validate_stream_url(payload.url)
+            seconds=capture_seconds_valid(payload.capture_seconds)
+    except (StreamURLRejected,YouTubeURLRejected) as ex:
         raise HTTPException(422,str(ex)) from ex
     mid=str(uuid.uuid4())
     jid=str(uuid.uuid4())
+    kind="youtube" if youtube_id else "url"
     # Store URL only in PostgreSQL, not in API job responses or logs.
     with session() as db:
-        db.add(MediaAsset(id=mid,filename="URL Capture "+mid[:8]+".mp4",
+        db.add(MediaAsset(id=mid,filename=("YouTube "+youtube_id if youtube_id else "URL Capture "+mid[:8])+".mp4",
                           object_key="uploads/"+mid+".mp4",
                           content_type="video/mp4",size_bytes=0,
                           sha256="pending",source_url=url,owner_user_id=actor["user_id"],
-                          source_kind="url",capture_seconds=seconds))
+                          source_kind=kind,capture_seconds=seconds))
         db.add(TranslationJob(id=jid,media_id=mid,
                               source_lang=payload.source_lang,target_lang=payload.target_lang,
-                              status="queued",progress=0,stage="waiting to capture URL",
+                              status="queued",progress=0,stage="waiting to download YouTube video" if youtube_id else "waiting to capture URL",
                               processing_mode=settings.model_mode,owner_user_id=actor["user_id"]))
         db.commit()
     try:
@@ -177,7 +188,7 @@ def create_url_job(payload:StreamJobCreate,actor:dict=Depends(authorize)):
                 job.error="Queue dispatch failed"
                 db.commit()
         raise HTTPException(503,"Queue dispatch failed") from exc
-    return {"job_id":jid,"status":"queued","source_kind":"url",
+    return {"job_id":jid,"status":"queued","source_kind":kind,
             "capture_seconds":seconds,"mode":settings.model_mode}
 
 def format_job(job,media):
@@ -227,6 +238,27 @@ def list_registered_users(actor:dict=Depends(authorize),
                           "created_at":u.created_at.isoformat() if u.created_at else None,
                           "providers":provider_map.get(u.id,[])} for u in users]}
 
+def host_metrics():
+    """Best-effort container resource usage for the System Health cards."""
+    import os,shutil
+    out={"cpu_percent":None,"memory_used_bytes":None,"memory_total_bytes":None,
+         "disk_used_bytes":None,"disk_total_bytes":None}
+    try:out["cpu_percent"]=round(min(100.0,os.getloadavg()[0]*100/(os.cpu_count() or 1)),1)
+    except OSError:pass
+    try:
+        info={}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k,v=line.split(":",1);info[k]=int(v.split()[0])*1024
+        out["memory_total_bytes"]=info["MemTotal"]
+        out["memory_used_bytes"]=info["MemTotal"]-info.get("MemAvailable",info.get("MemFree",0))
+    except (OSError,KeyError,ValueError):pass
+    try:
+        du=shutil.disk_usage("/")
+        out["disk_used_bytes"]=du.used;out["disk_total_bytes"]=du.total
+    except OSError:pass
+    return out
+
 @app.get("/api/system",dependencies=[Depends(authorize)])
 def system_status():
     checks={"api":"online","database":"unknown","redis":"unknown","storage":"unknown","worker":"unknown"}
@@ -246,7 +278,7 @@ def system_status():
         from app.tasks import celery_app
         checks["worker"]="online" if celery_app.control.inspect(timeout=0.8).ping() else "unknown"
     except Exception:checks["worker"]="unknown"
-    return {"services":checks,"mode":settings.model_mode}
+    return {"services":checks,"mode":settings.model_mode,"host":host_metrics()}
 
 @app.get("/api/jobs",dependencies=[Depends(authorize)])
 def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),

@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     max_upload_mb:int=1024
     max_video_duration_seconds:int=600
     stream_url_allow_users:bool=False
+    # YouTube links are resolved with yt-dlp (single public videos only).
+    youtube_enabled:bool=True
     # Hard Celery limit per job; a soft limit fires 5 min earlier so the job is marked failed cleanly.
     job_time_limit_seconds:int=3600
     # CTranslate2 threads for Whisper on CPU (0 = library default, which uses only 4 cores).

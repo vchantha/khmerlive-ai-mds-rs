@@ -11,3 +11,6 @@ httpx==0.28.1
 pytest==8.3.5
 authlib==1.5.2
 itsdangerous==2.2.0
+# YouTube ingestion: yt-dlp solves YouTube's JS player challenges with Deno.
+yt-dlp[default]==2026.10.26
+deno==2.9.8

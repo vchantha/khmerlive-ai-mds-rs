@@ -1,136 +1,116 @@
 import React,{useEffect,useRef,useState} from 'react';
-import{createRoot}from 'react-dom/client';
+import {createRoot} from 'react-dom/client';
 import './style.css';
+import {Job,Metrics,ModelInfo,SystemData,Account,Provider,req,setApiKey,getApiKey,saveKey,clearKey,baseName,asDate} from './api';
+import {Icon,Logo,Avatar} from './ui';
+import {Ctx,Login,Dashboard,NewJob,JobPage,MyJobs,Library,Models,Datasets,Users,SystemPage} from './pages';
 
-type Status='queued'|'processing'|'cancelling'|'cancelled'|'completed'|'failed'|'dispatch_failed';
-type Job={id:string;filename:string;size_bytes:number;source_kind?:'upload'|'url';capture_seconds?:number|null;status:Status;progress:number;stage:string|null;source_lang:string;target_lang:string;created_at:string|null;error:string|null;has_output:boolean;has_subtitles?:boolean;has_khmer_voice?:boolean;processing_mode?:'demo'|'real_subtitles';cancel_requested:boolean;transcript:string|null;translation:string|null};
-type Metrics={total:number;queued:number;processing:number;completed:number;failed:number};
-type QueueData={items:Job[];total:number};
-type SystemData={services:Record<string,string>};
-type Page='dashboard'|'new'|'queue'|'results'|'system'|'users';
-type Account={authenticated:boolean;user:{id:string;name:string;email:string|null;avatar_url:string|null}|null;identities:{provider:string;display_name:string|null}[]};
-type Provider={id:string;name:string;enabled:boolean};
-type DirectoryUser={id:string;display_name:string;email:string|null;created_at:string|null;providers:string[]};
-const empty:Metrics={total:0,queued:0,processing:0,completed:0,failed:0};
-const pages:[Page,string,string][]=[['dashboard','▦','Dashboard'],['new','⇧','New job'],['queue','☷','Queue'],['results','✓','Results'],['users','♙','Users & Social']];
-const limit=6;
-const asDate=(s:string|null)=>s?new Date(s).toLocaleString():'—';
-const elapsed=(s:string|null)=>{if(!s)return '—';const sec=Math.max(0,Math.floor((Date.now()-new Date(s).getTime())/1000));return sec<60?'just now':sec<3600?Math.floor(sec/60)+' min ago':sec<86400?Math.floor(sec/3600)+' hr ago':asDate(s)};
-const size=(n:number)=>n>=1048576?(n/1048576).toFixed(1)+' MB':Math.ceil(n/1024)+' KB';
-const finalStatus=(s:Status)=>s==='dispatch_failed'?'failed':s;
-const label=(s:Status)=>s==='cancelling'?'Cancelling':s==='cancelled'?'Cancelled':s==='dispatch_failed'?'Failed':s.charAt(0).toUpperCase()+s.slice(1);
-function Badge({status}:{status:Status}){return <span className={'status-chip status-'+finalStatus(status)} aria-label={'Status '+label(status)}><span aria-hidden="true">{status==='completed'?'✓':status==='failed'||status==='dispatch_failed'?'!':status==='queued'?'◷':status==='cancelled'?'−':'◌'}</span>{label(status)}</span>}
-const downloadName=(n:string)=>n.replace(/\.mp4$/i,'')+'-translated.mp4';
+const emptyMetrics:Metrics={total:0,queued:0,processing:0,completed:0,failed:0};
+const nav:[string,string,string][]=[
+ ['/dashboard','home','Dashboard'],['/new','plus','New Translation'],['/jobs','jobs','My Jobs'],['/library','library','Video Library'],
+ ['/models','models','AI Models'],['/datasets','datasets','Datasets'],['/users','users','Users & Access'],['/system','health','System Health'],['/settings','settings','Settings'],
+];
+const readRoute=()=>location.hash.replace(/^#/,'')||'/dashboard';
+const readTheme=()=>{try{return localStorage.getItem('khmerlive_theme')||''}catch{return ''}};
 
 function App(){
- const [key,setKey]=useState(sessionStorage.getItem('khmerlive_api_key')||'');
- const [keyDraft,setKeyDraft]=useState(key),[keyModal,setKeyModal]=useState(false);
- const [account,setAccount]=useState<Account|null>(null),[providers,setProviders]=useState<Provider[]>([]);
- const [directory,setDirectory]=useState<DirectoryUser[]>([]),[directoryTotal,setDirectoryTotal]=useState(0);
- const [collapsed,setCollapsed]=useState(localStorage.getItem('khmerlive_sidebar_collapsed')==='true'),[mobileNav,setMobileNav]=useState(false);
- const [page,setPage]=useState<Page>('dashboard'),[file,setFile]=useState<File|null>(null),[language,setLanguage]=useState('en'),[busy,setBusy]=useState(false),[uploadPct,setUploadPct]=useState<number|null>(null);
- const [metrics,setMetrics]=useState<Metrics>(empty),[queue,setQueue]=useState<Job[]>([]),[services,setServices]=useState<Record<string,string>>({});
- const [selected,setSelected]=useState<Job|null>(null),[filter,setFilter]=useState('all'),[offset,setOffset]=useState(0),[total,setTotal]=useState(0);
- const [auto,setAuto]=useState(true),[lastUpdate,setLastUpdate]=useState<Date|null>(null),[error,setError]=useState(''),[notice,setNotice]=useState(''),[banner,setBanner]=useState(true);
- const [loading,setLoading]=useState(false);
- const [modelInfo,setModelInfo]=useState<{mode:string;subtitle_translation_configured:boolean;speech_dubbing_available:boolean;khmer_dubbing_enabled?:boolean}|null>(null);
- const [playback,setPlayback]=useState<{video_url:string;captions_url:string|null}|null>(null),[previewError,setPreviewError]=useState('');
- const [sourceMode,setSourceMode]=useState<'upload'|'url'>('upload'),[streamUrl,setStreamUrl]=useState(''),[captureSeconds,setCaptureSeconds]=useState(30);
- const input=useRef<HTMLInputElement>(null);
- const videoRef=useRef<HTMLVideoElement|null>(null),resumeTime=useRef(0),resumePlaying=useRef(false);
- const selectedRef=useRef<string|null>(null);selectedRef.current=selected?.id||null;
- const currentKey=useRef(key);currentKey.current=key;
- const qref=useRef(0);qref.current=offset;
- const req=async<T,>(path:string,options:RequestInit={}):Promise<T>=>{
-  const r=await fetch(path,{...options,headers:{'X-API-Key':currentKey.current,...options.headers}});
-  if(!r.ok){let message=await r.text();try{message=JSON.parse(message).detail||message}catch{}throw new Error(r.status+': '+String(message).slice(0,220))}
-  return await r.json() as T;
- };
- const authReady=!!key||!!account?.authenticated;
- const loadAccount=async()=>{try{const [a,p]=await Promise.all([fetch('/api/auth/me').then(r=>r.json()),fetch('/api/auth/providers').then(r=>r.json())]);setAccount(a);setProviders(p.providers||[])}catch{setAccount(null);setProviders([])}};
+ const [route,setRoute]=useState(readRoute());
+ const [key,setKey]=useState(getApiKey());
+ const [account,setAccount]=useState<Account|null>(null),[providers,setProviders]=useState<Provider[]>([]),[authChecked,setAuthChecked]=useState(false);
+ const [loginError,setLoginError]=useState('');
+ const [metrics,setMetrics]=useState<Metrics>(emptyMetrics),[jobs,setJobs]=useState<Job[]>([]);
+ const [models,setModels]=useState<ModelInfo|null>(null),[system,setSystem]=useState<SystemData|null>(null);
+ const [hostHistory,setHostHistory]=useState<{cpu:number[];mem:number[];disk:number[]}>({cpu:[],mem:[],disk:[]});
+ const [toast,setToast]=useState<{msg:string;kind:'ok'|'err'}|null>(null);
+ const [navOpen,setNavOpen]=useState(false),[bell,setBell]=useState(false),[banner,setBanner]=useState(true);
+ const [theme,setThemeState]=useState(readTheme());
+ const [seen,setSeen]=useState(()=>{try{return Number(localStorage.getItem('khmerlive_seen')||0)}catch{return 0}});
+ const toastTimer=useRef<number|undefined>(undefined);
+ const authed=!!key||!!account?.authenticated;
+
+ useEffect(()=>{const f=()=>{setRoute(readRoute());setNavOpen(false);setBell(false)};addEventListener('hashchange',f);return()=>removeEventListener('hashchange',f)},[]);
+ useEffect(()=>{const r=document.documentElement;if(theme)r.dataset.theme=theme;else delete r.dataset.theme},[theme]);
+ const setTheme=(t:string)=>{setThemeState(t);try{localStorage.setItem('khmerlive_theme',t)}catch{}};
+ const effectiveDark=theme==='dark'||(!theme&&matchMedia('(prefers-color-scheme: dark)').matches);
+ const go=(p:string)=>{location.hash=p};
+ const notify=(msg:string,kind:'ok'|'err'='ok')=>{setToast({msg,kind});clearTimeout(toastTimer.current);toastTimer.current=window.setTimeout(()=>setToast(null),kind==='err'?7000:3500)};
+
+ const loadAccount=async()=>{try{const [a,p]=await Promise.all([fetch('/api/auth/me').then(r=>r.json()),fetch('/api/auth/providers').then(r=>r.json())]);setAccount(a);setProviders(p.providers||[])}catch{setAccount(null)}finally{setAuthChecked(true)}};
  useEffect(()=>{void loadAccount()},[]);
- useEffect(()=>{if(page!=='users'||!key||account?.authenticated)return;void req<{items:DirectoryUser[];total:number}>('/api/users?limit=50&offset=0').then(r=>{setDirectory(r.items);setDirectoryTotal(r.total)}).catch(e=>setError(String(e)))},[page,key,account?.authenticated]);
- const toggleSidebar=()=>{setCollapsed(v=>{localStorage.setItem('khmerlive_sidebar_collapsed',String(!v));return !v})};
- const refresh=async(silent=false)=>{
-  if(!currentKey.current&&!account?.authenticated)return;
-  if(!silent)setLoading(true);
+
+ const refresh=async()=>{
+  if(!getApiKey()&&!account?.authenticated)return;
   try{
-   const params=new URLSearchParams({limit:String(limit),offset:String(qref.current),status:filter});
-   const [q,m,s,models]=await Promise.all([req<QueueData>('/api/jobs?'+params),req<Metrics>('/api/dashboard'),req<SystemData>('/api/system'),req<{mode:string;subtitle_translation_configured:boolean;speech_dubbing_available:boolean;khmer_dubbing_enabled?:boolean}>('/api/models')]);
-   setModelInfo(models);
-   setQueue(q.items);setTotal(q.total);setMetrics(m);setServices(s.services);setLastUpdate(new Date());
-   if(selectedRef.current){const j=await req<Job>('/api/jobs/'+selectedRef.current);setSelected(j)}
-   if(!silent)setError('');
-  }catch(e){setError(String(e))}
-  finally{if(!silent)setLoading(false)}
+   const [m,list,mi,sys]=await Promise.all([req<Metrics>('/api/dashboard'),req<{items:Job[]}>('/api/jobs?limit=100&offset=0'),req<ModelInfo>('/api/models'),req<SystemData>('/api/system')]);
+   setMetrics(m);setJobs(list.items);setModels(mi);setSystem(sys);
+   const h=sys.host;if(h)setHostHistory(o=>({cpu:[...o.cpu,h.cpu_percent??0].slice(-30),mem:[...o.mem,h.memory_used_bytes??0].slice(-30),disk:[...o.disk,h.disk_used_bytes??0].slice(-30)}));
+  }catch(e){
+   const msg=String(e instanceof Error?e.message:e);
+   if(msg.startsWith('401')&&!account?.authenticated){clearKey();setApiKey('');setKey('');setLoginError('Your API key was rejected. Please sign in again.')}
+   else notify(msg,'err');
+  }
  };
- useEffect(()=>{void refresh()},[key,account?.authenticated,filter,offset]);
- useEffect(()=>{if(!authReady||!auto)return;const timer=window.setInterval(()=>void refresh(true),8000);return()=>clearInterval(timer)},[key,account?.authenticated,auto,filter,offset]);
- useEffect(()=>{
-  let closed=false;
-  setPlayback(null);setPreviewError('');resumeTime.current=0;resumePlaying.current=false;
-  if(!selected?.id||!selected.has_output||(!key&&!account?.authenticated))return;
-  const load=async()=>{
-    try{
-      const p=await req<{video_url:string;captions_url:string|null}>('/api/jobs/'+selected.id+'/player-token');
-      if(!closed){if(videoRef.current){resumeTime.current=videoRef.current.currentTime;resumePlaying.current=!videoRef.current.paused}setPlayback(p);setPreviewError('')}
-    }catch(e){if(!closed){setPreviewError(String(e));setPlayback(null)}}
-  };
-  void load();
-  // Playback grants are intentionally short-lived; refresh while preview is open.
-  const timer=window.setInterval(()=>void load(),120000);
-  return()=>{closed=true;window.clearInterval(timer)};
- },[selected?.id,selected?.has_output,key,account?.authenticated]);
- const change=(p:Page)=>{setPage(p);setFilter(p==='results'?'completed':'all');setOffset(0);setMobileNav(false)};
- const saveKey=()=>{const k=keyDraft.trim();sessionStorage.setItem('khmerlive_api_key',k);setKey(k);setKeyModal(false);setError('');setNotice('API key updated for this browser session')};
- const choose=(f:File|undefined)=>{if(!f)return;if(!f.name.toLowerCase().endsWith('.mp4')){setError('Only MP4 files are supported. Export your video as MP4 (H.264).');return}setFile(f);setError('')};
- const submit=async()=>{if(modelsMissing||!authReady|| (sourceMode==='upload'&&!file) || (sourceMode==='url'&&!streamUrl.trim()))return;setBusy(true);setUploadPct(sourceMode==='upload'?0:null);setError('');setNotice('');
-  try{
-   if(sourceMode==='url'){
-    const j=await req<{job_id:string}>('/api/jobs/from-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:streamUrl.trim(),capture_seconds:captureSeconds,source_lang:language,target_lang:language==='km'?'en':'km'})});
-    setSelected(await req<Job>('/api/jobs/'+j.job_id));setStreamUrl('');change('queue');setNotice(isReal?'Stream subtitle translation queued':'Stream capture queued (demo). Output retains original audio.');void refresh();return;
-   }
-   if(!file)return;
-   const media=await new Promise<{media_id:string}>((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','/api/media');if(key)x.setRequestHeader('X-API-Key',key);
-    x.upload.onprogress=e=>{if(e.lengthComputable)setUploadPct(Math.round(e.loaded*100/e.total))};
-    x.onerror=()=>reject(new Error('Network error while uploading video'));
-    x.onload=()=>{if(x.status<200||x.status>=300){reject(new Error('Upload failed '+x.status+': '+x.responseText.slice(0,180)));return}try{resolve(JSON.parse(x.responseText))}catch{reject(new Error('Unexpected upload response'))}};
-    const d=new FormData();d.append('file',file);x.send(d);
-   });
-   const j=await req<{job_id:string}>('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_id:media.media_id,source_lang:language,target_lang:language==='km'?'en':'km'})});
-   setSelected(await req<Job>('/api/jobs/'+j.job_id));setFile(null);if(input.current)input.current.value='';change('queue');setNotice(isReal?(language==='en'?'Khmer voice dubbing and subtitles queued':'Translation and subtitles queued'):'Demo job added to the live queue');void refresh();
-  }catch(e){setError(String(e))}finally{setBusy(false);setUploadPct(null)}
+ useEffect(()=>{void refresh()},[key,account?.authenticated]);
+ useEffect(()=>{if(!authed)return;const t=window.setInterval(()=>void refresh(),5000);return()=>clearInterval(t)},[key,account?.authenticated]);
+
+ const signInWithKey=async(k:string,remember:boolean)=>{
+  setLoginError('');
+  const r=await fetch('/api/dashboard',{headers:{'X-API-Key':k}});
+  if(!r.ok){setLoginError(r.status===401?'Invalid API key.':'Server error '+r.status+'. Is the API running?');return}
+  saveKey(k,remember);setApiKey(k);setKey(k);if(!location.hash)go('/dashboard');
  };
- const action=async(j:Job,which:'cancel'|'retry')=>{
-  if(which==='cancel'&&!window.confirm('Request cancellation for '+j.filename+'? The current processing step may need to finish.'))return;
-  setError('');try{await req('/api/jobs/'+j.id+'/'+which,{method:'POST'});setNotice(which==='retry'?'Retry requested. Job was re-queued.':'Cancellation requested. Check status for confirmation.');await refresh()}catch(e){setError(String(e))}
- };
- const downloadSubtitles=async(j:Job)=>{try{const r=await fetch('/api/jobs/'+j.id+'/subtitles',{headers:{'X-API-Key':key}});if(!r.ok)throw new Error('Subtitles unavailable: '+r.status);const url=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=url;a.download=j.filename.replace(/\.mp4$/i,'')+'-translated.srt';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000)}catch(e){setError(String(e))}};
- const download=async(j:Job)=>{try{
-  // The browser downloads directly from the S3 streaming proxy; avoid loading
-  // large MP4 files into a memory-hungry JavaScript Blob.
-  const p=await req<{video_url:string}>('/api/jobs/'+j.id+'/player-token');
-  const anchor=document.createElement('a');
-  anchor.href=p.video_url+'&download=1';
-  anchor.download=downloadName(j.filename);
-  document.body.appendChild(anchor);anchor.click();anchor.remove();
- }catch(e){setError(String(e))}};
- const isReal=modelInfo?.mode==='real_subtitles';
- const modelsMissing=isReal&&(modelInfo?.subtitle_translation_configured===false||(language==='en'&&modelInfo?.khmer_dubbing_enabled===true&&!modelInfo?.speech_dubbing_available));
- const operating=Object.values(services).filter(v=>v==='online').length;
- const active=metrics.queued+metrics.processing;
- const totals=([['Total jobs',metrics.total,'All time','blue'],['In progress',active,metrics.processing+' processing · '+metrics.queued+' queued','sky'],['Completed',metrics.completed,'Ready to download','green'],['Failed',metrics.failed,'Needs attention','orange']] as const);
- const filterTabs:[string,string,number][]=[['all','All',metrics.total],['active','Active',active],['completed','Completed',metrics.completed],['failed','Failed',metrics.failed]];
- const listPanel=<section className="card jobs-card" aria-label="Recent jobs"><div className="jobs-head"><div className="section-title"><h2>{page==='results'?'Completed results':'Recent jobs'}</h2><span className="live-dot">● Live</span></div><div className="tabs" role="tablist" aria-label="Job status filter">{filterTabs.map(([id,name,n])=><button key={id} role="tab" aria-selected={filter===id} className={filter===id?'active':''} onClick={()=>{setFilter(id);setOffset(0)}}>{name} <span>{n}</span></button>)}</div><label className="switch-label">Auto-refresh <input type="checkbox" role="switch" checked={auto} onChange={e=>setAuto(e.target.checked)}/></label></div><div className="table-scroll"><table><thead><tr><th>Video</th><th>Language</th><th>Status</th><th>Progress</th><th>Created</th><th>Action</th></tr></thead><tbody>{queue.map(j=><tr key={j.id} className={selected?.id===j.id?'selected':''} onClick={()=>setSelected(j)}><td><div className="video-cell"><div className="thumb" aria-hidden="true">▶</div><div className="file-info"><strong title={j.filename}>{j.filename}</strong><small>{j.source_kind==='url'?'◉ URL stream':'⇧ Upload'} · #{j.id.slice(0,8)} · {size(j.size_bytes)}</small></div></div></td><td><span className="language-cell">{j.source_lang==='km'?'Khmer':'English'}<small>({j.source_lang})</small></span></td><td><Badge status={j.status}/></td><td><div className="job-progress"><span>{j.status==='queued'?'Waiting':j.status==='cancelled'?'Stopped':j.progress+'%'}</span><div className="progress-track"><i className={finalStatus(j.status)} style={{width:j.progress+'%'}}/></div></div></td><td className="age">{elapsed(j.created_at)}</td><td onClick={e=>e.stopPropagation()}>{j.has_output?<button className="outline success" onClick={()=>void download(j)}>MP4</button>:['queued','processing','cancelling'].includes(j.status)?<button className="outline" disabled={j.status==='cancelling'} onClick={()=>void action(j,'cancel')}>{j.status==='cancelling'?'Pending':'Cancel'}</button>:<button className="outline warning" onClick={()=>void action(j,'retry')}>Retry</button>}</td></tr>)}{loading&&!queue.length&&Array.from({length:3},(_,i)=><tr key={i}><td colSpan={6}><div className="skeleton"/></td></tr>)}{!loading&&queue.length===0&&<tr><td colSpan={6}><div className="empty-state"><strong>No matching jobs yet</strong><p>Upload a video or enter a stream URL to see it move through the pipeline.</p><button className="primary" onClick={()=>change('new')}>Start a new job</button></div></td></tr>}</tbody></table></div><div className="pagination"><span>Showing {total?offset+1:0}–{Math.min(offset+limit,total)} of {total} jobs</span><div><button disabled={offset===0} onClick={()=>setOffset(Math.max(offset-limit,0))}>‹</button><span>{Math.floor(offset/limit)+1}</span><button disabled={offset+limit>=total} onClick={()=>setOffset(offset+limit)}>›</button></div></div></section>;
- const isUrlSource=selected?.source_kind==='url';
- const phases=isUrlSource?['URL submitted','Stream captured','Queued for processing','Worker processing','Saved to storage']:['Upload received','File validated','Queued','Worker processing','Saved to storage'];
- const current=selected?.status||'queued';
- const isComplete=current==='completed';
- const capturing=!!selected?.stage?.toLowerCase().includes('captur');
- const step=isComplete?5:isUrlSource&&current==='queued'?1:isUrlSource&&capturing?2:current==='queued'?3:current==='processing'||current==='cancelling'?4:current==='failed'||current==='dispatch_failed'?3:current==='cancelled'?3:0;
- const details=<section className="card detail-card"><div className="detail-top"><h2>{selected?'Job #'+selected.id.slice(0,8):'Job details'}</h2>{selected&&<Badge status={selected.status}/>}</div>{selected?.has_output? <div className="preview-ready"><div className="preview-banner">{selected.has_khmer_voice?'Khmer voice dubbing + translated subtitles':selected.has_subtitles?'Translated subtitles available · Original speech retained':'Demo video · Original speech retained'}</div>{playback?<video ref={videoRef} key={selected.id+playback.video_url} className="preview-video" controls playsInline preload="metadata" src={playback.video_url} aria-label="Review processed video" onLoadedMetadata={e=>{if(resumeTime.current>0)e.currentTarget.currentTime=resumeTime.current;if(resumePlaying.current)void e.currentTarget.play().catch(()=>{})}} onTimeUpdate={e=>{resumeTime.current=e.currentTarget.currentTime}} onPlay={()=>{resumePlaying.current=true}} onPause={()=>{resumePlaying.current=false}}>{playback.captions_url&&<track kind="subtitles" label={selected.target_lang==='km'?'Khmer subtitles':'English subtitles'} srcLang={selected.target_lang} src={playback.captions_url} default/>}Your browser cannot play this video.</video>:<div className="preview"><span>▶</span><small>{previewError||'Loading secure video preview…'}</small></div>}</div> : <div className="preview" role="img" aria-label="Preview will be available after processing"><span>▶</span><small>Review video after the job is completed.</small></div>}{selected?<><div className="details-grid"><div><small>File</small><strong title={selected.filename}>{selected.filename}</strong></div><div><small>Language</small><strong>{selected.source_lang==='km'?'Khmer':'English'} ({selected.source_lang})</strong></div><div><small>Source</small><strong>{selected.source_kind==='url'?'URL Stream (' +(selected.capture_seconds||30)+'s)':'MP4 Upload'}</strong></div><div><small>Job ID</small><strong title={selected.id}>#{selected.id.slice(0,8)}</strong><button className="copy" onClick={()=>void navigator.clipboard.writeText(selected.id)}>Copy</button></div></div>{(selected.transcript||selected.translation)&&<details className="translation-review"><summary>Review recognition & translated text (live updates for URL)</summary><div><strong>Recognized speech · {selected.source_lang.toUpperCase()}</strong><p>{selected.transcript||'No transcript'}</p><strong>Translated · {selected.target_lang.toUpperCase()}</strong><p>{selected.translation||'No translation'}</p></div></details>}<div className="pipeline"><h3>Pipeline</h3>{phases.map((title,i)=>{const done=i<step&&(isComplete||i<step-1);const currentStep=i===step-1&&!isComplete&&['queued','processing','cancelling'].includes(current);return <div className="pipeline-row" key={title}><div className={'node '+(done?'done':currentStep?'running':current==='failed'&&i===step-1?'problem':'')}>{done?'✓':currentStep?'◉':''}</div><div><strong>{title}</strong><small>{done?'Complete':currentStep?(selected.stage||label(current)):current==='failed'&&i===step-1?'Stopped':'Waiting'}</small></div></div>})}</div>{selected.error&&<div className="inline-error"><b>Job failed</b><p>{selected.error}</p></div>}<div className="detail-buttons">{selected.has_output?<><button className="primary" onClick={()=>void download(selected)}>Download {selected.has_khmer_voice?"Khmer dubbed":selected.has_subtitles?"subtitled":"demo"} MP4</button>{selected.has_subtitles&&<button className="outline" onClick={()=>void downloadSubtitles(selected)}>Download SRT</button>}</>:['failed','dispatch_failed','cancelled'].includes(selected.status)?<button className="primary" onClick={()=>void action(selected,'retry')}>Retry job</button>:<button className="primary" disabled={selected.status==='cancelling'} onClick={()=>void action(selected,'cancel')}>{selected.status==='cancelling'?'Cancelling…':'Cancel job'}</button>}<button className="outline" onClick={()=>void refresh()}>Refresh status</button></div></>:<div className="details-empty">Select a row from Recent jobs to inspect its processing stages and available actions.</div>}</section>;
- const userPanel=<section className="card accounts-card"><div className="account-heading"><div><h2>Users & connected accounts</h2><p>Sign in securely or link social identities to one KhmerLive account.</p></div><span className="research-pill">OAuth 2.0 / OIDC</span></div>{account?.authenticated?<><div className="account-profile"><span className="profile-avatar">{account.user?.name?.slice(0,1).toUpperCase()||'U'}</span><div><strong>{account.user?.name}</strong><small>{account.user?.email||'Email not provided by provider'}</small><small>Private user ID: {account.user?.id.slice(0,8)}…</small></div><button className="outline" onClick={async()=>{await fetch('/api/auth/logout',{method:'POST'});setAccount(null);setSelected(null);setQueue([]);setMetrics(empty);setNotice('Signed out');void loadAccount()}}>Sign out</button></div><h3>Linked social accounts</h3><div className="social-list">{account.identities.map(i=><div className="social-row" key={i.provider}><strong>{i.provider==='google'?'🌐 Google':i.provider==='github'?'◈ GitHub':'ⓕ Facebook'}</strong><span>Connected · {i.display_name||i.provider}</span><span className="status-chip status-completed">✓ Linked</span></div>)}</div><h3>Connect another account</h3></>:<div className="account-hint">You can sign in with a supported social account after an administrator configures its OAuth credentials. API key access remains available for trusted local admin testing.</div>}<div className="provider-actions">{providers.map(p=><div className="provider-card" key={p.id}><strong>{p.id==='google'?'🌐':p.id==='github'?'◈':'ⓕ'} {p.name}</strong><small>{p.enabled?'OAuth configured':'Not configured on server'}</small><button className={p.enabled?'primary':'outline'} disabled={!p.enabled||!!account?.identities.some(i=>i.provider===p.id)} onClick={()=>{window.location.href='/api/auth/'+(account?.authenticated?'link':'login')+'/'+p.id}}>{account?.identities.some(i=>i.provider===p.id)?'Already linked':account?.authenticated?'Link account':'Sign in'}</button></div>)}{!providers.length&&<p>OAuth providers could not be loaded.</p>}</div>{key&&!account?.authenticated&&<div className="user-directory"><h3>Registered users <small>({directoryTotal})</small></h3><p className="account-footnote">Admin-only directory via your API key. Social users see only their own account.</p><div className="table-scroll"><table><thead><tr><th>Name</th><th>Email</th><th>Connected providers</th><th>Registered</th></tr></thead><tbody>{directory.map(u=><tr key={u.id}><td>{u.display_name}</td><td>{u.email||'—'}</td><td>{u.providers.join(', ')||'—'}</td><td>{asDate(u.created_at)}</td></tr>)}{!directory.length&&<tr><td colSpan={4}>No users registered yet</td></tr>}</tbody></table></div></div>}<p className="account-footnote">Social tokens are not stored. A Google or Facebook developer app, callback URL and server-side credentials are required. Accounts are isolated by owner in PostgreSQL.</p></section>;
- const uploadPanel=<section className="card upload-card"><div className="card-head"><h2>Start a new job</h2><span>{account?.authenticated?'Signed in: '+account.user?.name:<>API Key <code>{key?key.slice(0,3)+'_••••'+key.slice(-4):'not set'}</code> · <button className="text-link" onClick={()=>{setKeyDraft(key);setKeyModal(true)}}>Change</button></>}</span></div><div className="source-picker" role="tablist" aria-label="Video input source"><button className={sourceMode==='upload'?'chosen':''} role="tab" aria-selected={sourceMode==='upload'} onClick={()=>setSourceMode('upload')}>⇧ &nbsp; Upload MP4</button><button className={sourceMode==='url'?'chosen':''} role="tab" aria-selected={sourceMode==='url'} onClick={()=>setSourceMode('url')}>◉ &nbsp; Stream by URL</button></div><div className="upload-layout"><div><label className="field-label">{sourceMode==='upload'?'1 · Video file':'1 · Stream URL'}</label>{sourceMode==='upload'?<div className="drop-zone" tabIndex={0} role="button" onClick={()=>input.current?.click()} onKeyDown={e=>{if(e.key==='Enter')input.current?.click()}} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();choose(e.dataTransfer.files[0])}}><span className="cloud">☁</span><strong>{file?file.name:'Drop an MP4 here, or '} {!file&&<u>browse files</u>}</strong><small>{file?size(file.size):'MP4 (H.264) · max 1 GiB configured by default'}</small><input ref={input} type="file" accept=".mp4,video/mp4" hidden onChange={e=>choose(e.target.files?.[0])}/></div>:<div className="url-source"><input aria-label="Stream URL" type="url" placeholder="https://video.example.org/live/index.m3u8" value={streamUrl} onChange={e=>setStreamUrl(e.target.value)} /><small>Direct HTTP(S) MP4 or HLS (.m3u8). Host must be listed in server STREAM_ALLOWED_HOSTS.</small><label className="field-label" htmlFor="capture-duration">Capture duration</label><select id="capture-duration" value={captureSeconds} onChange={e=>setCaptureSeconds(Number(e.target.value))}><option value={15}>15 seconds</option><option value={30}>30 seconds</option><option value={60}>60 seconds</option><option value={120}>120 seconds</option></select><small>Near-live caption updates per recorded chunk (model speed dependent). Bounded 15–120 second recording; not continuous voice dubbing.</small></div>}</div><div><label className="field-label" htmlFor="spoken">2 · Spoken language</label><select id="spoken" value={language} onChange={e=>setLanguage(e.target.value)}><option value="km">Khmer · ខ្មែរ (km)</option><option value="en">English (en)</option></select><p className="help">English → Khmer and Khmer → English. Choose the language spoken in your video.</p><div className="language-target"><b>Translation output</b><span>{language==='en'?'🇰🇭 Khmer (km)':'🇬🇧 English (en)'}</span></div>{uploadPct!==null&&<div className="upload-progress">Uploading {uploadPct}%<div className="progress-track"><i style={{width:uploadPct+'%'}}/></div></div>}<button className="primary submit" disabled={modelsMissing||!authReady||busy||(sourceMode==='upload'?!file:!streamUrl.trim())} onClick={()=>void submit()}>→ &nbsp;{busy?'Submitting…':sourceMode==='upload'?(isReal?'Translate and subtitle':'Submit demo job'):(isReal?'Capture and subtitle':'Capture stream demo')}</button><small className="submit-hint">{sourceMode==='url'?'Approved URL hosts only. Intermediate translated text appears as chunks finish. Original audio is preserved.':!file?'Add a video to enable submit.':'Subtitles add translated text; original spoken audio is preserved.'}</small></div></div></section>;
- return <div className={"app-shell"+(collapsed?" sidebar-collapsed":"")+(mobileNav?" nav-open":"")}><header className="topbar"><div className="brand"><button className="nav-toggle" aria-label={mobileNav?"Close navigation":"Toggle navigation"} aria-expanded={mobileNav} onClick={()=>{if(window.innerWidth<=760)setMobileNav(v=>!v);else toggleSidebar()}}>☰</button><span className="logo">▶</span><strong>KhmerLive AI</strong><span className="research-pill">{isReal?'OFFLINE SUBTITLES':'RESEARCH DEMO'}</span></div><div className="top-actions"><div className={'global-health '+(operating===5?'healthy':'partial')}><span>●</span> {operating===5?'All systems operational':'System status'} <b>{operating}/5</b></div><button className="help-button" title="API documentation" onClick={()=>window.open('/api/docs','_blank','noopener')}>?</button><button className="user-button" onClick={()=>change("users")}>{account?.authenticated?(account.user?.name?.slice(0,1).toUpperCase()||"U"):"KL"}　⌄</button></div></header>{banner&&<div className="demo-banner"><span>♧</span><p><b>{isReal?'Subtitle translation mode.':'Demo mode.'}</b> {isReal?'Offline Whisper + M2M100 generate translated captions and SRT. Original speech is preserved; dubbing is not available.':'No real speech recognition, translation or dubbing runs in demo mode.'}</p><button aria-label="Dismiss demo notice" onClick={()=>setBanner(false)}>×</button></div>}<div className="body-layout">{mobileNav&&<button className="mobile-scrim" aria-label="Close navigation" onClick={()=>setMobileNav(false)}/>}<aside className="sidebar"><button className="sidebar-collapse" onClick={toggleSidebar} title="Show or hide sidebar">{collapsed?"»":"«"} <span>{collapsed?"Expand":"Collapse"}</span></button><div className="nav-label">WORKSPACE</div><nav>{pages.map(([id,ico,title])=><button className={page===id?'current':''} key={id} onClick={()=>change(id)}><span>{ico}</span>{title}{id==='queue'&&active>0&&<b>{active}</b>}</button>)}</nav><div className="sidebar-divider"/><div className="nav-label">DEVELOPER</div><nav><button onClick={()=>{setKeyDraft(key);setKeyModal(true)}}><span>⚿</span>API keys</button><button onClick={()=>window.open('/api/docs','_blank','noopener')}><span>□</span>API docs</button><button className={page==='system'?'current':''} onClick={()=>change('system')}><span>▤</span>System <i className={operating===5?'online':''}/></button></nav></aside><main className="main-area"><div className="page-title"><div><h1>{page==='dashboard'?'Dashboard':page==='new'?'New job':page==='queue'?'Queue':page==='results'?'Results':page==='users'?'Users & Social':'System health'}</h1><p>Upload a Khmer video, follow it through the pipeline, download the result.</p></div><span className="last-update">◷ {lastUpdate?'Updated '+elapsed(lastUpdate.toISOString()):'Waiting for connection'}</span></div>{modelsMissing&&<div className="alert error-alert"><b>Offline translation or Khmer voice model is missing.</b> Install Whisper, M2M100 and Khmer MMS TTS under models/asr, models/mt and models/tts; then restart the real worker. No English-to-Khmer dubbing job can start yet.</div>}{error&&<div className="alert error-alert"><b>Could not complete the request.</b> {error}<button onClick={()=>{setError('');void refresh()}}>Try again</button></div>}{notice&&<div className="alert success-alert">{notice}<button onClick={()=>setNotice('')}>×</button></div>}{!authReady&&page!=='users'&&<div className="alert error-alert">Sign in or set an API key to load live jobs. <button onClick={()=>setKeyModal(true)}>Add API key</button></div>}{page==='dashboard'?<><div className="dashboard-top">{uploadPanel}<div className="metrics-grid">{totals.map(([title,n,desc,kind])=><div className={'metric-card '+kind} key={title}><span>{title}</span><b>{n}</b><small>{desc}</small></div>)}</div></div><div className="dashboard-bottom">{listPanel}{details}</div></>:page==='new'?<div className="new-layout">{uploadPanel}<div className="card aside-help"><h2>What happens next?</h2><p>The worker verifies an MP4 upload or captures a short URL stream and records each demo stage in PostgreSQL.</p><p>Translated speech is not available in this release. Results contain unchanged audio.</p><button className="outline" onClick={()=>change('queue')}>View queue →</button></div></div>:page==='system'?<section className="card system-card"><div className="section-title"><h2>Service health</h2><button className="outline" onClick={()=>void refresh()}>Refresh</button></div>{['api','worker','database','redis','storage'].map(s=><div className="service-row" key={s}><strong>{s==='database'?'PostgreSQL':s==='worker'?'Celery worker':s==='storage'?'Object storage':s.toUpperCase()}</strong><span className={services[s]||'unknown'}>● {services[s]||'unknown'}</span></div>)}<p>Unreachable checks are not displayed as operational. Worker ping may be unknown.</p></section>:<div className="dashboard-bottom">{listPanel}{details}</div>}</main></div>{keyModal&&<div className="modal-overlay" onClick={()=>setKeyModal(false)}><section className="key-modal" onClick={e=>e.stopPropagation()}><h2>API key</h2><p>Enter the API_KEY from your local .env file. The key stays in this browser session and is not committed to GitHub.</p><label className="field-label" htmlFor="api-key">API key</label><input id="api-key" type="password" value={keyDraft} onChange={e=>setKeyDraft(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')saveKey()}}/><div className="modal-actions"><button className="outline" onClick={()=>setKeyModal(false)}>Cancel</button><button className="primary" onClick={saveKey}>Save key</button></div></section></div>}</div>
+ const signOut=async()=>{clearKey();setApiKey('');setKey('');try{await fetch('/api/auth/logout',{method:'POST'})}catch{}setAccount(null);setJobs([]);setMetrics(emptyMetrics);void loadAccount();go('/dashboard')};
+
+ if(!authChecked)return <div className="boot"><Logo size={46}/></div>;
+ if(!authed)return <Login providers={providers} onKey={signInWithKey} error={loginError}/>;
+
+ const ctx:Ctx={account,providers,isAdmin:!!key&&!account?.authenticated,metrics,jobs,models,system,hostHistory,refresh,go,notify};
+ const real=models?.mode==='real_subtitles';
+ const userName=account?.authenticated?account.user?.name||'User':'Administrator';
+ const updates=jobs.filter(j=>(j.status==='completed'||j.status==='failed'||j.status==='dispatch_failed')&&j.updated_at);
+ const unread=updates.filter(j=>new Date(j.updated_at!).getTime()>seen).length;
+ const openBell=()=>{setBell(v=>!v);const now=Date.now();setSeen(now);try{localStorage.setItem('khmerlive_seen',String(now))}catch{}};
+ const [base,param]=(()=>{const p=route.split('/').filter(Boolean);return ['/'+(p[0]||'dashboard'),p[1]]})();
+ const active=base==='/job'?'/jobs':base;
+ const activeJobs=metrics.queued+metrics.processing;
+
+ let page:React.ReactNode;
+ switch(base){
+  case '/new':page=<NewJob ctx={ctx}/>;break;
+  case '/job':page=param?<JobPage ctx={ctx} id={param}/>:<MyJobs ctx={ctx}/>;break;
+  case '/jobs':page=<MyJobs ctx={ctx}/>;break;
+  case '/library':page=<Library ctx={ctx}/>;break;
+  case '/models':page=<Models ctx={ctx}/>;break;
+  case '/datasets':page=<Datasets ctx={ctx}/>;break;
+  case '/users':page=<Users ctx={ctx}/>;break;
+  case '/system':page=<SystemPage ctx={ctx} initial="health" theme={effectiveDark?'dark':'light'} setTheme={setTheme} onSignOut={()=>void signOut()}/>;break;
+  case '/settings':page=<SystemPage ctx={ctx} initial="settings" theme={effectiveDark?'dark':'light'} setTheme={setTheme} onSignOut={()=>void signOut()}/>;break;
+  default:page=<Dashboard ctx={ctx}/>;
+ }
+
+ return <div className={'shell'+(navOpen?' nav-open':'')}>
+  <aside className="side" aria-label="Main navigation">
+   <a className="side-brand" href="#/dashboard"><Logo/><b>KhmerLive AI</b></a>
+   <nav>{nav.map(([path,ic,label])=><a key={path} href={'#'+path} className={active===path?'current':''} aria-current={active===path?'page':undefined}><Icon name={ic}/><span>{label}</span>{path==='/jobs'&&activeJobs>0&&<em>{activeJobs}</em>}</a>)}</nav>
+   <div className="side-user"><Avatar name={userName} src={account?.user?.avatar_url} size={36}/><span><b>{userName}</b><small>{ctx.isAdmin?'Administrator':'User'}</small></span><button className="icon-btn" title="Sign out" aria-label="Sign out" onClick={()=>void signOut()}><Icon name="logout" size={17}/></button></div>
+  </aside>
+  {navOpen&&<button className="scrim" aria-label="Close navigation" onClick={()=>setNavOpen(false)}/>}
+  <div className="content">
+   <header className="top">
+    <button className="icon-btn menu-btn" aria-label="Open navigation" onClick={()=>setNavOpen(true)}><Icon name="menu"/></button>
+    <span className={'mode-pill '+(real?'real':'demo')} title={real?'Offline Whisper + M2M100'+(models?.khmer_dubbing_enabled?' + Khmer MMS TTS':''):'No real AI runs in demo mode'}>{models?(real?'Real mode':'Demo mode'):'…'}</span>
+    <div className="top-actions">
+     <button className="icon-btn" aria-label={effectiveDark?'Switch to light theme':'Switch to dark theme'} onClick={()=>setTheme(effectiveDark?'light':'dark')}><Icon name={effectiveDark?'sun':'moon'}/></button>
+     <div className="bell-wrap"><button className="icon-btn" aria-label={'Notifications'+(unread?' ('+unread+' new)':'')} aria-expanded={bell} onClick={openBell}><Icon name="bell"/>{unread>0&&<i className="dot-badge"/>}</button>
+      {bell&&<div className="dropdown"><b>Recent updates</b>{updates.slice(0,6).map(j=><a key={j.id} href={'#/job/'+j.id}><span className={'svc-dot '+(j.status==='completed'?'online':'offline')}><Icon name={j.status==='completed'?'check':'x'} size={12}/></span><span>{baseName(j.filename)}<small>{j.status==='completed'?'Completed':'Failed'} · {asDate(j.updated_at)}</small></span></a>)}{!updates.length&&<p className="muted small">No finished jobs yet.</p>}</div>}</div>
+     <a className="icon-btn" href="/api/docs" target="_blank" rel="noopener" aria-label="API documentation"><Icon name="help"/></a>
+     <a href="#/settings" aria-label="Account settings"><Avatar name={userName} src={account?.user?.avatar_url} size={34}/></a>
+    </div>
+   </header>
+   {banner&&models&&<div className={'mode-banner '+(real&&models.subtitle_translation_configured?'real':'demo')}><Icon name={real&&models.subtitle_translation_configured?'check':'help'} size={17}/><p>{real?<><b>Real mode.</b> Offline Whisper ASR + M2M100 translation{models.khmer_dubbing_enabled?<> + Khmer MMS TTS dubbing for English → Khmer{!models.speech_dubbing_available&&' (TTS model not installed)'}</>:null}.{!models.subtitle_translation_configured&&<b> ASR/MT model weights are missing.</b>}</>:<><b>Demo mode.</b> Jobs run through the full pipeline UI, but no real speech recognition, translation or dubbing is performed.</>}</p><button className="icon-btn" aria-label="Dismiss" onClick={()=>setBanner(false)}><Icon name="x" size={16}/></button></div>}
+   <main className="main">{page}</main>
+  </div>
+  {toast&&<div className={'toast '+toast.kind} role="status">{toast.msg}<button className="icon-btn" aria-label="Dismiss" onClick={()=>setToast(null)}><Icon name="x" size={14}/></button></div>}
+ </div>;
 }
 createRoot(document.getElementById('root')!).render(<App/>);

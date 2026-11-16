@@ -30,7 +30,8 @@ def request(path:str,*,method:str="GET",data:bytes|None=None,content_type:str|No
     if range_header:headers["Range"]=range_header
     req=Request(BASE+path,data=data,method=method,headers=headers)
     with urlopen(req,timeout=30) as resp:
-        return resp.status,dict(resp.headers),resp.read()
+        # Keep the case-insensitive HTTPMessage: nginx lower-cases proxied header names.
+        return resp.status,resp.headers,resp.read()
 
 def main():
     code,_,body=request("/api/models")

@@ -99,7 +99,9 @@ class OfflineM2M100:
             with self._torch.inference_mode():
                 encoded = self.model.generate(
                     **data, forced_bos_token_id=self.tok.get_lang_id(dst),
-                    max_new_tokens=256, num_beams=4
+                    max_new_tokens=256, num_beams=4,
+                    # M2M100-418M can loop a phrase for EN->KM; block repeats.
+                    no_repeat_ngram_size=3, repetition_penalty=1.2
                 )
             decoded = self.tok.batch_decode(encoded, skip_special_tokens=True)
             result.extend(TimedText(s.start_ms, s.end_ms, s.source_text, t.strip())

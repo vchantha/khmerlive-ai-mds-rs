@@ -11,6 +11,9 @@ import subprocess
 import wave
 
 
+# Faster than this sounds rushed; any remaining overflow is compressed below.
+MAX_NATIVE_SPEAKING_RATE=1.6
+
 def require_tts_model(path:str)->Path:
     root=Path(path)
     for name in ("config.json","vocab.json"):
@@ -28,7 +31,7 @@ def load_khmer_tts(path:str,device:str="cpu"):
     model=VitsModel.from_pretrained(str(model_path),local_files_only=True).to(device).eval()
     return tok,model
 
-def synthesize_khmer(text:str,model_path:str,device:str="cpu")->tuple[np.ndarray,int]:
+def synthesize_khmer(text:str,model_path:str,device:str="cpu",speaking_rate:float=1.0)->tuple[np.ndarray,int]:
     import torch
     import numpy as np
     if not text.strip():
@@ -38,8 +41,14 @@ def synthesize_khmer(text:str,model_path:str,device:str="cpu")->tuple[np.ndarray
     tok,model=load_khmer_tts(model_path,device)
     inputs=tok(text,return_tensors="pt")
     inputs={k:v.to(device) for k,v in inputs.items()}
-    with torch.inference_mode():
-        output=model(**inputs).waveform.squeeze().float().cpu().numpy()
+    # VITS speaking_rate shortens phoneme durations without changing pitch.
+    default_rate=model.speaking_rate
+    try:
+        model.speaking_rate=speaking_rate
+        with torch.inference_mode():
+            output=model(**inputs).waveform.squeeze().float().cpu().numpy()
+    finally:
+        model.speaking_rate=default_rate
     rate=int(model.config.sampling_rate)
     if output.size==0 or not np.isfinite(output).all():
         raise RuntimeError("Khmer TTS returned invalid audio")
@@ -72,13 +81,24 @@ def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
     rate=24000
     timeline=np.zeros(round(duration_seconds*rate),dtype=np.float32)
     synth=synthesizer or (lambda text:synthesize_khmer(text,model_path,device))
+    # Native (pitch-preserving) speed-up is only possible with the real model.
+    fast_synth=None if synthesizer else (lambda text,r:synthesize_khmer(text,model_path,device,speaking_rate=r))
     populated=0
-    for row in rows:
-        if not row.target_text.strip():continue
+    spoken=sorted((r for r in rows if r.target_text.strip()),key=lambda r:r.start_ms)
+    for index,row in enumerate(spoken):
         start=max(0,round(row.start_ms*rate/1000))
         end=min(len(timeline),round(row.end_ms*rate/1000))
         if end<=start:continue
+        # Khmer is usually longer than the English source. Let the dub use the
+        # pause before the next segment (or the end of the video) so it needs
+        # less compression; the speedup guard still rejects unintelligible audio.
+        following=[round(r.start_ms*rate/1000) for r in spoken[index+1:] if r.start_ms>row.start_ms]
+        limit=min(following[0] if following else len(timeline),len(timeline))
         waveform,source_rate=synth(row.target_text)
+        natural=round(len(waveform)*rate/source_rate)
+        end=max(end,min(start+natural,limit))
+        if fast_synth and natural>end-start:
+            waveform,source_rate=fast_synth(row.target_text,min(MAX_NATIVE_SPEAKING_RATE,natural/(end-start)))
         piece=resample_to_length(waveform,source_rate,end-start)
         timeline[start:end]+=piece
         populated+=1

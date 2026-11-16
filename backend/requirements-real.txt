@@ -1,5 +1,7 @@
 # Optional real subtitle translation dependencies for Dockerfile.real
 faster-whisper==1.2.1
+# faster-whisper 1.2.1 calls av.open(metadata_errors=...), removed in PyAV 14.
+av==13.1.0
 transformers==4.51.3
 sentencepiece==0.2.0
 huggingface-hub==0.30.2

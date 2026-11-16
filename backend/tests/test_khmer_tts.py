@@ -29,6 +29,21 @@ def test_dubbed_track_uses_khmer_speech_and_silence(tmp_path):
     assert np.any(samples[14000:35000])
     assert not np.any(samples[40000:])
 
+def test_long_khmer_line_uses_following_pause(tmp_path):
+    # 2.4 s of speech for a 1 s English slot: needs 2.4x inside the slot, but
+    # fits naturally in the 1.5 s pause before the next segment.
+    rows=[SimpleNamespace(start_ms=0,end_ms=1000,target_text="a"),
+          SimpleNamespace(start_ms=2500,end_ms=3000,target_text="b")]
+    def fake_synth(text):
+        return (np.full(24000*24//10,0.3,dtype=np.float32) if text=="a" else np.full(12000,0.3,dtype=np.float32)),24000
+    target=tmp_path/"dub.wav"
+    build_dubbed_audio(rows,target,4.0,"unused",synthesizer=fake_synth)
+    with wave.open(str(target),"rb") as audio:
+        samples=np.frombuffer(audio.readframes(audio.getnframes()),dtype="<i2")
+    assert np.all(samples[:24000*24//10-10])   # first line plays at natural speed
+    assert np.any(samples[60000:72000])          # second line starts on time
+    assert not np.any(samples[24000*35//10:])    # silence after the last line
+
 def test_extreme_speedup_fails_instead_of_unintelligible_dub():
     with pytest.raises(ValueError,match="speedup"):
         resample_to_length(np.ones(240000,dtype=np.float32),24000,24000)

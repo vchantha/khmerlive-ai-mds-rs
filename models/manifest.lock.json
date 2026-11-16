@@ -1,1 +1,49 @@
-{"models":[],"note":"Demo mode only. Download, vet, pin and checksum production models separately."}
+{
+  "format": 1,
+  "models": [
+    {
+      "id": "Systran/faster-whisper-small",
+      "component": "asr",
+      "revision": "536b0662742c02347bc0e980a01041f333bce120",
+      "card_license": "mit",
+      "sha256": {
+        "README.md": "329373481008c7c38654aff8ecdcf0163c211557cc7ba8e2ef6f2f84b4f75ec8",
+        "config.json": "b55496ac7940a7ae47d2c01eab40edfd8701feec1229d9cce3b40014383fb828",
+        "model.bin": "3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671",
+        "tokenizer.json": "fb7b63191e9bb045082c79fd742a3106a12c99513ab30df4a0d47fa6cb6fd0ab",
+        "vocabulary.txt": "34ce3fe1c5041027b3f8d42912270993f986dbc4bb34cf27f951e34a1e453913"
+      }
+    },
+    {
+      "id": "facebook/m2m100_418M",
+      "component": "mt",
+      "revision": "55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636",
+      "card_license": "mit",
+      "sha256": {
+        "README.md": "1fd660f130aedc5ecf1796b47ab47d43d3c4b36541f5387b7adb3df75cb5dfdb",
+        "config.json": "df0ae43e4e4b0d7e3c97b7f447857a70ef6b6a2aa1f145cedbcc730d95f67134",
+        "generation_config.json": "aed76366507333ddbb8bd49960f23c82fe6446b3319a46a54befdb45324ccf61",
+        "pytorch_model.bin": "d907ea45e4e4b9db163382a6674f6218b3c59566fe06d77f4055c208b4e87ed1",
+        "sentencepiece.bpe.model": "d8f7c76ed2a5e0822be39f0a4f95a55eb19c78f4593ce609e2edbc2aea4d380a",
+        "special_tokens_map.json": "c1a4f86c3874d279ae1b2a05162858db5dd6c61665d84223ed886cbcff08fda6",
+        "tokenizer_config.json": "a53e6aa83da0b82565ed90c3849056307a9453843322ac5b8439ec4b9497fe48",
+        "vocab.json": "b6e77e474aeea8f441363aca7614317c06381f3eacfe10fb9856d5081d1074cc"
+      }
+    },
+    {
+      "id": "facebook/mms-tts-khm",
+      "component": "tts",
+      "revision": "d10bc04c97208d31fa61cf46074c02f12f887534",
+      "card_license": "cc-by-nc-4.0",
+      "sha256": {
+        "README.md": "d9bda62241064e6c9ba15ba11df2371f413931d486ae50f18af3ce98bb711c87",
+        "config.json": "fe73644ccc1adf786e8ce084c35224c2454bc121538ea38b500a558f874dbdaf",
+        "model.safetensors": "0a0175ee25d009ac6e551c9050952426efe06ddc8c90465ddfd6e347e56df00c",
+        "pytorch_model.bin": "1bf459a25f34456652e3170644f5a84ef7fb1972ed0a238733f148373612ba25",
+        "special_tokens_map.json": "f2ec250813cb93a3979b9844708625c59a2b8ab36d0e2df3a48c7521e67c6b13",
+        "tokenizer_config.json": "6c66a77ed65eaa1ea9de0bcb966568db4895ebdb02c1630203d0aa424580c5b1",
+        "vocab.json": "b7549cb60a0851e2ad333bd259c62d9caa54e9e4d523e63334ddea8a4d22e91f"
+      }
+    }
+  ]
+}

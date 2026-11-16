@@ -13,6 +13,7 @@ from app.real_inference import translate_audio, build_srt, TimedText
 from app.khmer_tts import build_dubbed_audio
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
+from app.youtube import download_youtube,youtube_video_id
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
 celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=settings.job_time_limit_seconds,task_soft_time_limit=max(60,settings.job_time_limit_seconds-300))
 
@@ -57,6 +58,19 @@ def set_state(db,job,status,error=None,progress=None,stage=None):
     if stage is not None:job.stage=stage
     db.commit()
 
+def persist_captured(s3,db,media,source:Path):
+    """Store downloaded/captured media so retries replay it instead of re-fetching."""
+    if not source.exists() or source.stat().st_size<1024:
+        raise RuntimeError("Source yielded no playable MP4")
+    s3.upload_file(str(source),settings.minio_bucket,media.object_key,ExtraArgs={"ContentType":"video/mp4"})
+    digest=hashlib.sha256()
+    with source.open("rb") as stream:
+        for block in iter(lambda:stream.read(1024*1024),b""):
+            digest.update(block)
+    media.sha256=digest.hexdigest()
+    media.size_bytes=source.stat().st_size
+    db.commit()
+
 @celery_app.task(name="translate_media",bind=True)
 def translate_media(self,job_id:str):
     with SessionLocal() as db:
@@ -79,7 +93,18 @@ def translate_media(self,job_id:str):
                 result=root/"output.mp4"
                 s3=client()
                 streamed_rows=None
-                if media.source_kind=="url":
+                if media.source_kind=="youtube":
+                    check_cancel(db,job)
+                    set_state(db,job,"processing",progress=10,stage="downloading YouTube video")
+                    original=download_youtube(youtube_video_id(media.source_url),source,
+                        settings.max_video_duration_seconds,settings.max_upload_mb*1024*1024)
+                    if original and original>settings.max_video_duration_seconds:
+                        # Long video: only the first section was downloaded. Record it.
+                        media.capture_seconds=settings.max_video_duration_seconds
+                        media.filename=media.filename.removesuffix(".mp4")+" (first "+\
+                            str(round(settings.max_video_duration_seconds/60))+" of "+str(round(original/60))+" min).mp4"
+                    persist_captured(s3,db,media,source)
+                elif media.source_kind=="url":
                     check_cancel(db,job)
                     set_state(db,job,"processing",progress=10,stage="capturing URL stream")
                     # Restrict URL schemes, user-configured allowed hosts, and public DNS.
@@ -131,17 +156,7 @@ def translate_media(self,job_id:str):
                              "-movflags","+faststart","-fs",str(1024*1024*1024),
                              str(source)]
                         subprocess.run(cmd,check=True,timeout=max(100,seconds*4+60))
-                    if not source.exists() or source.stat().st_size<1024:
-                        raise RuntimeError("Stream yielded no playable MP4")
-                    # URL content is retained in object storage for replay, not silently re-fetched.
-                    s3.upload_file(str(source),settings.minio_bucket,media.object_key,ExtraArgs={"ContentType":"video/mp4"})
-                    digest=hashlib.sha256()
-                    with source.open("rb") as stream:
-                        for block in iter(lambda:stream.read(1024*1024),b""):
-                            digest.update(block)
-                    media.sha256=digest.hexdigest()
-                    media.size_bytes=source.stat().st_size
-                    db.commit()
+                    persist_captured(s3,db,media,source)
                 else:
                     s3.download_file(settings.minio_bucket,media.object_key,str(source))
                 check_cancel(db,job)
