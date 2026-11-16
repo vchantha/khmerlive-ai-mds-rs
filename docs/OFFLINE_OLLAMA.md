@@ -52,6 +52,35 @@ Reasoning output wrapped in `<think>…</think>` is stripped before validation. 
 instruct (non-thinking) model tag is still recommended so tokens are not spent on
 reasoning.
 
+## NVIDIA GPU acceleration
+
+On CPU each segment takes 10–15 s; fully on GPU it's about 1 s. Docker can only
+see the GPU once the NVIDIA Container Toolkit is installed (one-time, needs sudo):
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker info | grep -i runtimes   # must list "nvidia"
+```
+
+Then add the GPU overlay:
+
+```bash
+docker compose -f compose.yaml -f compose.real.yaml -f compose.ollama.yaml -f compose.ollama-gpu.yaml up -d
+docker compose -f compose.yaml -f compose.real.yaml -f compose.ollama.yaml -f compose.ollama-gpu.yaml \
+  exec ollama ollama ps        # PROCESSOR column should read "100% GPU"
+```
+
+The overlay enables flash attention and a `q8_0` KV cache so `qwen3:4b-instruct`
+fits entirely in 4 GB of VRAM. If `ollama ps` shows a CPU/GPU split, lower
+`OLLAMA_CONTEXT_LENGTH` or use a smaller model (e.g. `qwen3:1.7b`).
+
 ## Tests
 
 ```bash

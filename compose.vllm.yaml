@@ -16,6 +16,9 @@ services:
       - ${VLLM_MAX_MODEL_LEN:-2048}
       - --gpu-memory-utilization
       - ${VLLM_GPU_UTILIZATION:-0.70}
+      # Turing/Pascal GPUs (e.g. T1000, compute 7.5) lack bf16; "half" works on all CUDA GPUs.
+      - --dtype
+      - ${VLLM_DTYPE:-half}
     environment:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -23,6 +26,12 @@ services:
       - ${HF_CACHE_DIR:-./models/huggingface}:/root/.cache/huggingface:ro
     networks: [backend]
     # Intentionally no published host port.
+  api:
+    # Read-only status for System health; the api never sends job text to the LLM.
+    environment:
+      VLLM_POSTEDIT_ENABLED: ${VLLM_POSTEDIT_ENABLED:-false}
+      VLLM_BASE_URL: http://vllm:8000/v1
+      VLLM_MODEL: ${VLLM_SERVED_MODEL:-khmerlive-postedit}
   worker:
     environment:
       VLLM_POSTEDIT_ENABLED: ${VLLM_POSTEDIT_ENABLED:-false}

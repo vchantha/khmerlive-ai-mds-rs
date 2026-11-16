@@ -159,3 +159,87 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
     if stats["edited"] == 0:
         return rows
     return edited
+
+
+def _model_matches(wanted: str, available: list[str]) -> bool:
+    """Ollama lists 'name:tag'; an untagged request means ':latest'."""
+    norm = lambda n: n if ":" in n else n + ":latest"
+    return norm(wanted) in {norm(a) for a in available}
+
+
+def llm_status(probe_timeout: float = 1.0) -> dict:
+    """Report the optional post-editing LLM for the System health page.
+
+    Probes the configured internal server (never a public host) with a short
+    timeout and reports whether it answers and whether the model is present.
+    status: off | ready | model_missing | offline | misconfigured
+    """
+    enabled = bool(getattr(settings, "llm_postedit_enabled", False) or getattr(settings, "vllm_postedit_enabled", False))
+    if enabled:
+        cfg = _resolve_config()
+    else:
+        # Not active: describe the provider a user would most likely enable.
+        cfg = dict(provider=settings.llm_provider, base_url=settings.llm_base_url, model=settings.llm_model)
+    provider, model = cfg["provider"], cfg["model"]
+    out = {"enabled": enabled, "provider": provider, "model": model,
+           "endpoint": cfg["base_url"], "server": "unknown", "model_available": None,
+           "available_models": [], "status": "off", "detail": None,
+           "processor": None, "gpu_percent": None}
+    try:
+        if provider not in {"ollama", "vllm"}:
+            raise ValueError("Unsupported offline LLM provider")
+        endpoint = validate_local_endpoint(cfg["base_url"])
+    except ValueError as exc:
+        out.update(status="misconfigured" if enabled else "off", detail=str(exc))
+        return out
+    try:
+        with httpx.Client(timeout=probe_timeout, trust_env=False) as client:
+            if provider == "ollama":
+                root = endpoint[:-3] if endpoint.endswith("/v1") else endpoint
+                r = client.get(root + "/api/tags")
+                r.raise_for_status()
+                names = [m.get("name") or m.get("model") for m in r.json().get("models", [])]
+            else:
+                r = client.get(endpoint + "/models")
+                r.raise_for_status()
+                names = [m.get("id") for m in r.json().get("data", [])]
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError) as exc:
+        out.update(server="offline", detail=f"{provider} server not reachable")
+        if enabled:
+            out["status"] = "offline"
+        logger.debug("LLM status probe failed: %s", exc)
+        return out
+    names = [n for n in names if isinstance(n, str)]
+    available = _model_matches(model, names)
+    out.update(server="online", available_models=names, model_available=available)
+    if enabled:
+        out["status"] = "ready" if available else "model_missing"
+    out.update(_processor_status(provider, endpoint, model, probe_timeout) if available else {})
+    return out
+
+
+def _processor_status(provider: str, endpoint: str, model: str, probe_timeout: float) -> dict:
+    """Where the model runs: processor = gpu | cpu | split | idle (not loaded) | None (unknown).
+
+    Ollama's /api/ps reports size and size_vram per loaded model; vLLM only runs on GPU.
+    Failures are non-fatal and leave processor unknown.
+    """
+    if provider == "vllm":
+        return {"processor": "gpu", "gpu_percent": 100}
+    root = endpoint[:-3] if endpoint.endswith("/v1") else endpoint
+    try:
+        with httpx.Client(timeout=probe_timeout, trust_env=False) as client:
+            r = client.get(root + "/api/ps")
+            r.raise_for_status()
+            loaded = r.json().get("models", [])
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError) as exc:
+        logger.debug("LLM processor probe failed: %s", exc)
+        return {}
+    for m in loaded if isinstance(loaded, list) else []:
+        if isinstance(m, dict) and _model_matches(model, [m.get("name") or m.get("model") or ""]):
+            size, vram = m.get("size") or 0, m.get("size_vram") or 0
+            if not isinstance(size, (int, float)) or size <= 0:
+                return {}
+            pct = max(0, min(100, round(100 * vram / size)))
+            return {"processor": "gpu" if pct == 100 else "cpu" if pct == 0 else "split", "gpu_percent": pct}
+    return {"processor": "idle", "gpu_percent": None}

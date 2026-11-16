@@ -193,3 +193,102 @@ def test_unterminated_reasoning_is_rejected(monkeypatch):
     monkeypatch.setattr(llm_postedit.httpx, "Client", Client)
     rows = [Row(0, 900, "hi", "ស")]
     assert llm_postedit.postedit_rows(rows, "en", "km") is rows
+
+
+def _status_settings(**kw):
+    base = dict(llm_postedit_enabled=False, vllm_postedit_enabled=False, llm_provider="ollama",
+                llm_base_url="http://ollama:11434/v1", llm_model="qwen3:4b-instruct",
+                llm_timeout_seconds=180, llm_max_tokens=128, llm_fail_open=True)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+_TAGS = "http://ollama:11434/api/tags"
+_PS = "http://ollama:11434/api/ps"
+
+def _probe_client(payload=None, error=None, expect_url=None, routes=None):
+    """routes maps url -> payload (or Exception); otherwise every GET returns payload."""
+    class Response:
+        def __init__(self, data): self.data = data
+        def raise_for_status(self): pass
+        def json(self): return self.data
+    class Client:
+        def __init__(self, **kwargs): assert kwargs["trust_env"] is False
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, url, **kwargs):
+            if routes is not None:
+                assert url in routes, url
+                if isinstance(routes[url], Exception): raise routes[url]
+                return Response(routes[url])
+            if expect_url: assert url == expect_url
+            if error: raise error
+            return Response(payload)
+    return Client
+
+def test_status_ready_when_ollama_model_pulled(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(llm_postedit_enabled=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client(routes={
+        _TAGS: {"models": [{"name": "qwen3:4b-instruct"}]}, _PS: {"models": []}}))
+    s = llm_postedit.llm_status()
+    assert s["status"] == "ready" and s["server"] == "online" and s["model_available"] is True
+
+def test_status_model_missing(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(llm_postedit_enabled=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client({"models": []}))
+    assert llm_postedit.llm_status()["status"] == "model_missing"
+
+def test_status_offline_when_enabled(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(llm_postedit_enabled=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client(error=llm_postedit.httpx.ConnectError("x")))
+    s = llm_postedit.llm_status()
+    assert s["status"] == "offline" and s["server"] == "offline"
+
+def test_status_off_still_reports_server(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings())
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client({"models": [{"name": "qwen3:4b-instruct"}]}))
+    s = llm_postedit.llm_status()
+    assert s["status"] == "off" and s["enabled"] is False and s["model_available"] is True
+
+def test_status_vllm_models_endpoint(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(
+        vllm_postedit_enabled=True, vllm_base_url="http://vllm:8000/v1", vllm_model="khmerlive-postedit",
+        vllm_timeout_seconds=60, vllm_max_tokens=256, vllm_fail_open=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client(
+        {"data": [{"id": "khmerlive-postedit"}]}, expect_url="http://vllm:8000/v1/models"))
+    assert llm_postedit.llm_status()["status"] == "ready"
+
+def test_untagged_model_matches_latest():
+    assert llm_postedit._model_matches("qwen3", ["qwen3:latest"])
+    assert not llm_postedit._model_matches("qwen3:4b", ["qwen3:latest"])
+
+def _loaded(size, vram, name="qwen3:4b-instruct"):
+    return {_TAGS: {"models": [{"name": "qwen3:4b-instruct"}]},
+            _PS: {"models": [{"name": name, "size": size, "size_vram": vram}]}}
+
+@pytest.mark.parametrize("size,vram,processor,pct", [
+    (3_000, 3_000, "gpu", 100), (3_000, 0, "cpu", 0), (3_000, 1_500, "split", 50)])
+def test_status_reports_ollama_processor(monkeypatch, size, vram, processor, pct):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(llm_postedit_enabled=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client(routes=_loaded(size, vram)))
+    s = llm_postedit.llm_status()
+    assert s["processor"] == processor and s["gpu_percent"] == pct
+
+def test_status_processor_idle_when_model_not_loaded(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(llm_postedit_enabled=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client(routes=_loaded(3_000, 3_000, name="other:1b")))
+    s = llm_postedit.llm_status()
+    assert s["processor"] == "idle" and s["gpu_percent"] is None and s["status"] == "ready"
+
+def test_status_processor_probe_failure_is_non_fatal(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(llm_postedit_enabled=True))
+    routes = {_TAGS: {"models": [{"name": "qwen3:4b-instruct"}]}, _PS: llm_postedit.httpx.ConnectError("x")}
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client(routes=routes))
+    s = llm_postedit.llm_status()
+    assert s["status"] == "ready" and s["processor"] is None
+
+def test_status_vllm_is_gpu(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _status_settings(
+        vllm_postedit_enabled=True, vllm_base_url="http://vllm:8000/v1", vllm_model="khmerlive-postedit",
+        vllm_timeout_seconds=60, vllm_max_tokens=256, vllm_fail_open=True))
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _probe_client({"data": [{"id": "khmerlive-postedit"}]}))
+    assert llm_postedit.llm_status()["processor"] == "gpu"

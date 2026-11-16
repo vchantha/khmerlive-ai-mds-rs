@@ -1,5 +1,5 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,Metrics,ModelInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Job,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
 import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb} from './ui';
 
 export type Ctx={
@@ -444,6 +444,14 @@ export function System({ctx}:{ctx:Ctx}){
  const isReal=real(m);
  const modelRow=(step:string,comp:string,ok:boolean|undefined,off?:boolean)=>{const inst=m?.installed?.[comp];const st=!isReal?['Demo','muted']:off?['Off','muted']:ok?['Ready','ok']:['Missing','bad'];
   return <tr key={comp}><td><b>{step}</b></td><td>{inst?<><span>{inst.id.split('/').pop()}</span><small className="mono">{inst.id}</small></>:<span className="muted">Not installed</span>}</td><td>{inst?.license?<span className={inst.license.includes('nc')?'lic nc':'lic'}>{inst.license.toUpperCase()}</span>:'—'}</td><td><span className={'badge badge-'+st[1]}>{st[0]}</span></td></tr>};
+ const llm=m?.llm;
+ const llmRow=()=>{
+  if(!llm)return <tr key="llm"><td><b>Polish translation</b><small>LLM post-edit</small></td><td><span className="muted">Not reported</span></td><td>—</td><td><span className="badge badge-muted">Unknown</span></td></tr>;
+  const st:[string,string]=!isReal?['Demo','muted']:llm.status==='ready'?['Ready','ok']:llm.status==='model_missing'?['Model not pulled','bad']:llm.status==='offline'?['Server offline','bad']:llm.status==='misconfigured'?['Misconfigured','bad']:['Off','muted'];
+  const srv=llm.server==='online'?'server online':llm.server==='offline'?'server not running':'server unknown';
+  const proc:[string,string,string]|null=llm.processor==='gpu'?['GPU','ok',llm.gpu_percent!=null?llm.gpu_percent+'% on GPU':'Runs on GPU']:llm.processor==='split'?[`${llm.gpu_percent}% GPU`,'warn',`Only ${llm.gpu_percent}% of the model fits in VRAM; the rest runs on CPU`]:llm.processor==='cpu'?['CPU','warn','Running on CPU only (slow)']:llm.processor==='idle'?['Not loaded','muted','Loads into memory on the next job']:null;
+  return <tr key="llm"><td><b>Polish translation</b><small>LLM post-edit (optional)</small></td><td><span>{llm.model}</span><small className="mono">{llm.provider} · {srv}{llm.server==='online'?(llm.model_available?' · model pulled':' · model not pulled'):''}</small></td><td>—</td><td><div className="llm-proc"><span className={'badge badge-'+st[1]}>{st[0]}</span>{proc&&<span className={'badge badge-'+proc[1]} title={proc[2]}>{proc[0]}</span>}</div></td></tr>;
+ };
  return <>
   <Head title="System health" sub="Services, server resources and the AI models behind each step. Refreshes every few seconds."><button className="btn btn-outline" onClick={()=>void ctx.refresh()}><Icon name="refresh"/>Refresh now</button></Head>
   <div className={'banner '+(down.length?'bad':unknown.length?'warn':'ok')}><Icon name={down.length?'alert':'check'} size={22}/><div><b>{down.length?down.map(d=>d[1]).join(', ')+(down.length>1?' are':' is')+' offline':unknown.length?'Most services are running · '+unknown.map(u=>u[1]).join(', ')+' not responding to pings':'All 5 services are running normally'}</b><span>{isReal?'Real AI mode':'Demo mode'} · {m?.installed&&Object.keys(m.installed).length?Object.keys(m.installed).length+' models installed':'no models installed'}</span></div></div>
@@ -462,10 +470,26 @@ export function System({ctx}:{ctx:Ctx}){
     {modelRow('Transcribe','asr',m?.subtitle_translation_configured)}
     {modelRow('Translate','mt',m?.subtitle_translation_configured)}
     {modelRow('Khmer voice','tts',m?.speech_dubbing_available,!m?.khmer_dubbing_enabled)}
+    {llmRow()}
    </tbody></table></div>
+   {llm&&isReal&&llm.status!=='ready'&&<p className="hint pad-x">{llmHint(llm)}</p>}
+   {llm&&isReal&&llm.status==='ready'&&(llm.processor==='cpu'||llm.processor==='split')&&<p className="hint pad-x">{llmProcHint(llm)}</p>}
    <p className="hint pad-x pb">To add or update models run <code>python3 scripts/download-models.py</code> on the server, then restart the worker.</p>
   </section>
  </>;
+}
+
+function llmHint(l:LLMInfo){
+ const pull=l.provider==='ollama'?<>Pull it with <code>docker compose exec ollama ollama pull {l.model}</code>. </>:null;
+ if(l.status==='model_missing')return <>The {l.provider} server is running but <b>{l.model}</b> isn't downloaded, so jobs skip polishing. {pull}</>;
+ if(l.status==='offline')return <>Post-editing is on but the {l.provider} server isn't reachable. Start it with the <code>compose.{l.provider}.yaml</code> override. Jobs still finish without polishing.</>;
+ if(l.status==='misconfigured')return <>Post-editing is misconfigured: {l.detail}</>;
+ return <>Optional AI polishing of Khmer translations is off. {l.server==='online'&&!l.model_available?pull:null}To turn it on set <code>{l.provider==='vllm'?'VLLM_POSTEDIT_ENABLED':'LLM_POSTEDIT_ENABLED'}=true</code> in <code>.env</code> and restart api and worker.</>;
+}
+
+function llmProcHint(l:LLMInfo){
+ if(l.processor==='cpu')return <>Post-editing is running on the <b>CPU</b>, so each subtitle line takes several seconds. To use an NVIDIA GPU, install the NVIDIA Container Toolkit and add <code>-f compose.ollama-gpu.yaml</code> when starting the stack.</>;
+ return <>Only <b>{l.gpu_percent}%</b> of <b>{l.model}</b> fits in GPU memory; the rest runs on the CPU, which slows post-editing. Lower <code>OLLAMA_CONTEXT_LENGTH</code> or use a smaller model.</>;
 }
 
 /* ================= Datasets ================= */

@@ -12,6 +12,7 @@ from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.youtube import is_youtube_host,youtube_video_id,canonical_url,fetch_info,YouTubeURLRejected
 from app.tasks import translate_media
+from app.llm_postedit import llm_status
 from app.media_preview import issue_playback_token,check_playback_token,parse_byte_range,srt_to_webvtt,InvalidPlaybackToken,InvalidByteRange
 from starlette.background import BackgroundTask
 from app.auth import router as auth_router, actor_from_request
@@ -80,6 +81,7 @@ def models():
             "youtube_enabled":settings.youtube_enabled,
             "speech_dubbing_available":dubbing_ready,
             "khmer_dubbing_enabled":settings.enable_khmer_dubbing,
+            "llm":llm_status(),
             "note":"English to Khmer jobs replace source audio with offline Khmer TTS when enabled. Khmer to English remains subtitle-only."}
 
 @app.post("/api/media",status_code=201,dependencies=[Depends(authorize)])

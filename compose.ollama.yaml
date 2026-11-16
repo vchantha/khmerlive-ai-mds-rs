@@ -13,6 +13,13 @@ services:
     volumes:
       - ollama_models:/root/.ollama
     networks: [backend]
+  api:
+    # Read-only status for System health; the api never sends job text to the LLM.
+    environment:
+      LLM_POSTEDIT_ENABLED: ${LLM_POSTEDIT_ENABLED:-false}
+      LLM_PROVIDER: ollama
+      LLM_BASE_URL: http://ollama:11434/v1
+      LLM_MODEL: ${OLLAMA_MODEL:-qwen3:4b-instruct}
   worker:
     environment:
       LLM_POSTEDIT_ENABLED: ${LLM_POSTEDIT_ENABLED:-false}
