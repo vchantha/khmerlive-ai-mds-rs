@@ -1,4 +1,4 @@
-"""Optional offline vLLM post-editing of timestamped English→Khmer segments.
+"""Optional offline Ollama/vLLM post-editing of timestamped English→Khmer segments.
 
 The service is only called when explicitly enabled. Never send user text to
 a public endpoint: the configured endpoint must be an internal Docker hostname.
@@ -16,7 +16,7 @@ def validate_local_endpoint(url: str) -> str:
     parsed = urlsplit(url)
     if parsed.scheme != "http" or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("vLLM must use an internal HTTP endpoint")
-    if parsed.hostname not in {"vllm", "localhost", "127.0.0.1"}:
+    if parsed.hostname not in {"vllm", "ollama", "localhost", "127.0.0.1"}:
         raise ValueError("vLLM endpoint must be a trusted local service")
     if parsed.path.rstrip("/") not in {"", "/v1"}:
         raise ValueError("vLLM endpoint must end at /v1")
@@ -24,20 +24,25 @@ def validate_local_endpoint(url: str) -> str:
 
 def postedit_rows(rows, source_lang: str, target_lang: str):
     """Return unchanged rows unless explicitly enabled for English→Khmer."""
-    if not settings.vllm_postedit_enabled or source_lang != "en" or target_lang != "km":
+    if not (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) or source_lang != "en" or target_lang != "km":
         return rows
     try:
-        endpoint = validate_local_endpoint(settings.vllm_base_url)
+        provider = settings.llm_provider if settings.llm_postedit_enabled else "vllm"
+        if provider not in {"ollama", "vllm"}:
+            raise ValueError("Unsupported offline LLM provider")
+        endpoint = validate_local_endpoint(settings.llm_base_url if settings.llm_postedit_enabled else settings.vllm_base_url)
+        if provider == "ollama" and urlsplit(endpoint).hostname not in {"ollama", "localhost", "127.0.0.1"}:
+            raise ValueError("Ollama provider must use an Ollama endpoint")
         edited = []
-        with httpx.Client(timeout=settings.vllm_timeout_seconds, trust_env=False) as client:
+        with httpx.Client(timeout=settings.llm_timeout_seconds if settings.llm_postedit_enabled else settings.vllm_timeout_seconds, trust_env=False) as client:
             for row in rows:
                 if not row.target_text.strip():
                     edited.append(row)
                     continue
                 payload = {
-                    "model": settings.vllm_model,
+                    "model": settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
                     "temperature": 0,
-                    "max_tokens": settings.vllm_max_tokens,
+                    "max_tokens": settings.llm_max_tokens if settings.llm_postedit_enabled else settings.vllm_max_tokens,
                     "messages": [
                         {"role": "system", "content": (
                             "You are a careful English-to-Khmer translation post-editor for video dubbing. "
@@ -66,6 +71,6 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
         return edited
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
         logger.warning("Local vLLM post-editing failed: %s", exc)
-        if settings.vllm_fail_open:
+        if settings.llm_fail_open if settings.llm_postedit_enabled else settings.vllm_fail_open:
             return rows
         raise RuntimeError("Offline vLLM post-editing failed") from exc
