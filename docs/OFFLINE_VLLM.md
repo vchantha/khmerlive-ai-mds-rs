@@ -15,7 +15,7 @@ docker compose -f compose.yaml -f compose.real.yaml -f compose.vllm.yaml --profi
 docker compose -f compose.yaml -f compose.real.yaml -f compose.vllm.yaml --profile vllm exec worker python -c 'import httpx; r=httpx.get("http://vllm:8000/v1/models",timeout=15); r.raise_for_status(); print(r.json())'
 ```
 
-Only **after** the model server is healthy, set `VLLM_POSTEDIT_ENABLED=true` in the deployment environment and recreate the worker. The overlay forwards that variable to the worker. If `VLLM_FAIL_OPEN=true` (default), network/response errors revert the entire job to the unedited M2M100 translation; set it to false for strict research experiments.
+Only **after** the model server is healthy, set `VLLM_POSTEDIT_ENABLED=true` in the deployment environment and recreate the worker. The overlay forwards that variable to the worker. If `VLLM_FAIL_OPEN=true` (default), a failed or rejected segment keeps its unedited M2M100 translation while other segments keep their edits; an unreachable server stops post-editing after the first attempt. `LLM_TOTAL_BUDGET_SECONDS` (default 900) caps total post-editing time per job. Set `VLLM_FAIL_OPEN=false` for strict research experiments, where any segment failure fails the job.
 
 For tests:
 

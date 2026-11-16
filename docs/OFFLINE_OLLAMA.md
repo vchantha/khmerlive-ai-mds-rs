@@ -33,8 +33,24 @@ docker compose -f compose.yaml -f compose.real.yaml -f compose.ollama.yaml exec 
   python -c 'import httpx; r=httpx.get("http://ollama:11434/v1/models",timeout=30); r.raise_for_status(); print(r.json())'
 ```
 
-`LLM_FAIL_OPEN=true` falls back to the original M2M100 segments if any segment
-request fails. Use `false` for strictly reproducible failure-aware experiments.
+`LLM_FAIL_OPEN=true` keeps the original M2M100 translation for any segment whose
+request fails or whose output fails the guard (empty, too long, no Khmer script);
+other segments keep their edits. If the server is unreachable, post-editing stops
+after the first attempt. Use `false` for strictly reproducible failure-aware
+experiments: any segment failure then fails the job.
+
+`LLM_TOTAL_BUDGET_SECONDS` (default `900`) caps the total time post-editing may add
+to one job. Segments still pending when it runs out keep their original translation
+(or fail the job when `LLM_FAIL_OPEN=false`). Keep it well below
+`JOB_TIME_LIMIT_SECONDS`.
+
+`OLLAMA_KEEP_ALIVE` (default `10m`) keeps the model loaded between segment
+requests. Setting it to `0` forces a model reload for every subtitle line, which is
+very slow on CPU.
+
+Reasoning output wrapped in `<think>…</think>` is stripped before validation. An
+instruct (non-thinking) model tag is still recommended so tokens are not spent on
+reasoning.
 
 ## Tests
 

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds:float=180.0
     llm_max_tokens:int=256
     llm_fail_open:bool=True
+    llm_total_budget_seconds:float=900.0
     vllm_postedit_enabled:bool=False
     vllm_base_url:str="http://vllm:8000/v1"
     vllm_model:str="khmerlive-postedit"

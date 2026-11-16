@@ -29,3 +29,4 @@ services:
       VLLM_BASE_URL: http://vllm:8000/v1
       VLLM_MODEL: ${VLLM_SERVED_MODEL:-khmerlive-postedit}
       VLLM_FAIL_OPEN: ${VLLM_FAIL_OPEN:-true}
+      LLM_TOTAL_BUDGET_SECONDS: ${LLM_TOTAL_BUDGET_SECONDS:-900}
