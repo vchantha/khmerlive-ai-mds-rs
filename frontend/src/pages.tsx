@@ -1,5 +1,5 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Job,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
 import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb} from './ui';
 
 export type Ctx={
@@ -28,10 +28,17 @@ async function createUploadJob(file:File,source:'en'|'km',onPct:(n:number)=>void
  const r=await req<{job_id:string}>('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_id:media.media_id,source_lang:source,target_lang:source==='en'?'km':'en'})});
  return r.job_id;
 }
-async function jobAction(ctx:Ctx,j:Job,which:'cancel'|'retry',after?:()=>void){
- if(which==='cancel'&&!window.confirm('Cancel “'+baseName(j.filename)+'”? The current step may need to finish first.'))return;
- try{await req('/api/jobs/'+j.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?'Cancellation requested':'Job queued again');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
+async function jobAction(ctx:Ctx,j:Job,which:'cancel'|'retry',after?:()=>void,force?:boolean){
+ if(which==='cancel'&&!force&&!window.confirm('Cancel “'+baseName(j.filename)+'”? It stops immediately.'))return;
+ try{const r=await req<{status?:string}>('/api/jobs/'+j.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?(r.status==='cancelled'?'Job cancelled':'Stopping job…'):'Job queued again');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
 }
+
+async function trashJob(ctx:Ctx,j:Job,after?:()=>void){
+ if(isActive(j.status)){ctx.notify('Cancel the job before deleting it','err');return}
+ if(!window.confirm('Move “'+baseName(j.filename)+'” to the Trash?\n\nIt disappears from your lists. '+(ctx.isAdmin?'You can restore it from the Trash.':'An administrator can still restore it.')))return;
+ try{await req('/api/jobs/'+j.id,{method:'DELETE'});ctx.notify('Job moved to the Trash');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
+}
+const JOB_SORTS:[string,string][]=[['newest','Newest first'],['oldest','Oldest first'],['updated','Recently updated'],['name_asc','Name A–Z'],['name_desc','Name Z–A'],['status','Status']];
 
 /* ================= Sign in ================= */
 export function Login({providers,onKey,error}:{providers:Provider[];onKey:(k:string,remember:boolean)=>Promise<void>;error:string}){
@@ -313,7 +320,7 @@ function Progress({ctx,job,reload,onResult}:{ctx:Ctx;job:Job;reload:()=>Promise<
  return <>
   <Head crumb={<><a href="#/jobs">Jobs</a> / {shortId(job.id)}</>} title={<>{baseName(job.filename)} <span className="head-badge"><Badge status={job.status}/></span></>} sub={jobMeta(job,'Started '+asDate(job.created_at))}>
    {onResult&&<button className="btn btn-outline" onClick={onResult}>View result</button>}
-   {isActive(job.status)?<button className="btn btn-outline btn-danger-text" disabled={job.status==='cancelling'} onClick={()=>void jobAction(ctx,job,'cancel',reload)}>{job.status==='cancelling'?'Cancelling…':'Cancel job'}</button>:stopped&&<button className="btn btn-primary" onClick={()=>void jobAction(ctx,job,'retry',reload)}><Icon name="refresh"/>Retry</button>}
+   {isActive(job.status)?<button className="btn btn-outline btn-danger-text" title={job.status==='cancelling'?'Stop it now':undefined} onClick={()=>void jobAction(ctx,job,'cancel',reload,job.status==='cancelling')}>{job.status==='cancelling'?'Cancelling… · Stop now':'Cancel job'}</button>:stopped&&<><button className="btn btn-outline btn-danger-text" onClick={()=>void trashJob(ctx,job,()=>ctx.go('/jobs'))}><Icon name="trash"/>Delete</button><button className="btn btn-primary" onClick={()=>void jobAction(ctx,job,'retry',reload)}><Icon name="refresh"/>Retry</button></>}
   </Head>
   <Card>
    <div className="pg-head"><h2>{heading}</h2><span><b>{job.progress}%</b>{timeLeft(job)&&' · '+timeLeft(job)}</span></div>
@@ -354,6 +361,7 @@ function Review({ctx,job,onPipeline}:{ctx:Ctx;job:Job;onPipeline:()=>void}){
  const share=async()=>{try{await navigator.clipboard.writeText(location.origin+'/#/job/'+job.id);ctx.notify('Link copied — people need access to this workspace to open it')}catch{ctx.notify('Could not copy the link','err')}};
  return <>
   <Head crumb={<><a href="#/jobs">Jobs</a> / {shortId(job.id)}</>} title={<>{baseName(job.filename)} <span className="head-badge"><span className="badge badge-ok"><Icon name="check" size={13}/>Completed</span></span></>} sub={jobMeta(job,(dur?fmtDur(dur)+' · ':'')+'Finished '+asDate(job.updated_at))}>
+   <button className="btn btn-outline btn-danger-text" onClick={()=>void trashJob(ctx,job,()=>ctx.go('/jobs'))}><Icon name="trash"/>Delete</button>
    <button className="btn btn-outline" onClick={onPipeline}>Pipeline</button>
    <button className="btn btn-outline" onClick={()=>void share()}><Icon name="share"/>Share</button>
    <button className="btn btn-primary" onClick={()=>void downloadVideo(job).catch(fail)}><Icon name="download"/>Download video</button>
@@ -387,12 +395,13 @@ export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
  const initial=query.get('status')||'';
  const [status,setStatus]=useState<'all'|'active'|'completed'|'failed'>((['active','completed','failed'].includes(initial)?initial:'all') as 'all');
  const [view,setView]=useState<'list'|'grid'>(query.get('view')==='grid'?'grid':'list');
- const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[offset,setOffset]=useState(0);
+ const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[offset,setOffset]=useState(0),[sort,setSort]=useState('newest');
+ const mediaId=query.get('media')||'';
  const limit=view==='grid'?12:10;
  const [data,setData]=useState<{items:Job[];total:number}|null>(null);
- const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),status:view==='grid'&&status==='all'?'completed':status,source});if(search)p.set('search',search);setData(await req('/api/jobs?'+p))}catch(e){ctx.notify(errText(e),'err')}};
- useEffect(()=>{void load()},[status,search,source,offset,view]);
- useEffect(()=>{const t=setInterval(()=>void load(),6000);return()=>clearInterval(t)},[status,search,source,offset,view]);
+ const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),status:view==='grid'&&status==='all'?'completed':status,source,sort});if(search)p.set('search',search);if(mediaId)p.set('media_id',mediaId);setData(await req('/api/jobs?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[status,search,source,offset,view,sort]);
+ useEffect(()=>{const t=setInterval(()=>void load(),6000);return()=>clearInterval(t)},[status,search,source,offset,view,sort]);
  useEffect(()=>{const t=setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
  const m=ctx.metrics;
  return <>
@@ -400,11 +409,13 @@ export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
   <div className="toolbar">
    <Seg label="Status" value={status} onChange={v=>{setStatus(v);setOffset(0)}} items={[['all',<>All <em>{m.total}</em></>],['active',<>In progress <em>{m.processing+m.queued}</em></>],['completed',<>Completed <em>{m.completed}</em></>],['failed',<>Failed <em>{m.failed}</em></>]]}/>
    <div className="toolbar-r">
-    <label className="input-icon"><Icon name="search"/><input placeholder="Search title or ID" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search jobs"/></label>
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search title, ID or link" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search jobs"/></label>
+    <select className="select" value={sort} onChange={e=>{setSort(e.target.value);setOffset(0)}} aria-label="Sort jobs">{JOB_SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select>
     <select className="select" value={source} onChange={e=>{setSource(e.target.value);setOffset(0)}} aria-label="Source"><option value="all">All sources</option><option value="youtube">YouTube</option><option value="upload">Upload</option><option value="url">Video link</option></select>
     <Seg label="View" value={view} onChange={v=>{setView(v);setOffset(0)}} items={[['list',<Icon name="list" key="l"/>],['grid',<Icon name="grid" key="g"/>]]}/>
    </div>
   </div>
+  {mediaId&&<div className="alert alert-info filter-chip">Showing jobs for one video · <a href="#/jobs">Show all jobs</a></div>}
   {view==='list'?<section className="card">
    <div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Source</th><th>Status</th><th>Created</th><th><span className="sr">Action</span></th></tr></thead><tbody>
     {data?.items.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}>
@@ -412,7 +423,7 @@ export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
      <td>{sourceLabel(j.source_kind,j.capture_seconds)}</td>
      <td><div className="scell"><Badge status={j.status}/>{isActive(j.status)&&j.status!=='queued'&&<><Bar value={j.progress}/><small>{j.stage||''} · {j.progress}%</small></>}{j.status==='queued'&&<small>Waiting for a worker</small>}{isFailed(j.status)&&<small className="clip" title={j.error||''}>{j.error||'Failed'}</small>}</div></td>
      <td className="nowrap">{asDate(j.created_at)}</td>
-     <td className="act" onClick={e=>e.stopPropagation()}>{isFailed(j.status)||j.status==='cancelled'?<button className="btn btn-outline btn-sm" onClick={()=>void jobAction(ctx,j,'retry',load)}>Retry</button>:<button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/job/'+j.id)}>{j.status==='completed'?'Open':'View'}</button>}</td>
+     <td className="act" onClick={e=>e.stopPropagation()}><div className="act-row">{isFailed(j.status)||j.status==='cancelled'?<button className="btn btn-outline btn-sm" onClick={()=>void jobAction(ctx,j,'retry',load)}>Retry</button>:<button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/job/'+j.id)}>{j.status==='completed'?'Open':'View'}</button>}<button className="btn btn-ghost btn-sm btn-icon btn-danger-text" disabled={isActive(j.status)} title={isActive(j.status)?'Cancel the job before deleting it':'Move to Trash'} aria-label={'Delete '+baseName(j.filename)} onClick={()=>void trashJob(ctx,j,load)}><Icon name="trash" size={16}/></button></div></td>
     </tr>)}
     {data&&!data.items.length&&<tr><td colSpan={5}><div className="empty"><b>No jobs match</b><span>Try another filter, or start a new translation.</span></div></td></tr>}
     {!data&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
@@ -490,6 +501,88 @@ function llmHint(l:LLMInfo){
 function llmProcHint(l:LLMInfo){
  if(l.processor==='cpu')return <>Post-editing is running on the <b>CPU</b>, so each subtitle line takes several seconds. To use an NVIDIA GPU, install the NVIDIA Container Toolkit and add <code>-f compose.ollama-gpu.yaml</code> when starting the stack.</>;
  return <>Only <b>{l.gpu_percent}%</b> of <b>{l.model}</b> fits in GPU memory; the rest runs on the CPU, which slows post-editing. Lower <code>OLLAMA_CONTEXT_LENGTH</code> or use a smaller model.</>;
+}
+
+/* ================= Videos ================= */
+const MEDIA_SORTS:[string,string][]=[['newest','Newest first'],['oldest','Oldest first'],['name_asc','Name A–Z'],['name_desc','Name Z–A'],['size_desc','Largest first'],['size_asc','Smallest first']];
+const kindLabel=(k:string)=>k==='youtube'?'YouTube':k==='url'?'Video link':'Upload';
+export function Videos({ctx}:{ctx:Ctx}){
+ const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[sort,setSort]=useState('newest'),[offset,setOffset]=useState(0);
+ const limit=15;
+ const [data,setData]=useState<{items:MediaItem[];total:number}|null>(null);
+ const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),source,sort});if(search)p.set('search',search);setData(await req('/api/media?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[search,source,sort,offset]);
+ useEffect(()=>{const t=setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
+ const remove=async(m:MediaItem)=>{
+  if(m.active){ctx.notify('This video has jobs in progress. Cancel them first.','err');return}
+  if(!window.confirm('Move “'+baseName(m.filename)+'” to the Trash?\n\n'+(m.jobs?'Its '+m.jobs+' translation job'+(m.jobs===1?'':'s')+' will be moved too. ':'')+(ctx.isAdmin?'You can restore it from the Trash.':'An administrator can still restore it.')))return;
+  try{const r=await req<{jobs_trashed:number}>('/api/media/'+m.id,{method:'DELETE'});ctx.notify('Video moved to the Trash'+(r.jobs_trashed?' with '+r.jobs_trashed+' job'+(r.jobs_trashed===1?'':'s'):''));void load();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}};
+ const pg=data?{total:data.total,items:data.items as unknown as Job[]}:null;
+ return <>
+  <Head title="Videos" sub="Source videos you uploaded or linked. Deleting a video also removes its translation jobs."><NewBtn go={ctx.go}/></Head>
+  <div className="toolbar">
+   <span className="muted">{data?data.total+' video'+(data.total===1?'':'s'):''}</span>
+   <div className="toolbar-r">
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search name, ID or link" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search videos"/></label>
+    <select className="select" value={source} onChange={e=>{setSource(e.target.value);setOffset(0)}} aria-label="Source"><option value="all">All sources</option><option value="youtube">YouTube</option><option value="upload">Upload</option><option value="url">Video link</option></select>
+    <select className="select" value={sort} onChange={e=>{setSort(e.target.value);setOffset(0)}} aria-label="Sort videos">{MEDIA_SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select>
+   </div>
+  </div>
+  <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Source</th><th>Size</th><th>Jobs</th><th>Added</th><th><span className="sr">Actions</span></th></tr></thead><tbody>
+   {data?.items.map(m=><tr key={m.id} onClick={()=>ctx.go('/jobs?media='+m.id)}>
+    <td><div className="vcell"><Thumb/><div><b title={m.filename}>{baseName(m.filename)}</b><small className="clip" title={m.source_url||m.id}>{m.source_url||shortId(m.id)}</small></div></div></td>
+    <td>{kindLabel(m.source_kind)}</td>
+    <td className="nowrap">{m.size_bytes?size(m.size_bytes):'—'}</td>
+    <td className="nowrap">{m.jobs}{m.active?<small>{m.active} in progress</small>:m.completed?<small>{m.completed} completed</small>:null}</td>
+    <td className="nowrap">{asDate(m.created_at)}</td>
+    <td className="act" onClick={e=>e.stopPropagation()}><div className="act-row"><button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/jobs?media='+m.id)}>Jobs</button><button className="btn btn-ghost btn-sm btn-icon btn-danger-text" disabled={m.active>0} title={m.active?'Cancel its jobs before deleting':'Move to Trash'} aria-label={'Delete '+baseName(m.filename)} onClick={()=>void remove(m)}><Icon name="trash" size={16}/></button></div></td>
+   </tr>)}
+   {data&&!data.items.length&&<tr><td colSpan={6}><div className="empty"><b>No videos match</b><span>Try another search, or start a new translation.</span></div></td></tr>}
+   {!data&&<tr><td colSpan={6}><span className="sk w80"/></td></tr>}
+  </tbody></table></div>
+  <Pager data={pg} offset={offset} limit={limit} setOffset={setOffset}/></section>
+ </>;
+}
+
+/* ================= Trash (admin) ================= */
+const TRASH_SORTS:[string,string][]=[['deleted_newest','Recently deleted'],['deleted_oldest','Oldest deleted'],['name_asc','Name A–Z'],['name_desc','Name Z–A']];
+export function Trash({ctx}:{ctx:Ctx}){
+ const [kind,setKind]=useState<'all'|'job'|'video'>('all'),[q,setQ]=useState(''),[search,setSearch]=useState(''),[sort,setSort]=useState('deleted_newest');
+ const [data,setData]=useState<{items:TrashItem[];total:number}|null>(null),[busy,setBusy]=useState(false);
+ const load=async()=>{if(!ctx.isAdmin)return;try{const p=new URLSearchParams({kind,sort,limit:'200'});if(search)p.set('search',search);setData(await req('/api/trash?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[kind,search,sort,ctx.isAdmin]);
+ useEffect(()=>{const t=setTimeout(()=>setSearch(q.trim()),300);return()=>clearTimeout(t)},[q]);
+ if(!ctx.isAdmin)return <><Head title="Trash"/><div className="alert alert-err">Only administrators can open the Trash.</div></>;
+ const label=(i:TrashItem)=>i.kind==='video'?'video':'job';
+ const restore=async(i:TrashItem)=>{try{const r=await req<{jobs_restored:number}>(`/api/trash/${i.kind}/${i.id}/restore`,{method:'POST'});ctx.notify('Restored '+label(i)+(r.jobs_restored?' and '+r.jobs_restored+' job'+(r.jobs_restored===1?'':'s'):''));void load();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}};
+ const purge=async(i:TrashItem)=>{
+  if(!window.confirm('Permanently delete “'+baseName(i.filename)+'”?\n\n'+(i.kind==='video'&&i.jobs?'This also deletes its '+i.jobs+' job'+(i.jobs===1?'':'s')+'. ':'')+'The files are erased from storage. This cannot be undone.'))return;
+  try{const r=await req<{storage_cleaned:boolean}>(`/api/trash/${i.kind}/${i.id}`,{method:'DELETE'});ctx.notify(r.storage_cleaned?'Permanently deleted':'Deleted, but some files could not be removed from storage',r.storage_cleaned?undefined:'err');void load()}catch(e){ctx.notify(errText(e),'err')}};
+ const empty=async()=>{
+  if(!data?.total)return;
+  if(!window.confirm('Empty the Trash?\n\nAll '+data.total+' item'+(data.total===1?'':'s')+' and their files will be permanently deleted. This cannot be undone.'))return;
+  setBusy(true);try{const r=await req<{jobs_deleted:number;videos_deleted:number;storage_cleaned:boolean}>('/api/trash',{method:'DELETE'});ctx.notify('Trash emptied · '+r.videos_deleted+' video'+(r.videos_deleted===1?'':'s')+', '+r.jobs_deleted+' job'+(r.jobs_deleted===1?'':'s')+' deleted'+(r.storage_cleaned?'':' (some files could not be removed)'),r.storage_cleaned?undefined:'err');void load()}catch(e){ctx.notify(errText(e),'err')}finally{setBusy(false)}};
+ return <>
+  <Head title="Trash" sub="Jobs and videos deleted by anyone. Restore them, or delete permanently to erase their files."><button className="btn btn-outline btn-danger-text" disabled={busy||!data?.total} onClick={()=>void empty()}><Icon name="trash"/>{busy?'Emptying…':'Empty Trash'}</button></Head>
+  <div className="toolbar">
+   <Seg label="Type" value={kind} onChange={setKind} items={[['all','All'],['video','Videos'],['job','Jobs']]}/>
+   <div className="toolbar-r">
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search name or ID" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search Trash"/></label>
+    <select className="select" value={sort} onChange={e=>setSort(e.target.value)} aria-label="Sort Trash">{TRASH_SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select>
+   </div>
+  </div>
+  <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Item</th><th>Type</th><th>Owner</th><th>Deleted</th><th><span className="sr">Actions</span></th></tr></thead><tbody>
+   {data?.items.map(i=><tr key={i.kind+i.id} className="no-click">
+    <td><div className="vcell"><Thumb/><div><b title={i.filename}>{baseName(i.filename)}</b><small>{shortId(i.id)}{i.kind==='video'?' · '+kindLabel(i.source_kind)+(i.jobs?' · '+i.jobs+' job'+(i.jobs===1?'':'s'):''):''}</small></div></div></td>
+    <td>{i.kind==='video'?'Video':<>Job {i.status&&<Badge status={i.status}/>}</>}</td>
+    <td>{i.owner_name||(i.owner_user_id?shortId(i.owner_user_id):'Administrator')}</td>
+    <td className="nowrap">{asDate(i.deleted_at)}<small>by {i.deleted_by_name||'unknown'}</small></td>
+    <td className="act"><div className="act-row"><button className="btn btn-outline btn-sm" onClick={()=>void restore(i)}><Icon name="restore" size={15}/>Restore</button><button className="btn btn-ghost btn-sm btn-danger-text" onClick={()=>void purge(i)}>Delete forever</button></div></td>
+   </tr>)}
+   {data&&!data.items.length&&<tr><td colSpan={5}><div className="empty"><b>Trash is empty</b><span>Deleted jobs and videos appear here until you delete them permanently.</span></div></td></tr>}
+   {!data&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
+  </tbody></table></div></section>
+ </>;
 }
 
 /* ================= Datasets ================= */

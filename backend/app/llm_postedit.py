@@ -109,6 +109,10 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
     edited = list(rows)
     stats = {"edited": 0, "failed": 0, "skipped_budget": 0}
 
+    concurrency = max(1, int(getattr(settings, "llm_concurrency", 1) or 1))
+    if concurrency > 1:
+        return _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency)
+
     with httpx.Client(timeout=cfg["timeout"], trust_env=False) as client:
         for index, row in enumerate(rows):
             if not row.target_text.strip():
@@ -122,19 +126,7 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
                 if not cfg["fail_open"]:
                     raise RuntimeError(msg)
                 break
-            payload = {
-                "model": cfg["model"],
-                "temperature": 0,
-                "max_tokens": cfg["max_tokens"],
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps({
-                        "english": row.source_text,
-                        "draft_khmer": row.target_text,
-                        "available_duration_ms": row.end_ms - row.start_ms,
-                    }, ensure_ascii=False)},
-                ],
-            }
+            payload = _payload(cfg, row)
             try:
                 response = client.post(endpoint + "/chat/completions", json=payload,
                                        timeout=min(cfg["timeout"], remaining))
@@ -159,6 +151,105 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
     if stats["edited"] == 0:
         return rows
     return edited
+
+
+def _payload(cfg, row) -> dict:
+    return {
+        "model": cfg["model"],
+        "temperature": 0,
+        "max_tokens": cfg["max_tokens"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({
+                "english": row.source_text,
+                "draft_khmer": row.target_text,
+                "available_duration_ms": row.end_ms - row.start_ms,
+            }, ensure_ascii=False)},
+        ],
+    }
+
+
+def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency):
+    """Same per-segment requests and guards as the sequential path, N at a time.
+
+    The server batches concurrent requests (Ollama: OLLAMA_NUM_PARALLEL; vLLM:
+    continuous batching), so throughput rises without changing any prompt.
+    """
+    from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+    edited = list(rows)
+    stats = {"edited": 0, "failed": 0, "skipped_budget": 0}
+    todo = [i for i, r in enumerate(rows) if r.target_text.strip()]
+    stop = False
+    fatal: Exception | None = None
+
+    def one(client, index):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            raise TimeoutError("budget")
+        r = client.post(endpoint + "/chat/completions", json=_payload(cfg, rows[index]),
+                        timeout=min(cfg["timeout"], remaining))
+        r.raise_for_status()
+        return _clean_output(r.json()["choices"][0]["message"]["content"], rows[index].target_text)
+
+    with httpx.Client(timeout=cfg["timeout"], trust_env=False) as client, \
+            ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending = {}
+        queue = iter(todo)
+        while True:
+            while not stop and len(pending) < concurrency:
+                index = next(queue, None)
+                if index is None:
+                    break
+                if deadline - time.monotonic() <= 1:
+                    stats["skipped_budget"] += 1 + sum(1 for _ in queue)
+                    stop = True
+                    break
+                pending[pool.submit(one, client, index)] = index
+            if not pending:
+                break
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                index = pending.pop(fut)
+                try:
+                    edited[index] = replace(rows[index], target_text=fut.result())
+                    stats["edited"] += 1
+                except TimeoutError:
+                    stats["skipped_budget"] += 1
+                except httpx.ConnectError as exc:
+                    logger.warning("Offline %s endpoint unreachable: %s", provider, exc)
+                    stats["failed"] += 1
+                    stop = True
+                    fatal = fatal or exc
+                except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+                    logger.warning("Offline %s post-editing failed for segment %d: %s", provider, index, exc)
+                    stats["failed"] += 1
+                    if not cfg["fail_open"]:
+                        stop = True
+                        fatal = fatal or exc
+    if stats["skipped_budget"]:
+        msg = f"Offline {provider} post-editing budget of {budget:.0f}s exhausted; {stats['skipped_budget']} segments unedited"
+        logger.warning(msg)
+        if not cfg["fail_open"]:
+            raise RuntimeError(msg)
+    if fatal is not None and not cfg["fail_open"]:
+        raise RuntimeError(f"Offline {provider} post-editing failed") from fatal
+    logger.info("Offline %s post-editing (x%d parallel): %s", provider, concurrency, stats)
+    return edited if stats["edited"] else rows
+
+
+def unload_llm(timeout: float = 10.0) -> bool:
+    """Ask Ollama to drop the post-edit model from (GPU) memory now. Next request reloads it."""
+    if not settings.llm_postedit_enabled or settings.llm_provider != "ollama":
+        return False
+    try:
+        endpoint = validate_local_endpoint(settings.llm_base_url)
+        root = endpoint[:-3] if endpoint.endswith("/v1") else endpoint
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            client.post(root + "/api/generate", json={"model": settings.llm_model, "keep_alive": 0}).raise_for_status()
+        return True
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Could not unload the post-edit LLM: %s", exc)
+        return False
 
 
 def _model_matches(wanted: str, available: list[str]) -> bool:

@@ -16,6 +16,9 @@ class MediaAsset(Base):
     source_kind:Mapped[str]=mapped_column(String(16),default="upload",server_default="upload")
     capture_seconds:Mapped[int|None]=mapped_column(nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+    # Soft delete: set when moved to the Trash; only an admin purge removes the row and files.
+    deleted_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True,index=True)
+    deleted_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
 
 class TranslationJob(Base):
     __tablename__="translation_jobs"
@@ -33,9 +36,13 @@ class TranslationJob(Base):
     output_key:Mapped[str|None]=mapped_column(String(500),nullable=True)
     subtitle_key:Mapped[str|None]=mapped_column(String(500),nullable=True)
     processing_mode:Mapped[str]=mapped_column(String(32),default="demo",server_default="demo")
+    # JSON: seconds per pipeline stage, devices and engines used (performance tuning).
+    timings:Mapped[str|None]=mapped_column(Text,nullable=True)
     owner_user_id:Mapped[str|None]=mapped_column(ForeignKey("app_users.id"),nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())
+    deleted_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True,index=True)
+    deleted_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
 
 
 class AppUser(Base):

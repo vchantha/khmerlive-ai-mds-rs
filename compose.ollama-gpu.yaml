@@ -15,7 +15,11 @@ services:
       OLLAMA_KV_CACHE_TYPE: ${OLLAMA_KV_CACHE_TYPE:-q8_0}
       # Keep the model resident; reloading to VRAM per job wastes seconds.
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      # 2 subtitle lines at once. Context is per line, so 2 x 1024 uses the same VRAM as 1 x 2048.
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-1024}
   worker:
     environment:
       # GPU responses take ~1 s per segment; fail fast instead of waiting on a stuck request.
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      LLM_CONCURRENCY: ${LLM_CONCURRENCY:-2}

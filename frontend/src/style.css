@@ -353,3 +353,10 @@ kbd{font-family:inherit;font-size:11px;padding:1px 6px;border:1px solid var(--li
  .head-act{width:100%}.head-act .btn-primary{flex:1}
  .seg{width:100%}.seg button{flex:1;justify-content:center;padding:7px 8px}
 }
+/* Delete / Trash */
+.act-row{display:inline-flex;gap:6px;align-items:center;justify-content:flex-end}
+.btn-icon{width:34px;padding:0;justify-content:center}
+.btn-icon:disabled{opacity:.35;cursor:not-allowed}
+.alert-info{background:var(--primary-soft);border:1px solid var(--primary-mid);color:var(--ink)}
+.filter-chip{margin:0 0 16px}
+.table tbody tr.no-click{cursor:default}

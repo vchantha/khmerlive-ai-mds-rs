@@ -3,10 +3,10 @@ import {createRoot} from 'react-dom/client';
 import './style.css';
 import {Job,Metrics,ModelInfo,SystemData,Account,Provider,req,setApiKey,getApiKey,saveKey,clearKey,baseName,asDate} from './api';
 import {Icon,Logo,Avatar} from './ui';
-import {Ctx,Login,Dashboard,NewTranslation,JobPage,Jobs,System,Datasets,Users,Settings,SearchDialog} from './pages';
+import {Ctx,Login,Dashboard,NewTranslation,JobPage,Jobs,System,Datasets,Users,Settings,SearchDialog,Videos,Trash} from './pages';
 
 const emptyMetrics:Metrics={total:0,queued:0,processing:0,completed:0,failed:0};
-const WORK:[string,string,string][]=[['/dashboard','dashboard','Dashboard'],['/new','translate','New translation'],['/jobs','jobs','Jobs']];
+const WORK:[string,string,string][]=[['/dashboard','dashboard','Dashboard'],['/new','translate','New translation'],['/jobs','jobs','Jobs'],['/videos','video','Videos']];
 const ADMIN:[string,string,string][]=[['/system','health','System health'],['/datasets','datasets','Datasets'],['/users','users','Users'],['/settings','settings','Settings']];
 const readRoute=()=>location.hash.replace(/^#/,'')||'/dashboard';
 const store={get:(k:string)=>{try{return localStorage.getItem(k)||''}catch{return ''}},set:(k:string,v:string)=>{try{localStorage.setItem(k,v)}catch{}}};
@@ -67,6 +67,7 @@ function App(){
  const unread=finished.filter(j=>new Date(j.updated_at!).getTime()>seen).length;
  const openBell=()=>{setBell(v=>!v);const now=Date.now();setSeen(now);store.set('khmerlive_seen',String(now))};
  const ctx:Ctx={account,providers,isAdmin:!!key&&!account?.authenticated,userName,metrics,jobs,models,system,refresh,go,notify,openBell,unread};
+ const nav=ctx.isAdmin?[...ADMIN.slice(0,1),['/trash','trash','Trash'] as [string,string,string],...ADMIN.slice(1)]:ADMIN;
  const [path,qs]=route.split('?');const query=new URLSearchParams(qs||'');
  const parts=path.split('/').filter(Boolean);const base='/'+(parts[0]||'dashboard');
  const current=base==='/job'?'/jobs':base==='/library'?'/jobs':base==='/models'?'/system':base;
@@ -80,6 +81,8 @@ function App(){
   case '/jobs':page=<Jobs key={route} ctx={ctx} query={query}/>;break;
   case '/library':page=<Jobs key={route} ctx={ctx} query={new URLSearchParams('view=grid')}/>;break;
   case '/system':case '/models':page=<System ctx={ctx}/>;break;
+  case '/videos':page=<Videos key={route} ctx={ctx}/>;break;
+  case '/trash':page=<Trash ctx={ctx}/>;break;
   case '/datasets':page=<Datasets ctx={ctx}/>;break;
   case '/users':page=<Users ctx={ctx}/>;break;
   case '/settings':page=<Settings ctx={ctx} theme={theme} setTheme={setTheme} onSignOut={()=>void signOut()}/>;break;
@@ -95,7 +98,7 @@ function App(){
    <a className="side-logo" href="#/dashboard" title={expanded?undefined:'KhmerLive AI'}><Logo/><span className="nv-l brand">KhmerLive<b> AI</b></span></a>
    <button className="side-search" onClick={()=>setSearch(true)} title={expanded?undefined:'Search (⌘K)'}><Icon name="search"/><span className="nv-l">Search</span><kbd className="nv-l">⌘K</kbd></button>
    <div className="nv-group"><span className="nv-h">Workspace</span>{WORK.map(navLink)}</div>
-   <div className="nv-group"><span className="nv-h">Administration</span><i className="nv-sep"/>{ADMIN.map(navLink)}</div>
+   <div className="nv-group"><span className="nv-h">Administration</span><i className="nv-sep"/>{nav.map(navLink)}</div>
    <div className="side-foot">
     <button className="nv" onClick={toggleNav} title={expanded?undefined:'Expand sidebar'} aria-label={expanded?'Collapse sidebar':'Expand sidebar'}><Icon name={expanded?'collapse':'expand'} size={20}/><span className="nv-l">Collapse</span></button>
     <a className="nv" href="/api/docs" target="_blank" rel="noopener" title={expanded?undefined:'Help & API docs'}><Icon name="help" size={20}/><span className="nv-l">Help &amp; API docs</span></a>

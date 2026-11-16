@@ -47,8 +47,43 @@ class Settings(BaseSettings):
     youtube_enabled:bool=True
     # Hard Celery limit per job; a soft limit fires 5 min earlier so the job is marked failed cleanly.
     job_time_limit_seconds:int=3600
-    # CTranslate2 threads for Whisper on CPU (0 = library default, which uses only 4 cores).
+    # ---- Performance ----
+    # Jobs processed in parallel by one worker container (Celery prefork processes).
+    worker_concurrency:int=1
+    # Recycle the worker process after N jobs (0 = never). GPU setups use 1 so every job
+    # starts with empty GPU memory (models reload in a few seconds).
+    worker_max_tasks_per_child:int=0
+    # CPU threads per job for Whisper/M2M100/TTS. 0 = auto: all cores / WORKER_CONCURRENCY.
+    cpu_threads:int=0
+    # Deprecated alias of CPU_THREADS kept for existing .env files.
     asr_cpu_threads:int=0
+    # Per-stage device. Empty = INFERENCE_DEVICE. Values: cpu | cuda
+    asr_device:str=""
+    mt_device:str=""
+    tts_device:str=""
+    # CTranslate2 precision for Whisper. Empty = auto (cuda: int8_float16, cpu: int8).
+    asr_compute_type:str=""
+    # Translation engine: auto uses the CTranslate2 model at MT_CT2_PATH when present.
+    mt_engine:str="auto"
+    mt_ct2_path:str="/models/mt-ct2"
+    mt_beam_size:int=4
+    # Parallel LLM post-edit requests (match OLLAMA_NUM_PARALLEL). 1 = sequential.
+    llm_concurrency:int=1
+    # Drop Whisper from GPU memory after each use (~1 s reload) so TTS/LLM fit on small GPUs.
+    asr_release_after_use:bool=False
+    # Free the post-edit LLM from GPU memory before GPU speech recognition (small GPUs).
+    llm_unload_before_gpu_asr:bool=False
+
+    def device_for(self,stage:str)->str:
+        return (getattr(self,stage+"_device","") or self.inference_device or "cpu").strip().lower()
+
+    def threads_per_job(self)->int:
+        import os
+        if self.cpu_threads>0:return self.cpu_threads
+        if self.asr_cpu_threads>0:return self.asr_cpu_threads
+        try:cores=len(os.sched_getaffinity(0))
+        except (AttributeError,OSError):cores=os.cpu_count() or 4
+        return max(1,cores//max(1,self.worker_concurrency))
     @model_validator(mode="after")
     def protect_session_secret(self):
         if self.auth_session_secret in ("replace_with_generated_session_secret","change_this_auth_session_secret"):
