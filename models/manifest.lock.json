@@ -44,6 +44,20 @@
         "tokenizer_config.json": "6c66a77ed65eaa1ea9de0bcb966568db4895ebdb02c1630203d0aa424580c5b1",
         "vocab.json": "b7549cb60a0851e2ad333bd259c62d9caa54e9e4d523e63334ddea8a4d22e91f"
       }
+    },
+    {
+      "id": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+      "component": "asr-large-v3-turbo",
+      "revision": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+      "card_license": "mit",
+      "sha256": {
+        "README.md": "b3068692728faed23580cce5cd569fc47ff76c690c032b2641ffd5554ea64d8f",
+        "config.json": "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
+        "model.bin": "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+        "preprocessor_config.json": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+        "tokenizer.json": "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+        "vocabulary.json": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"
+      }
     }
   ]
 }
