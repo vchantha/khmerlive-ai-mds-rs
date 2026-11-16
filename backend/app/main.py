@@ -8,7 +8,8 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel,Field
 from sqlalchemy import select,text,func,or_,delete
 from app.db import SessionLocal
-from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity
+from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity,JobEvent
+from app.joblog import log_event
 from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
@@ -409,6 +410,21 @@ def get_job(job_id:str,actor:dict=Depends(authorize)):
 def actor_label(actor)->str:
     return actor["user_id"] or "admin"
 
+@app.get("/api/jobs/{job_id}/events",dependencies=[Depends(authorize)])
+def job_events(job_id:str,stage:str|None=Query(None,max_length=40),actor:dict=Depends(authorize)):
+    """Pipeline log for a job. stage=llm returns only the LLM post-edit line records."""
+    import json
+    with session() as db:
+        if owned_job(db,job_id,actor) is None:raise HTTPException(404,"Job not found")
+        q=select(JobEvent).where(JobEvent.job_id==job_id)
+        if stage:q=q.where(JobEvent.stage==stage)
+        rows=db.scalars(q.order_by(JobEvent.id.asc()).limit(5000)).all()
+        def data(raw):
+            try:return json.loads(raw) if raw else None
+            except ValueError:return None
+        return {"items":[{"id":e.id,"at":e.created_at.isoformat() if e.created_at else None,"stage":e.stage,
+                          "level":e.level,"message":e.message,"seconds":e.seconds,"data":data(e.data)} for e in rows]}
+
 @app.delete("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
 def delete_job(job_id:str,actor:dict=Depends(authorize)):
     """Move a finished, failed or cancelled job to the Trash. Files are kept until an admin purges it."""
@@ -419,6 +435,7 @@ def delete_job(job_id:str,actor:dict=Depends(authorize)):
             raise HTTPException(409,"Cancel the job before deleting it")
         j.deleted_at=datetime.now(timezone.utc);j.deleted_by=actor_label(actor)
         db.commit()
+    log_event(job_id,"job","Moved to Trash",level="warning",by=actor_label(actor))
     return {"id":job_id,"trashed":True}
 
 @app.get("/api/media",dependencies=[Depends(authorize)])
@@ -531,16 +548,19 @@ def restore_trash(kind:str=Path(pattern="^(job|video)$"),item_id:str=Path(max_le
                 m.deleted_at=None;m.deleted_by=None   # a job needs its source video
         row.deleted_at=None;row.deleted_by=None
         db.commit()
+    if kind=="job":log_event(item_id,"job","Restored from Trash")
     return {"kind":kind,"id":item_id,"restored":True,"jobs_restored":restored}
 
 def _purge(db,kind,row)->list:
     """Hard-delete a trashed row (a video takes all of its jobs). Returns storage keys to remove."""
     if kind=="job":
+        db.execute(delete(JobEvent).where(JobEvent.job_id==row.id))
         keys=[row.output_key,row.subtitle_key];db.delete(row);return keys
     jobs=db.scalars(select(TranslationJob).where(TranslationJob.media_id==row.id)).all()
     if any(j.deleted_at is None for j in jobs):
         raise HTTPException(409,"Restore or trash this video's remaining jobs first")
     keys=[row.object_key]+[k for j in jobs for k in (j.output_key,j.subtitle_key)]
+    db.execute(delete(JobEvent).where(JobEvent.job_id.in_([j.id for j in jobs])))
     db.execute(delete(TranslationJob).where(TranslationJob.media_id==row.id))
     db.delete(row);return keys
 
@@ -583,6 +603,7 @@ def cancel_job(job_id:str,actor:dict=Depends(authorize)):
             j.stage="cancellation requested"
         db.commit()
         status=j.status
+    log_event(job_id,"job","Cancel requested",level="warning",by=actor_label(actor))
     if status=="cancelling":
         status=abort_running_job(job_id) or status
     return {"id":job_id,"status":status}
@@ -624,6 +645,7 @@ def retry_job(job_id:str,actor:dict=Depends(authorize)):
         j.progress=0
         j.stage="queued for retry"
         j.timings=None
+        log_event(j.id,"job","Retry requested",by=actor_label(actor))
         j.error=None
         j.output_key=None
         j.subtitle_key=None

@@ -1,4 +1,4 @@
-import React from 'react';
+import React,{useEffect,useRef,useState} from 'react';
 import {Status,isFailed} from './api';
 
 /* Icon paths follow the redesign (lucide-style 24px strokes). */
@@ -32,6 +32,8 @@ const P:Record<string,string>={
  grid:'M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z',
  clock:'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 6v6l4 2',
  file:'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8',
+ 'chevron-down':'M6 9l6 6 6-6',
+ 'chevron-up':'M18 15l-6-6-6 6',
  trash:'M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6',
  video:'M15 10l4.55-2.28A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.9L15 14M5 6h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z',
  restore:'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5',
@@ -75,4 +77,50 @@ export function Card({title,extra,children,className,pad=true}:{title?:React.Rea
 
 export function Thumb({label,dur}:{label?:string;dur?:string}){
  return <span className="thumb" aria-hidden="true">{label&&<b>{label}</b>}{dur&&<em>{dur}</em>}</span>;
+}
+
+
+/* ================= Confirm dialog =================
+   confirmDialog({...}) returns Promise<boolean>. Mount <ConfirmHost/> once in the app shell. */
+export type ConfirmTone='danger'|'warn'|'primary';
+export type ConfirmOptions={title:string;message?:React.ReactNode;details?:React.ReactNode[];confirmLabel?:string;cancelLabel?:string;tone?:ConfirmTone;icon?:string};
+let openConfirm:((o:ConfirmOptions)=>Promise<boolean>)|null=null;
+export function confirmDialog(o:ConfirmOptions):Promise<boolean>{
+ return openConfirm?openConfirm(o):Promise.resolve(window.confirm(o.title));
+}
+export function ConfirmHost(){
+ const [req,setReq]=useState<(ConfirmOptions&{resolve:(v:boolean)=>void})|null>(null);
+ const box=useRef<HTMLDivElement>(null),cancelBtn=useRef<HTMLButtonElement>(null),okBtn=useRef<HTMLButtonElement>(null);
+ const returnFocus=useRef<HTMLElement|null>(null);
+ useEffect(()=>{openConfirm=o=>new Promise(resolve=>{returnFocus.current=document.activeElement as HTMLElement;setReq({...o,resolve})});return()=>{openConfirm=null}},[]);
+ const close=(v:boolean)=>{if(!req)return;req.resolve(v);setReq(null);setTimeout(()=>returnFocus.current?.focus?.(),0)};
+ useEffect(()=>{
+  if(!req)return;
+  // Destructive: focus the safe choice first. Otherwise focus the action.
+  (req.tone==='danger'?cancelBtn:okBtn).current?.focus();
+  const onKey=(e:KeyboardEvent)=>{
+   if(e.key==='Escape'){e.preventDefault();close(false)}
+   if(e.key==='Tab'&&box.current){
+    const f=Array.from(box.current.querySelectorAll<HTMLElement>('button'));if(!f.length)return;
+    const i=f.indexOf(document.activeElement as HTMLElement);
+    if(e.shiftKey&&i<=0){e.preventDefault();f[f.length-1].focus()}else if(!e.shiftKey&&i===f.length-1){e.preventDefault();f[0].focus()}
+   }
+  };
+  document.addEventListener('keydown',onKey);const prev=document.body.style.overflow;document.body.style.overflow='hidden';
+  return()=>{document.removeEventListener('keydown',onKey);document.body.style.overflow=prev};
+ },[req]);
+ if(!req)return null;
+ const tone=req.tone||'primary';
+ const icon=req.icon||(tone==='danger'?'trash':tone==='warn'?'warn':'alert');
+ return <div className="dlg-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)close(false)}}>
+  <div ref={box} className={'dlg dlg-'+tone} role="alertdialog" aria-modal="true" aria-labelledby="dlg-title" aria-describedby={req.message?'dlg-msg':undefined}>
+   <div className="dlg-head"><span className="dlg-icon"><Icon name={icon} size={22}/></span><h2 id="dlg-title">{req.title}</h2></div>
+   {req.message&&<div id="dlg-msg" className="dlg-msg">{req.message}</div>}
+   {req.details&&req.details.length>0&&<ul className="dlg-details">{req.details.map((d,i)=><li key={i}>{d}</li>)}</ul>}
+   <div className="dlg-actions">
+    <button ref={cancelBtn} className="btn btn-outline" onClick={()=>close(false)}>{req.cancelLabel||'Cancel'}</button>
+    <button ref={okBtn} className={'btn '+(tone==='danger'?'btn-danger':'btn-primary')} onClick={()=>close(true)}>{req.confirmLabel||'Confirm'}</button>
+   </div>
+  </div>
+ </div>;
 }

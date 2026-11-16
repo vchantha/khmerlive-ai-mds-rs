@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     llm_concurrency:int=1
     # Drop Whisper from GPU memory after each use (~1 s reload) so TTS/LLM fit on small GPUs.
     asr_release_after_use:bool=False
+    # Load the post-edit LLM into memory when the worker starts, so the first job doesn't wait for it.
+    llm_preload_on_start:bool=True
     # Free the post-edit LLM from GPU memory before GPU speech recognition (small GPUs).
     llm_unload_before_gpu_asr:bool=False
 

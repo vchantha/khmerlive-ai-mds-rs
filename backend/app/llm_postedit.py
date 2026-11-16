@@ -86,7 +86,14 @@ def _resolve_config():
     )
 
 
-def postedit_rows(rows, source_lang: str, target_lang: str):
+def _task(index, row, status, started, output=None, error=None):
+    return {"index": index, "english": row.source_text, "draft": row.target_text, "output": output,
+            "status": status, "seconds": round(time.monotonic() - started, 3) if started else None,
+            "error": str(error)[:300] if error else None}
+
+
+def postedit_rows(rows, source_lang: str, target_lang: str, report: list | None = None):
+    """report: optional list that receives one dict per line (english, draft, output, status, seconds, error)."""
     """Return unchanged rows unless explicitly enabled for English→Khmer."""
     if not (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) or source_lang != "en" or target_lang != "km":
         return rows
@@ -111,7 +118,7 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
 
     concurrency = max(1, int(getattr(settings, "llm_concurrency", 1) or 1))
     if concurrency > 1:
-        return _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency)
+        return _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency, report)
 
     with httpx.Client(timeout=cfg["timeout"], trust_env=False) as client:
         for index, row in enumerate(rows):
@@ -121,12 +128,16 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
             if remaining <= 1:
                 left = sum(1 for r in rows[index:] if r.target_text.strip())
                 stats["skipped_budget"] = left
+                if report is not None:
+                    report.extend(_task(i, r, "skipped (time budget)", None) for i, r in enumerate(rows)
+                                  if i >= index and r.target_text.strip())
                 msg = f"Offline {provider} post-editing budget of {budget:.0f}s exhausted; {left} segments unedited"
                 logger.warning(msg)
                 if not cfg["fail_open"]:
                     raise RuntimeError(msg)
                 break
             payload = _payload(cfg, row)
+            started = time.monotonic()
             try:
                 response = client.post(endpoint + "/chat/completions", json=payload,
                                        timeout=min(cfg["timeout"], remaining))
@@ -134,7 +145,11 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
                 content = response.json()["choices"][0]["message"]["content"]
                 edited[index] = replace(row, target_text=_clean_output(content, row.target_text))
                 stats["edited"] += 1
+                if report is not None:
+                    report.append(_task(index, row, "edited", started, edited[index].target_text))
             except httpx.ConnectError as exc:
+                if report is not None:
+                    report.append(_task(index, row, "failed (server unreachable)", started, error=exc))
                 # The server is unreachable: stop rather than retry every segment.
                 logger.warning("Offline %s endpoint unreachable: %s", provider, exc)
                 if not cfg["fail_open"]:
@@ -143,6 +158,9 @@ def postedit_rows(rows, source_lang: str, target_lang: str):
                 break
             except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
                 logger.warning("Offline %s post-editing failed for segment %d: %s", provider, index, exc)
+                if report is not None:
+                    report.append(_task(index, row, "kept original (rejected output)" if isinstance(exc, PostEditError)
+                                        else "kept original (request failed)", started, error=exc))
                 if not cfg["fail_open"]:
                     raise RuntimeError(f"Offline {provider} post-editing failed") from exc
                 stats["failed"] += 1  # keep this segment's original translation
@@ -169,7 +187,7 @@ def _payload(cfg, row) -> dict:
     }
 
 
-def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency):
+def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurrency, report=None):
     """Same per-segment requests and guards as the sequential path, N at a time.
 
     The server batches concurrent requests (Ollama: OLLAMA_NUM_PARALLEL; vLLM:
@@ -182,7 +200,10 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
     stop = False
     fatal: Exception | None = None
 
+    started_at = {}
+
     def one(client, index):
+        started_at[index] = time.monotonic()
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             raise TimeoutError("budget")
@@ -190,6 +211,10 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
                         timeout=min(cfg["timeout"], remaining))
         r.raise_for_status()
         return _clean_output(r.json()["choices"][0]["message"]["content"], rows[index].target_text)
+
+    def note(index, status, output=None, error=None):
+        if report is not None:
+            report.append(_task(index, rows[index], status, started_at.get(index), output, error))
 
     with httpx.Client(timeout=cfg["timeout"], trust_env=False) as client, \
             ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -201,7 +226,10 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
                 if index is None:
                     break
                 if deadline - time.monotonic() <= 1:
-                    stats["skipped_budget"] += 1 + sum(1 for _ in queue)
+                    rest = [index, *queue]
+                    stats["skipped_budget"] += len(rest)
+                    for i in rest:
+                        note(i, "skipped (time budget)")
                     stop = True
                     break
                 pending[pool.submit(one, client, index)] = index
@@ -213,15 +241,20 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
                 try:
                     edited[index] = replace(rows[index], target_text=fut.result())
                     stats["edited"] += 1
+                    note(index, "edited", edited[index].target_text)
                 except TimeoutError:
                     stats["skipped_budget"] += 1
+                    note(index, "skipped (time budget)")
                 except httpx.ConnectError as exc:
+                    note(index, "failed (server unreachable)", error=exc)
                     logger.warning("Offline %s endpoint unreachable: %s", provider, exc)
                     stats["failed"] += 1
                     stop = True
                     fatal = fatal or exc
                 except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
                     logger.warning("Offline %s post-editing failed for segment %d: %s", provider, index, exc)
+                    note(index, "kept original (rejected output)" if isinstance(exc, PostEditError)
+                         else "kept original (request failed)", error=exc)
                     stats["failed"] += 1
                     if not cfg["fail_open"]:
                         stop = True
@@ -233,8 +266,38 @@ def _postedit_parallel(rows, cfg, endpoint, provider, budget, deadline, concurre
             raise RuntimeError(msg)
     if fatal is not None and not cfg["fail_open"]:
         raise RuntimeError(f"Offline {provider} post-editing failed") from fatal
+    if report is not None:
+        report.sort(key=lambda t: t["index"])
     logger.info("Offline %s post-editing (x%d parallel): %s", provider, concurrency, stats)
     return edited if stats["edited"] else rows
+
+
+def preload_llm(attempts: int = 24, wait_seconds: float = 5.0, load_timeout: float = 300.0) -> bool:
+    """Load the Ollama post-edit model into memory now (empty request; no text is generated).
+
+    Retries while Ollama is still starting. Keep-alive follows the server's OLLAMA_KEEP_ALIVE.
+    """
+    if not settings.llm_postedit_enabled or settings.llm_provider != "ollama":
+        return False
+    try:
+        endpoint = validate_local_endpoint(settings.llm_base_url)
+    except ValueError as exc:
+        logger.warning("LLM preload skipped: %s", exc)
+        return False
+    root = endpoint[:-3] if endpoint.endswith("/v1") else endpoint
+    for attempt in range(attempts):
+        try:
+            started = time.monotonic()
+            with httpx.Client(timeout=load_timeout, trust_env=False) as client:
+                client.post(root + "/api/generate", json={"model": settings.llm_model}).raise_for_status()
+            logger.info("Preloaded LLM %s in %.1fs", settings.llm_model, time.monotonic() - started)
+            return True
+        except httpx.HTTPError as exc:
+            if attempt == attempts - 1:
+                logger.warning("Could not preload LLM %s: %s", settings.llm_model, exc)
+                return False
+            time.sleep(wait_seconds)
+    return False
 
 
 def unload_llm(timeout: float = 10.0) -> bool:

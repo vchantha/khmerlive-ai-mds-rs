@@ -1,6 +1,6 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
-import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb} from './ui';
+import {Job,JobEvent,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb,confirmDialog} from './ui';
 
 export type Ctx={
  account:Account|null;providers:Provider[];isAdmin:boolean;userName:string;
@@ -29,13 +29,18 @@ async function createUploadJob(file:File,source:'en'|'km',onPct:(n:number)=>void
  return r.job_id;
 }
 async function jobAction(ctx:Ctx,j:Job,which:'cancel'|'retry',after?:()=>void,force?:boolean){
- if(which==='cancel'&&!force&&!window.confirm('Cancel “'+baseName(j.filename)+'”? It stops immediately.'))return;
+ if(which==='cancel'&&!force&&!await confirmDialog({tone:'warn',icon:'x',title:'Cancel this job?',
+  message:<>“<b>{baseName(j.filename)}</b>” stops right away. The step that's running is interrupted and nothing is published.</>,
+  details:['You can start it again later with Retry.'],confirmLabel:'Cancel job',cancelLabel:'Keep running'}))return;
  try{const r=await req<{status?:string}>('/api/jobs/'+j.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?(r.status==='cancelled'?'Job cancelled':'Stopping job…'):'Job queued again');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
 }
 
 async function trashJob(ctx:Ctx,j:Job,after?:()=>void){
  if(isActive(j.status)){ctx.notify('Cancel the job before deleting it','err');return}
- if(!window.confirm('Move “'+baseName(j.filename)+'” to the Trash?\n\nIt disappears from your lists. '+(ctx.isAdmin?'You can restore it from the Trash.':'An administrator can still restore it.')))return;
+ if(!await confirmDialog({tone:'danger',title:'Move job to Trash?',
+  message:<>“<b>{baseName(j.filename)}</b>” will disappear from your Jobs list.</>,
+  details:[ctx.isAdmin?'You can restore it from the Trash.':'An administrator can restore it if needed.','The source video is kept.'],
+  confirmLabel:'Move to Trash',cancelLabel:'Keep job'}))return;
  try{await req('/api/jobs/'+j.id,{method:'DELETE'});ctx.notify('Job moved to the Trash');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
 }
 const JOB_SORTS:[string,string][]=[['newest','Newest first'],['oldest','Oldest first'],['updated','Recently updated'],['name_asc','Name A–Z'],['name_desc','Name Z–A'],['status','Status']];
@@ -304,8 +309,63 @@ export function JobPage({ctx,id}:{ctx:Ctx;id:string}){
  useEffect(()=>{if(!job||!isActive(job.status))return;const t=setInterval(()=>void load(),2500);return()=>clearInterval(t)},[job?.status,id]);
  if(err&&!job)return <><Head crumb={<><a href="#/jobs">Jobs</a> / {id.slice(0,8)}</>} title="Job not found"/><div className="alert alert-err">{err}</div></>;
  if(!job)return <div className="card pad"><span className="sk w60"/><span className="sk w40"/></div>;
- if(job.status==='completed'&&!forceProgress)return <Review ctx={ctx} job={job} onPipeline={()=>setForceProgress(true)}/>;
- return <Progress ctx={ctx} job={job} reload={load} onResult={job.status==='completed'?()=>setForceProgress(false):undefined}/>;
+ const view=job.status==='completed'&&!forceProgress?<Review ctx={ctx} job={job} onPipeline={()=>setForceProgress(true)}/>
+  :<Progress ctx={ctx} job={job} reload={load} onResult={job.status==='completed'?()=>setForceProgress(false):undefined}/>;
+ return <>{view}<JobLogs ctx={ctx} job={job}/></>;
+}
+
+/* ---------- Pipeline log (steps + LLM tasks) ---------- */
+const STAGE_NAMES:Record<string,string>={job:'Job',prepare:'Prepare',download:'Source',extract_audio:'Audio',asr_translate:'Speech + translation',
+ llm_postedit:'LLM post-edit',llm:'LLM',tts:'Khmer voice',mux:'Mux',upload:'Publish'};
+const fmtSec=(s:number|null)=>s==null?'':s<1?Math.round(s*1000)+' ms':s<90?s.toFixed(1)+' s':Math.floor(s/60)+' min '+Math.round(s%60)+' s';
+const fmtVal=(v:unknown):string=>v==null?'—':typeof v==='object'?Object.entries(v as Record<string,unknown>).map(([k,x])=>k+': '+fmtVal(x)).join(', '):String(v);
+function JobLogs({ctx,job}:{ctx:Ctx;job:Job}){
+ const [open,setOpen]=useState(isActive(job.status)||isFailed(job.status));
+ const [tab,setTab]=useState<'steps'|'llm'>('steps');
+ const [events,setEvents]=useState<JobEvent[]|null>(null);
+ const [filter,setFilter]=useState<'all'|'changed'|'kept'>('all'),[q,setQ]=useState('');
+ const load=async()=>{try{setEvents((await req<{items:JobEvent[]}>('/api/jobs/'+job.id+'/events')).items)}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{if(open)void load()},[open,job.id,job.status,job.progress]);
+ useEffect(()=>{if(!open||!isActive(job.status))return;const t=setInterval(()=>void load(),3000);return()=>clearInterval(t)},[open,job.status,job.id]);
+ const steps=(events||[]).filter(e=>e.stage!=='llm');
+ const llm=(events||[]).filter(e=>e.stage==='llm').map(e=>({...(e.data as Record<string,unknown>),level:e.level,id:e.id}) as {id:number;index:number;english:string;draft:string;output:string|null;status:string;seconds:number|null;error:string|null;level:string});
+ const changed=llm.filter(t=>t.status==='edited'&&t.output!==t.draft).length;
+ const shown=llm.filter(t=>(filter==='all'||(filter==='changed'?t.status==='edited':t.status!=='edited'))&&(!q||[t.english,t.draft,t.output].some(x=>x&&x.toLowerCase().includes(q.toLowerCase()))));
+ const download=()=>saveBlob(new Blob([JSON.stringify(events||[],null,2)],{type:'application/json'}),'job-'+shortId(job.id)+'-log.json');
+ return <section className="card logs">
+  <button className="logs-toggle" aria-expanded={open} onClick={()=>setOpen(v=>!v)}>
+   <Icon name="file"/><span><b>Pipeline log</b><small>Every step with timings{llm.length?' · '+llm.length+' LLM tasks':''}</small></span><Icon name={open?'chevron-up':'chevron-down'} size={18}/>
+  </button>
+  {open&&<div className="logs-body">
+   <div className="logs-bar">
+    <Seg label="Log view" value={tab} onChange={setTab} items={[['steps',<>Steps <em>{steps.length}</em></>],['llm',<>LLM tasks <em>{llm.length}</em></>]]}/>
+    <div className="toolbar-r">
+     {tab==='llm'&&<><label className="input-icon"><Icon name="search"/><input placeholder="Search text" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search LLM tasks"/></label>
+      <select className="select" value={filter} onChange={e=>setFilter(e.target.value as 'all')} aria-label="Filter LLM tasks"><option value="all">All lines</option><option value="changed">Edited by LLM</option><option value="kept">Kept original / failed</option></select></>}
+     <button className="btn btn-outline btn-sm" onClick={()=>void load()}><Icon name="refresh" size={15}/>Refresh</button>
+     <button className="btn btn-outline btn-sm" disabled={!events?.length} onClick={download}><Icon name="download" size={15}/>JSON</button>
+    </div>
+   </div>
+   {!events&&<span className="sk w80"/>}
+   {events&&tab==='steps'&&(steps.length?<ol className="logs-steps">{steps.map(e=><li key={e.id} className={'lv-'+e.level}>
+     <time>{e.at?new Date(e.at).toLocaleTimeString(undefined,{hour12:false}):''}</time>
+     <span className="logs-stage">{STAGE_NAMES[e.stage]||e.stage}</span>
+     <div className="logs-msg"><b>{e.message}</b>{e.data&&<small>{Object.entries(e.data).map(([k,v])=><span key={k}><i>{k.replace(/_/g,' ')}</i> {fmtVal(v)}</span>)}</small>}</div>
+     <span className="logs-dur">{fmtSec(e.seconds)}</span>
+    </li>)}</ol>:<div className="empty"><b>No log entries yet</b><span>Jobs processed before this update have no step log.</span></div>)}
+   {events&&tab==='llm'&&(llm.length?<>
+    <p className="hint">{llm.length} lines sent to the LLM · {changed} changed · {llm.filter(t=>t.status!=='edited').length} kept the machine translation · avg {fmtSec(llm.reduce((a,t)=>a+(t.seconds||0),0)/llm.length)} per line</p>
+    <div className="table-wrap"><table className="table logs-llm"><thead><tr><th>#</th><th>English</th><th>Machine draft</th><th>LLM output</th><th>Result</th><th>Time</th></tr></thead><tbody>
+     {shown.map(t=><tr key={t.id} className="no-click">
+      <td className="nowrap">{t.index+1}</td><td>{t.english}</td><td className="km">{t.draft}</td>
+      <td className="km">{t.output??<span className="muted">—</span>}</td>
+      <td><span className={'badge badge-'+(t.status==='edited'?'ok':'warn')} title={t.error||undefined}>{t.status==='edited'?(t.output===t.draft?'Unchanged':'Edited'):t.status}</span>{t.error&&<small className="clip" title={t.error}>{t.error}</small>}</td>
+      <td className="nowrap">{fmtSec(t.seconds)}</td></tr>)}
+     {!shown.length&&<tr><td colSpan={6}><div className="empty"><b>No lines match</b></div></td></tr>}
+    </tbody></table></div></>
+    :<div className="empty"><b>No LLM tasks</b><span>LLM post-editing was off for this job or hasn't run yet.</span></div>)}
+  </div>}
+ </section>;
 }
 function jobMeta(j:Job,extra?:string){return [srcName(j),j.capture_seconds&&j.source_kind!=='youtube'?j.capture_seconds+' s capture':'',lang(j.source_lang)+' → '+lang(j.target_lang),outputsLabel(j),extra].filter(Boolean).join(' · ')}
 function Progress({ctx,job,reload,onResult}:{ctx:Ctx;job:Job;reload:()=>Promise<void>;onResult?:()=>void}){
@@ -515,7 +575,10 @@ export function Videos({ctx}:{ctx:Ctx}){
  useEffect(()=>{const t=setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
  const remove=async(m:MediaItem)=>{
   if(m.active){ctx.notify('This video has jobs in progress. Cancel them first.','err');return}
-  if(!window.confirm('Move “'+baseName(m.filename)+'” to the Trash?\n\n'+(m.jobs?'Its '+m.jobs+' translation job'+(m.jobs===1?'':'s')+' will be moved too. ':'')+(ctx.isAdmin?'You can restore it from the Trash.':'An administrator can still restore it.')))return;
+  if(!await confirmDialog({tone:'danger',title:'Move video to Trash?',
+   message:<>“<b>{baseName(m.filename)}</b>” will disappear from Videos{m.jobs?<> together with its <b>{m.jobs} translation job{m.jobs===1?'':'s'}</b></>:null}.</>,
+   details:[ctx.isAdmin?'You can restore everything from the Trash.':'An administrator can restore it if needed.'],
+   confirmLabel:'Move to Trash',cancelLabel:'Keep video'}))return;
   try{const r=await req<{jobs_trashed:number}>('/api/media/'+m.id,{method:'DELETE'});ctx.notify('Video moved to the Trash'+(r.jobs_trashed?' with '+r.jobs_trashed+' job'+(r.jobs_trashed===1?'':'s'):''));void load();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}};
  const pg=data?{total:data.total,items:data.items as unknown as Job[]}:null;
  return <>
@@ -556,11 +619,16 @@ export function Trash({ctx}:{ctx:Ctx}){
  const label=(i:TrashItem)=>i.kind==='video'?'video':'job';
  const restore=async(i:TrashItem)=>{try{const r=await req<{jobs_restored:number}>(`/api/trash/${i.kind}/${i.id}/restore`,{method:'POST'});ctx.notify('Restored '+label(i)+(r.jobs_restored?' and '+r.jobs_restored+' job'+(r.jobs_restored===1?'':'s'):''));void load();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}};
  const purge=async(i:TrashItem)=>{
-  if(!window.confirm('Permanently delete “'+baseName(i.filename)+'”?\n\n'+(i.kind==='video'&&i.jobs?'This also deletes its '+i.jobs+' job'+(i.jobs===1?'':'s')+'. ':'')+'The files are erased from storage. This cannot be undone.'))return;
+  if(!await confirmDialog({tone:'danger',title:'Delete forever?',
+   message:<>“<b>{baseName(i.filename)}</b>” and its files will be erased from storage.</>,
+   details:[...(i.kind==='video'&&i.jobs?[`Its ${i.jobs} job${i.jobs===1?'':'s'} will be deleted too.`]:[]),'This cannot be undone.'],
+   confirmLabel:'Delete forever',cancelLabel:'Keep in Trash'}))return;
   try{const r=await req<{storage_cleaned:boolean}>(`/api/trash/${i.kind}/${i.id}`,{method:'DELETE'});ctx.notify(r.storage_cleaned?'Permanently deleted':'Deleted, but some files could not be removed from storage',r.storage_cleaned?undefined:'err');void load()}catch(e){ctx.notify(errText(e),'err')}};
  const empty=async()=>{
   if(!data?.total)return;
-  if(!window.confirm('Empty the Trash?\n\nAll '+data.total+' item'+(data.total===1?'':'s')+' and their files will be permanently deleted. This cannot be undone.'))return;
+  if(!await confirmDialog({tone:'danger',title:'Empty the Trash?',
+   message:<>All <b>{data.total} item{data.total===1?'':'s'}</b> in the Trash and their files will be permanently deleted.</>,
+   details:['This cannot be undone.'],confirmLabel:'Empty Trash',cancelLabel:'Keep items'}))return;
   setBusy(true);try{const r=await req<{jobs_deleted:number;videos_deleted:number;storage_cleaned:boolean}>('/api/trash',{method:'DELETE'});ctx.notify('Trash emptied · '+r.videos_deleted+' video'+(r.videos_deleted===1?'':'s')+', '+r.jobs_deleted+' job'+(r.jobs_deleted===1?'':'s')+' deleted'+(r.storage_cleaned?'':' (some files could not be removed)'),r.storage_cleaned?undefined:'err');void load()}catch(e){ctx.notify(errText(e),'err')}finally{setBusy(false)}};
  return <>
   <Head title="Trash" sub="Jobs and videos deleted by anyone. Restore them, or delete permanently to erase their files."><button className="btn btn-outline btn-danger-text" disabled={busy||!data?.total} onClick={()=>void empty()}><Icon name="trash"/>{busy?'Emptying…':'Empty Trash'}</button></Head>

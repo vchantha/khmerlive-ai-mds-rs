@@ -145,7 +145,7 @@ def fit_line(waveform:np.ndarray,rate:int,available:int,native=None)->tuple[np.n
     return waveform,how or "natural"
 
 def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
-                       device:str="cpu",synthesizer=None)->Path:
+                       device:str="cpu",synthesizer=None,stats_out:dict|None=None)->Path:
     """Produce a mono PCM track: each Khmer line at natural pitch, placed at its subtitle time.
 
     Lines play at natural speed. Lines longer than the gap to the next one are sped up
@@ -182,6 +182,7 @@ def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
     if not stats:
         raise ValueError("No translated Khmer speech segments available for dubbing")
     logger.info("Khmer dub: %d lines placed %s",sum(stats.values()),stats)
+    if stats_out is not None:stats_out.update(stats)
     peak=float(np.max(np.abs(timeline)))
     if peak>0.95:timeline*=0.95/peak
     output.parent.mkdir(parents=True,exist_ok=True)

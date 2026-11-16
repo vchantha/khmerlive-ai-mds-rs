@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String,Text,ForeignKey,DateTime,BigInteger,func,UniqueConstraint
+from sqlalchemy import String,Text,ForeignKey,DateTime,BigInteger,Integer,Float,func,UniqueConstraint
 from sqlalchemy.orm import Mapped,mapped_column
 from app.db import Base
 
@@ -62,3 +62,16 @@ class SocialIdentity(Base):
     subject:Mapped[str]=mapped_column(String(255))
     display_name:Mapped[str|None]=mapped_column(String(200),nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+
+
+class JobEvent(Base):
+    """Pipeline log: one row per step event, and one per LLM post-edit line (stage='llm')."""
+    __tablename__="job_events"
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    job_id:Mapped[str]=mapped_column(ForeignKey("translation_jobs.id",ondelete="CASCADE"),index=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+    stage:Mapped[str]=mapped_column(String(40))
+    level:Mapped[str]=mapped_column(String(10),default="info")
+    message:Mapped[str]=mapped_column(Text)
+    seconds:Mapped[float|None]=mapped_column(Float,nullable=True)
+    data:Mapped[str|None]=mapped_column(Text,nullable=True)   # JSON details

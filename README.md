@@ -108,6 +108,7 @@ better. To get the old engine back, set `MT_ENGINE=transformers` in `.env`.
 | `ASR_RELEASE_AFTER_USE` | GPU mode: `true` | Frees Whisper's VRAM after each use (~1 s reload). `false` on 8 GB+ |
 | `LLM_CONCURRENCY` + `OLLAMA_NUM_PARALLEL` | GPU: `2` | Parallel LLM lines. Raise both together on bigger GPUs |
 | `OLLAMA_MODEL` | `qwen3:4b-instruct` | Smaller (`qwen3:1.7b`) if `ollama ps` shows a CPU/GPU split, or for faster polishing (check Khmer quality) |
+| `LLM_PRELOAD_ON_START` | `true` | The worker loads the LLM into memory at startup, so the first job doesn't wait for it (a cold load took 46 s). `OLLAMA_KEEP_ALIVE=-1` keeps it loaded even when idle |
 | `WORKER_MAX_TASKS_PER_CHILD` | GPU: `1` | Fresh worker process per job so all GPU memory is freed between jobs (models reload in a few seconds). `0` = keep the process |
 
 ### Khmer voice (dubbing) behaviour

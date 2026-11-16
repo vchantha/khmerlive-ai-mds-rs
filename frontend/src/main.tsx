@@ -2,7 +2,7 @@ import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import './style.css';
 import {Job,Metrics,ModelInfo,SystemData,Account,Provider,req,setApiKey,getApiKey,saveKey,clearKey,baseName,asDate} from './api';
-import {Icon,Logo,Avatar} from './ui';
+import {Icon,Logo,Avatar,ConfirmHost} from './ui';
 import {Ctx,Login,Dashboard,NewTranslation,JobPage,Jobs,System,Datasets,Users,Settings,SearchDialog,Videos,Trash} from './pages';
 
 const emptyMetrics:Metrics={total:0,queued:0,processing:0,completed:0,failed:0};
@@ -117,6 +117,7 @@ function App(){
    {!finished.length&&<p className="hint pad">No finished jobs yet.</p>}
   </div>}
   {search&&<SearchDialog onClose={()=>setSearch(false)} go={go}/>}
+  <ConfirmHost/>
   {toast&&<div className={'toast '+toast.kind} role="status">{toast.kind==='err'?<Icon name="alert" size={18}/>:<Icon name="check" size={18}/>}<span>{toast.msg}</span><button className="icon-btn ghost" aria-label="Dismiss" onClick={()=>setToast(null)}><Icon name="x" size={14}/></button></div>}
  </div>;
 }

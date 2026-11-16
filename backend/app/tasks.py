@@ -18,7 +18,8 @@ from app.storage import client
 from app.adapters import get_adapters
 from app.real_inference import translate_audio, build_srt, TimedText
 from app.khmer_tts import build_dubbed_audio
-from app.llm_postedit import postedit_rows,unload_llm
+from app.llm_postedit import postedit_rows,unload_llm,preload_llm
+from app.joblog import log_event,log_llm_tasks
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
 from app.youtube import download_youtube,youtube_video_id,safe_title
@@ -84,15 +85,33 @@ def _recover_on_start(sender=None,**_):
         active=None
     try:recover_interrupted_jobs(active)
     except Exception as exc:logger.warning("Interrupted-job recovery failed: %s",exc)
+    if settings.llm_preload_on_start and settings.llm_postedit_enabled:
+        import threading
+        threading.Thread(target=preload_llm,name="llm-preload",daemon=True).start()
 
+
+STAGE_LABELS={"prepare":"Prepare","download":"Get source video","extract_audio":"Extract audio",
+              "asr_translate":"Speech recognition + translation","llm_postedit":"LLM post-editing",
+              "tts":"Khmer voice synthesis","mux":"Build video (mux)","upload":"Publish output"}
 
 class StageClock:
-    """Wall-clock seconds per pipeline stage, saved on the job for tuning."""
-    def __init__(self):
+    """Wall-clock seconds per pipeline stage (saved on the job) and a step log (job_events)."""
+    def __init__(self,job_id:str|None=None):
         self.data:dict={};self._t=time.monotonic();self._start=self._t;self._stage=None
+        self.job_id=job_id;self._notes:dict={}
+    def note(self,**details):
+        """Attach details to the current stage's 'finished' log event."""
+        self._notes.update(details)
     def mark(self,stage:str|None):
         now=time.monotonic()
-        if self._stage:self.data[self._stage]=round(self.data.get(self._stage,0)+now-self._t,2)
+        if self._stage:
+            self.data[self._stage]=round(self.data.get(self._stage,0)+now-self._t,2)
+            if self.job_id:
+                log_event(self.job_id,self._stage,"Finished: "+STAGE_LABELS.get(self._stage,self._stage),
+                          seconds=now-self._t,**self._notes)
+        self._notes={}
+        if stage and self.job_id:
+            log_event(self.job_id,stage,"Started: "+STAGE_LABELS.get(stage,stage))
         self._stage,self._t=stage,now
     def finish(self)->dict:
         self.mark(None);self.data["total"]=round(time.monotonic()-self._start,2);return self.data
@@ -199,7 +218,9 @@ def _finish_aborted(job_id:str):
             job.status,job.stage="failed","interrupted"
             job.error="Interrupted: the worker stopped while processing. Retry the job."
         db.commit()
-    logger.info("Job %s aborted (%s)",job_id,job.status)
+        status=job.status
+    log_event(job_id,"job","Stopped immediately: cancelled by user" if status=="cancelled"
+              else "Interrupted: the worker was stopped",level="warning")
 
 def _translate_media(job_id:str):
     with SessionLocal() as db:
@@ -209,7 +230,10 @@ def _translate_media(job_id:str):
         check_cancel(db,job)
         set_state(db,job,"processing",progress=5,stage="starting")
         media=db.get(MediaAsset,job.media_id)
-        clock=StageClock();clock.mark("prepare")
+        log_event(job.id,"job","Job started",mode=job.processing_mode,source=media.source_kind,
+                  file=media.filename,languages=f"{job.source_lang}->{job.target_lang}",
+                  devices={k:settings.device_for(k) for k in ("asr","mt","tts")},cpu_threads=settings.threads_per_job())
+        clock=StageClock(job.id);clock.mark("prepare")
         timings:dict={}
         try:
             mode=job.processing_mode
@@ -297,6 +321,7 @@ def _translate_media(job_id:str):
                 else:
                     s3.download_file(settings.minio_bucket,media.object_key,str(source))
                 check_cancel(db,job)
+                clock.note(source=media.source_kind,size_mb=round(source.stat().st_size/1048576,1))
                 if source.stat().st_size>settings.max_upload_mb*1024*1024:
                     raise ValueError("Captured media exceeds configured MAX_UPLOAD_MB")
                 import json
@@ -336,6 +361,9 @@ def _translate_media(job_id:str):
                         translated=" ".join(row.target_text for row in rows)
                         subtitle_path.write_text(build_srt(rows),encoding="utf-8")
                         rows_for_dubbing=rows
+                        clock.note(segments=len(rows),asr_seconds=timings.get("asr"),translate_seconds=timings.get("translate"),
+                                   asr_device=settings.device_for("asr"),mt_device=settings.device_for("mt"),
+                                   mt_engine=timings.get("mt_engine"),media_seconds=round(clip_seconds,1))
                     else:
                         set_state(db,job,"processing",progress=45,stage="demo transcription")
                         text=asr.transcribe(audio,job.source_lang).text
@@ -345,7 +373,13 @@ def _translate_media(job_id:str):
                     if (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) and job.source_lang=="en" and job.target_lang=="km":
                         clock.mark("llm_postedit")
                         set_state(db,job,"processing",progress=60,stage="offline LLM translation post-editing")
-                        rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang)
+                        llm_tasks:list=[]
+                        rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang,report=llm_tasks)
+                        log_llm_tasks(job.id,llm_tasks)
+                        counts={}
+                        for t in llm_tasks:counts[t["status"]]=counts.get(t["status"],0)+1
+                        clock.note(model=settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
+                                   lines=len(llm_tasks),results=counts,parallel=settings.llm_concurrency)
                         translated=" ".join(row.target_text for row in rows_for_dubbing)
                         subtitle_path.write_text(build_srt(rows_for_dubbing),encoding="utf-8")
                 check_cancel(db,job)
@@ -363,8 +397,10 @@ def _translate_media(job_id:str):
                         clock.mark("tts")
                         set_state(db,job,"processing",progress=70,stage="synthesizing Khmer voice")
                         dubbed=root/"khmer-dub.wav"
+                        placement:dict={}
                         build_dubbed_audio(rows_for_dubbing or [],dubbed,clip_seconds,
-                                           settings.khmer_tts_model_path,settings.device_for("tts"))
+                                           settings.khmer_tts_model_path,settings.device_for("tts"),stats_out=placement)
+                        clock.note(device=settings.device_for("tts"),lines=sum(placement.values()),placement=placement)
                         check_cancel(db,job)
                         clock.mark("mux")
                         audio_args=["-i",str(dubbed)]
@@ -424,9 +460,13 @@ def _translate_media(job_id:str):
                 job.timings=json.dumps(info)
                 logger.info("Job %s finished in %.1fs for %.0fs of media: %s",job.id,stages["total"],clip_seconds,stages)
                 set_state(db,job,"completed",progress=100,stage="completed")
+                log_event(job.id,"job","Job completed",seconds=stages["total"],stages=stages,
+                          media_seconds=round(clip_seconds,1),output=key)
         except CancelledJob:
+            log_event(job.id,"job","Cancelled by user",level="warning")
             return
         except Exception as exc:
             db.rollback()
             set_state(db,job,"failed",str(exc)[:1500],stage="failed")
+            log_event(job.id,clock._stage or "job","Failed: "+str(exc)[:500],level="error",error_type=type(exc).__name__)
             raise

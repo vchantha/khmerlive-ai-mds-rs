@@ -292,3 +292,47 @@ def test_cancel_orphaned_job_is_cancelled_immediately(db, monkeypatch):
     assert r.json()["status"] == "cancelled" and revoked == []
     with Session() as s:
         assert s.get(Job, "dead").status == "cancelled"
+
+
+# ---------- LLM preload ----------
+
+def _preload_client(fail_times, calls):
+    class Client:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def post(self, url, json):
+            calls.append((url, json))
+            if len(calls) <= fail_times:
+                raise llm_postedit.httpx.ConnectError("starting")
+            return SimpleNamespace(raise_for_status=lambda: None)
+    return Client
+
+
+def test_preload_loads_model_without_generating(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _settings())
+    calls = []
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _preload_client(0, calls))
+    assert llm_postedit.preload_llm() is True
+    assert calls == [("http://ollama:11434/api/generate", {"model": "m"})]   # no prompt -> load only
+
+
+def test_preload_retries_while_ollama_starts(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _settings())
+    monkeypatch.setattr(llm_postedit.time, "sleep", lambda s: None)
+    calls = []
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _preload_client(2, calls))
+    assert llm_postedit.preload_llm() is True and len(calls) == 3
+
+
+def test_preload_gives_up_quietly(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _settings())
+    monkeypatch.setattr(llm_postedit.time, "sleep", lambda s: None)
+    calls = []
+    monkeypatch.setattr(llm_postedit.httpx, "Client", _preload_client(99, calls))
+    assert llm_postedit.preload_llm(attempts=3) is False and len(calls) == 3
+
+
+def test_preload_skipped_when_llm_disabled(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", _settings(llm_postedit_enabled=False))
+    assert llm_postedit.preload_llm() is False
