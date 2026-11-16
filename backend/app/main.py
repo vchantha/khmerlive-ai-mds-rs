@@ -10,7 +10,7 @@ from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity
 from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
-from app.youtube import is_youtube_host,youtube_video_id,canonical_url,YouTubeURLRejected
+from app.youtube import is_youtube_host,youtube_video_id,canonical_url,fetch_info,YouTubeURLRejected
 from app.tasks import translate_media
 from app.media_preview import issue_playback_token,check_playback_token,parse_byte_range,srt_to_webvtt,InvalidPlaybackToken,InvalidByteRange
 from starlette.background import BackgroundTask
@@ -66,7 +66,18 @@ def models():
             dubbing_ready=True
         except FileNotFoundError:
             pass
+    import json,os
+    installed={}
+    try:
+        with open(os.path.join(os.path.dirname(settings.whisper_model_path.rstrip("/")),"manifest.lock.json")) as fh:
+            for m in json.load(fh).get("models",[]):
+                installed[m.get("component")]={"id":m.get("id"),"license":m.get("card_license"),
+                                               "revision":(m.get("revision") or "")[:12]}
+    except (OSError,ValueError):
+        pass
     return {"mode":settings.model_mode,"subtitle_translation_configured":configured,
+            "installed":installed,"max_video_duration_seconds":settings.max_video_duration_seconds,
+            "youtube_enabled":settings.youtube_enabled,
             "speech_dubbing_available":dubbing_ready,
             "khmer_dubbing_enabled":settings.enable_khmer_dubbing,
             "note":"English to Khmer jobs replace source audio with offline Khmer TTS when enabled. Khmer to English remains subtitle-only."}
@@ -135,6 +146,24 @@ def create_job(payload:JobCreate,actor:dict=Depends(authorize)):
         raise HTTPException(503,"Queue temporarily unavailable") from exc
     return {"job_id":jid,"status":"queued","mode":settings.model_mode}
 
+
+@app.get("/api/youtube/info",dependencies=[Depends(authorize)])
+def youtube_info(url:str=Query(min_length=8,max_length=2048),actor:dict=Depends(authorize)):
+    """Title/length preview for a YouTube link before a job is created."""
+    if not actor["admin"] and not settings.stream_url_allow_users:
+        raise HTTPException(403,"URL ingestion is restricted to trusted administrators")
+    if not settings.youtube_enabled:
+        raise HTTPException(403,"YouTube ingestion is disabled on this server")
+    try:
+        video_id=youtube_video_id(url)
+    except YouTubeURLRejected as ex:
+        raise HTTPException(422,str(ex)) from ex
+    try:
+        info=fetch_info(video_id)
+    except Exception as ex:
+        raise HTTPException(502,"Could not read this YouTube video: "+str(ex)[:200]) from ex
+    info["trimmed_to_seconds"]=settings.max_video_duration_seconds if (info.get("duration") or 0)>settings.max_video_duration_seconds else None
+    return info
 
 class StreamJobCreate(BaseModel):
     url:str=Field(min_length=8,max_length=2048)
@@ -261,28 +290,36 @@ def host_metrics():
 
 @app.get("/api/system",dependencies=[Depends(authorize)])
 def system_status():
+    import time
     checks={"api":"online","database":"unknown","redis":"unknown","storage":"unknown","worker":"unknown"}
+    latency={"api":0}
+    t=time.perf_counter()
     try:
         with session() as db:db.execute(text("SELECT 1"))
         checks["database"]="online"
     except Exception:checks["database"]="offline"
+    latency["database"]=round((time.perf_counter()-t)*1000);t=time.perf_counter()
     try:
         from redis import Redis
         checks["redis"]="online" if Redis.from_url(settings.redis_url,socket_timeout=1,socket_connect_timeout=1).ping() else "offline"
     except Exception:checks["redis"]="offline"
+    latency["redis"]=round((time.perf_counter()-t)*1000);t=time.perf_counter()
     try:
         client().head_bucket(Bucket=settings.minio_bucket)
         checks["storage"]="online"
     except Exception:checks["storage"]="offline"
+    latency["storage"]=round((time.perf_counter()-t)*1000);t=time.perf_counter()
     try:
         from app.tasks import celery_app
         checks["worker"]="online" if celery_app.control.inspect(timeout=0.8).ping() else "unknown"
     except Exception:checks["worker"]="unknown"
-    return {"services":checks,"mode":settings.model_mode,"host":host_metrics()}
+    # Celery's ping waits for its full timeout, so no meaningful latency for the worker.
+    return {"services":checks,"latency_ms":latency,"mode":settings.model_mode,"host":host_metrics()}
 
 @app.get("/api/jobs",dependencies=[Depends(authorize)])
 def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
               status:str|None=Query(None),search:str|None=Query(None,max_length=200),
+              source:str|None=Query(None,pattern="^(all|upload|url|youtube)$"),
               actor:dict=Depends(authorize)):
     with session() as db:
         q=only_owned(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id),actor,TranslationJob)
@@ -292,6 +329,8 @@ def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
             elif status in ("queued","processing","completed","dispatch_failed"):
                 q=q.where(TranslationJob.status==status)
             else:raise HTTPException(422,"Unsupported job status")
+        if source and source!="all":
+            q=q.where(MediaAsset.source_kind==source)
         if search:
             term=f"%{search.strip()}%"
             q=q.where(or_(MediaAsset.filename.ilike(term),TranslationJob.id.ilike(term)))

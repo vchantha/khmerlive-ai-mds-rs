@@ -75,11 +75,12 @@ def download_command(video_id: str, destination: Path, max_seconds: int, max_byt
             "-o", str(destination),
             # Report the original duration so callers know whether it was trimmed.
             "--no-simulate", "--quiet", "--print", "before_dl:duration=%(duration)s",
+            "--print", "before_dl:title=%(title)s",
             "--", canonical_url(video_id)]
 
 def download_youtube(video_id: str, destination: Path, max_seconds: int, max_bytes: int,
-                     timeout: int = 1800) -> float | None:
-    """Download a video (first ``max_seconds`` only). Returns the original duration."""
+                     timeout: int = 1800) -> dict:
+    """Download a video (first ``max_seconds`` only). Returns printed metadata."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(download_command(video_id, destination, max_seconds, max_bytes),
                           capture_output=True, text=True, timeout=timeout)
@@ -89,10 +90,43 @@ def download_youtube(video_id: str, destination: Path, max_seconds: int, max_byt
         if "does not pass filter" in message or proc.returncode == 101:
             message = "Live broadcasts are not supported"
         raise RuntimeError("YouTube download failed: " + message[:400])
-    for line in proc.stdout.splitlines():
-        if line.startswith("duration="):
+    return parse_printed(proc.stdout)
+
+def parse_printed(stdout: str) -> dict:
+    """Parse ``key=value`` lines printed by yt-dlp ``--print``."""
+    info: dict = {}
+    for line in stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key not in ("duration", "title", "uploader", "height", "is_live", "thumbnail"):
+            continue
+        if key in ("duration", "height"):
             try:
-                return float(line.split("=", 1)[1])
+                info[key] = float(value)
             except ValueError:
-                return None
-    return None
+                pass
+        elif key == "is_live":
+            info[key] = value == "True"
+        elif value and value != "NA":
+            info[key] = value[:300]
+    return info
+
+def fetch_info(video_id: str, timeout: int = 45) -> dict:
+    """Metadata only (no download) for the New translation preview card."""
+    cmd = ["python", "-m", "yt_dlp", "--no-playlist", "--no-warnings", "--no-cache-dir",
+           "--skip-download", "--socket-timeout", "20",
+           "--print", "duration=%(duration)s", "--print", "title=%(title)s",
+           "--print", "uploader=%(uploader)s", "--print", "height=%(height)s",
+           "--print", "is_live=%(is_live)s", "--print", "thumbnail=%(thumbnail)s",
+           "--", canonical_url(video_id)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        raise RuntimeError(detail[-1][:300] if detail else "Video unavailable")
+    info = parse_printed(proc.stdout)
+    info["id"] = video_id
+    return info
+
+def safe_title(title: str | None, fallback: str) -> str:
+    """Display filename from a YouTube title (no path separators/control chars)."""
+    cleaned = re.sub(r"[\x00-\x1f/\\]+", " ", title or "").strip()
+    return (cleaned[:200] or fallback)

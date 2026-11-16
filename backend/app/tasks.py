@@ -13,7 +13,7 @@ from app.real_inference import translate_audio, build_srt, TimedText
 from app.khmer_tts import build_dubbed_audio
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
-from app.youtube import download_youtube,youtube_video_id
+from app.youtube import download_youtube,youtube_video_id,safe_title
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
 celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=settings.job_time_limit_seconds,task_soft_time_limit=max(60,settings.job_time_limit_seconds-300))
 
@@ -96,13 +96,17 @@ def translate_media(self,job_id:str):
                 if media.source_kind=="youtube":
                     check_cancel(db,job)
                     set_state(db,job,"processing",progress=10,stage="downloading YouTube video")
-                    original=download_youtube(youtube_video_id(media.source_url),source,
+                    video_id=youtube_video_id(media.source_url)
+                    info=download_youtube(video_id,source,
                         settings.max_video_duration_seconds,settings.max_upload_mb*1024*1024)
+                    name=safe_title(info.get("title"),"YouTube "+video_id)
+                    original=info.get("duration")
                     if original and original>settings.max_video_duration_seconds:
                         # Long video: only the first section was downloaded. Record it.
                         media.capture_seconds=settings.max_video_duration_seconds
-                        media.filename=media.filename.removesuffix(".mp4")+" (first "+\
-                            str(round(settings.max_video_duration_seconds/60))+" of "+str(round(original/60))+" min).mp4"
+                        name+=" (first "+str(round(settings.max_video_duration_seconds/60))+\
+                            " of "+str(round(original/60))+" min)"
+                    media.filename=name[:250]+".mp4"
                     persist_captured(s3,db,media,source)
                 elif media.source_kind=="url":
                     check_cancel(db,job)

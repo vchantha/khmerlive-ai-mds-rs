@@ -1,436 +1,538 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,Metrics,ModelInfo,SystemData,Account,Provider,DirectoryUser,Status,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,baseName,shortId,getApiKey,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel} from './api';
-import {Icon,Badge,Toggle,Progress,Avatar,Tabs,Sparkline} from './ui';
+import {Job,Metrics,ModelInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb} from './ui';
 
 export type Ctx={
- account:Account|null;providers:Provider[];isAdmin:boolean;
+ account:Account|null;providers:Provider[];isAdmin:boolean;userName:string;
  metrics:Metrics;jobs:Job[];models:ModelInfo|null;system:SystemData|null;
- hostHistory:{cpu:number[];mem:number[];disk:number[]};
  refresh:()=>Promise<void>;go:(path:string)=>void;
  notify:(msg:string,kind?:'ok'|'err')=>void;
+ openBell:()=>void;unread:number;
 };
-const isReal=(m:ModelInfo|null)=>m?.mode==='real_subtitles';
-const dubbingFor=(m:ModelInfo|null,source:string)=>isReal(m)&&source==='en'&&!!m?.khmer_dubbing_enabled;
+const real=(m:ModelInfo|null)=>m?.mode==='real_subtitles';
+const errText=(e:unknown)=>String(e instanceof Error?e.message:e);
+const srcName=(j:Job)=>j.source_kind==='youtube'?'YouTube':j.source_kind==='url'?'Video link':'Upload';
 
-/* ---------- Page header ---------- */
-export function PageHead({title,sub,children}:{title:string;sub:string;children?:React.ReactNode}){
- return <div className="page-head"><div><h1>{title}</h1><p>{sub}</p></div>{children&&<div className="page-head-extra">{children}</div>}</div>;
+export function Head({title,sub,crumb,children}:{title:React.ReactNode;sub?:React.ReactNode;crumb?:React.ReactNode;children?:React.ReactNode}){
+ return <header className="head">{crumb&&<nav className="crumb" aria-label="Breadcrumb">{crumb}</nav>}<div className="head-row"><div className="head-txt"><h1>{title}</h1>{sub&&<p>{sub}</p>}</div>{children&&<div className="head-act">{children}</div>}</div></header>;
+}
+function NewBtn({go}:{go:(p:string)=>void}){return <button className="btn btn-primary" onClick={()=>go('/new')}><Icon name="plus"/>New translation</button>}
+
+/* Submit a job from any source. Returns the job id. */
+async function createUrlJob(url:string,source:'en'|'km',seconds=30){
+ const r=await req<{job_id:string}>('/api/jobs/from-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url.trim(),capture_seconds:seconds,source_lang:source,target_lang:source==='en'?'km':'en'})});
+ return r.job_id;
+}
+async function createUploadJob(file:File,source:'en'|'km',onPct:(n:number)=>void){
+ const media=await uploadMedia(file,onPct);
+ const r=await req<{job_id:string}>('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_id:media.media_id,source_lang:source,target_lang:source==='en'?'km':'en'})});
+ return r.job_id;
+}
+async function jobAction(ctx:Ctx,j:Job,which:'cancel'|'retry',after?:()=>void){
+ if(which==='cancel'&&!window.confirm('Cancel “'+baseName(j.filename)+'”? The current step may need to finish first.'))return;
+ try{await req('/api/jobs/'+j.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?'Cancellation requested':'Job queued again');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
 }
 
-/* ---------- 1. Login ---------- */
+/* ================= Sign in ================= */
 export function Login({providers,onKey,error}:{providers:Provider[];onKey:(k:string,remember:boolean)=>Promise<void>;error:string}){
  const [key,setKey]=useState(''),[show,setShow]=useState(false),[remember,setRemember]=useState(true),[busy,setBusy]=useState(false);
  const submit=async(e:React.FormEvent)=>{e.preventDefault();if(!key.trim())return;setBusy(true);try{await onKey(key.trim(),remember)}finally{setBusy(false)}};
- const social=(id:string)=>providers.find(p=>p.id===id);
- return <div className="login-screen">
-  <div className="login-art" aria-hidden="true"><svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMax slice"><defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#0b2a6b"/><stop offset=".55" stopColor="#3b6fd8"/><stop offset="1" stopColor="#f3a96b"/></linearGradient></defs><rect width="400" height="220" fill="url(#sky)"/><g fill="#0a1d45"><path d="M150 160h100v-30l-6-4v-22l-5-4V78l-4-6-5-22-5 22-4 6v22l-5 4v22l-6 4z"/><path d="M110 165h40v-25l-4-3v-16l-4-4-4-16-4 16-4 4v16l-4 3zM250 165h40v-25l-4-3v-16l-4-4-4-16-4 16-4 4v16l-4 3z"/><path d="M90 168h220v8H90zM30 175c10-30 20-40 22-60 2 20 12 30 22 60zM330 175c8-25 16-34 18-50 2 16 10 25 18 50z"/><rect y="176" width="400" height="44" opacity=".85"/></g></svg></div>
-  <form className="login-card" onSubmit={submit}>
-   <span className="login-logo"><svg viewBox="0 0 32 32" width="30" height="30" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M5 9l7 7-7 7M27 9l-7 7 7 7M12 16h8"/></svg></span>
-   <h1>KhmerLive AI</h1>
-   <p className="login-sub">Video Translation &amp; Dubbing</p>
-   <p className="login-pair">English ⇔ Khmer</p>
-   <label className="login-field"><Icon name="key"/><input type={show?'text':'password'} placeholder="Administrator API key" aria-label="API key" value={key} onChange={e=>setKey(e.target.value)} autoComplete="current-password"/><button type="button" className="icon-btn" aria-label={show?'Hide key':'Show key'} onClick={()=>setShow(v=>!v)}><Icon name="eye"/></button></label>
-   <div className="login-row"><label><input type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)}/> Remember me</label><a href="/api/docs" target="_blank" rel="noopener">API docs</a></div>
-   {error&&<div className="login-error" role="alert">{error}</div>}
-   <button className="btn btn-primary btn-block" disabled={busy||!key.trim()}>{busy?'Signing in…':'Sign In'}</button>
-   <div className="login-or"><span>or continue with</span></div>
-   <div className="login-social">{(['google','github','facebook'] as const).filter(id=>social(id)).map(id=>{const p=social(id)!;return <button type="button" key={id} className="btn btn-light" disabled={!p.enabled} title={p.enabled?'Sign in with '+p.name:p.name+' OAuth is not configured on the server'} onClick={()=>{window.location.href='/api/auth/login/'+id}}>{id==='google'?<b className="g">G</b>:id==='github'?<b>◈</b>:<b className="f">f</b>}{p.name}</button>})}</div>
-   <p className="login-foot">Use the <code>API_KEY</code> from your <code>.env</code>, or a configured social account.</p>
-  </form>
+ const google=providers.find(p=>p.id==='google'),github=providers.find(p=>p.id==='github');
+ const social=(p:Provider|undefined,label:string,icon:React.ReactNode)=>p&&<button type="button" className="btn btn-outline btn-lg" disabled={!p.enabled} title={p.enabled?undefined:label+' sign-in is not configured on this server'} onClick={()=>{window.location.href='/api/auth/login/'+p.id}}>{icon}{label}</button>;
+ return <div className="login">
+  <aside className="login-hero">
+   <div className="login-brand"><Logo size={40}/><span>KhmerLive<b> AI</b></span></div>
+   <div>
+    <p className="login-km km">នាំវីដេអូពីពិភពលោក មកជាភាសាខ្មែរ</p>
+    <h1>Translate and dub any English video into natural Khmer.</h1>
+    <ul>
+     <li><Icon name="check"/>Khmer voice-over and Khmer subtitles, generated offline on your own server</li>
+     <li><Icon name="check"/>Review the bilingual transcript and download MP4, SRT and TXT</li>
+     <li><Icon name="check"/>Works with YouTube links, uploads and streaming URLs</li>
+    </ul>
+   </div>
+  </aside>
+  <main className="login-main">
+   <form className="login-form" onSubmit={submit}>
+    <h2>Sign in</h2>
+    <p className="muted">Use a connected account, or the administrator API key from <code>.env</code>.</p>
+    {(google||github)&&<div className="login-social">
+     {social(google,'Google',<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.230 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84A11 11 0 0 0 12 23z"/><path fill="#FBBC05" d="M5.84 14.09a6.6 6.6 0 0 1 0-4.18V7.07H2.18a11 11 0 0 0 0 9.86l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15A11 11 0 0 0 2.18 7.07l3.66 2.84C6.71 7.31 9.14 5.38 12 5.38z"/></svg>)}
+     {social(github,'GitHub',<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.690-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.090-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>)}
+    </div>}
+    <div className="or"><span>or with API key</span></div>
+    <label className="field"><span>API key</span>
+     <div className="input-wrap"><input type={show?'text':'password'} aria-label="API key" placeholder="API_KEY from .env" value={key} onChange={e=>setKey(e.target.value)} autoComplete="current-password"/><button type="button" className="icon-btn ghost" aria-label={show?'Hide key':'Show key'} onClick={()=>setShow(v=>!v)}><Icon name="eye"/></button></div>
+    </label>
+    <label className="check"><input type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)}/>Keep me signed in on this browser</label>
+    {error&&<div className="alert alert-err" role="alert">{error}</div>}
+    <button className="btn btn-primary btn-lg btn-block" disabled={busy||!key.trim()}>{busy?'Signing in…':'Sign in'}</button>
+    <p className="login-foot"><a href="/api/docs" target="_blank" rel="noopener">API documentation</a></p>
+   </form>
+  </main>
  </div>;
 }
 
-/* ---------- 2. Dashboard ---------- */
+/* ================= Dashboard ================= */
 const DAY=86400000;
-function bucketDays(jobs:Job[],days:number){
- const today=new Date();today.setHours(0,0,0,0);
- const start=today.getTime()-(days-1)*DAY;
- const counts=Array.from({length:days},()=>0);
- for(const j of jobs){if(!j.created_at)continue;const t=new Date(j.created_at).getTime();const i=Math.floor((t-start)/DAY);if(i>=0&&i<days)counts[i]++}
- return counts.map((n,i)=>({n,date:new Date(start+i*DAY)}));
+function perDay(jobs:Job[],days:number){
+ const t=new Date();t.setHours(0,0,0,0);const start=t.getTime()-(days-1)*DAY;
+ const n=Array.from({length:days},()=>0);
+ for(const j of jobs){if(!j.created_at)continue;const i=Math.floor((new Date(j.created_at).getTime()-start)/DAY);if(i>=0&&i<days)n[i]++}
+ return n.map((v,i)=>({v,d:new Date(start+i*DAY)}));
 }
-function LineChart({data}:{data:{n:number;date:Date}[]}){
- const W=520,H=210,L=34,B=26,T=10,R=26;
- const max=Math.max(4,...data.map(d=>d.n));const nice=Math.ceil(max/4)*4;
- const x=(i:number)=>L+(data.length<2?0:i*(W-L-R)/(data.length-1));const y=(v:number)=>T+(H-T-B)*(1-v/nice);
- const line=data.map((d,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(d.n).toFixed(1)).join(' ');
+function Bars({data}:{data:{v:number;d:Date}[]}){
+ const max=Math.max(1,...data.map(x=>x.v));const top=data.reduce((a,b,i)=>b.v>data[a].v?i:a,0);
  const every=Math.ceil(data.length/7);
- return <svg className="chart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Jobs created per day">
-  <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="var(--primary)" stopOpacity=".28"/><stop offset="1" stopColor="var(--primary)" stopOpacity="0"/></linearGradient></defs>
-  {[0,1,2,3,4].map(i=>{const v=nice*i/4;return <g key={i}><line x1={L} x2={W-R} y1={y(v)} y2={y(v)} className="grid"/><text x={L-8} y={y(v)+4} textAnchor="end">{v}</text></g>})}
-  <path d={line+` L${x(data.length-1)},${y(0)} L${x(0)},${y(0)} Z`} fill="url(#area)"/>
-  <path d={line} fill="none" stroke="var(--primary)" strokeWidth="2.5"/>
-  {data.map((d,i)=><g key={i}><circle cx={x(i)} cy={y(d.n)} r={data.length>31?0:4} className="dot"><title>{d.date.toLocaleDateString()}: {d.n} jobs</title></circle>{i%every===0&&<text x={x(i)} y={H-6} textAnchor="middle">{d.date.toLocaleDateString(undefined,{month:'short',day:'numeric'})}</text>}</g>)}
- </svg>;
+ return <div className="bars" role="img" aria-label="Jobs created per day">
+  {data.map((x,i)=><div className="bar-col" key={i} title={x.d.toLocaleDateString()+': '+x.v+' jobs'}>
+   <span className={'bar-n'+(i===top&&x.v?' top':'')}>{data.length<=14&&x.v?x.v:''}</span>
+   <i className={i===top&&x.v?'top':''} style={{height:(x.v?Math.max(4,x.v*100/max):0)+'%'}}/>
+   <small>{i%every===0||i===data.length-1?x.d.toLocaleDateString(undefined,data.length<=7?{weekday:'short',day:'numeric'}:{month:'short',day:'numeric'}):''}</small>
+  </div>)}
+ </div>;
 }
-function Donut({parts,total}:{parts:{label:string;value:number;color:string}[];total:number}){
- const r=46,c=2*Math.PI*r;let acc=0;
- return <svg viewBox="0 0 120 120" className="donut" role="img" aria-label="Jobs by source">
-  <circle cx="60" cy="60" r={r} fill="none" stroke="var(--line)" strokeWidth="13"/>
-  {total>0&&parts.map(p=>{const len=c*p.value/total;const el=<circle key={p.label} cx="60" cy="60" r={r} fill="none" stroke={p.color} strokeWidth="13" strokeDasharray={`${len} ${c-len}`} strokeDashoffset={-acc} transform="rotate(-90 60 60)"/>;acc+=len;return el})}
-  <text x="60" y="60" textAnchor="middle" className="donut-n">{total}</text><text x="60" y="76" textAnchor="middle" className="donut-l">Jobs</text>
- </svg>;
-}
-export function Dashboard({ctx}:{ctx:Ctx}){
- const [range,setRange]=useState<'7'|'30'|'90'>('7');
- const {metrics:m,jobs}=ctx;
- const pct=(n:number)=>m.total?Math.round(n*100/m.total):0;
- const data=useMemo(()=>bucketDays(jobs,Number(range)),[jobs,range]);
- const srcCount=(k:string)=>jobs.filter(j=>(j.source_kind||'upload')===k).length;
- const sources=[{label:'YouTube',value:srcCount('youtube'),color:'var(--red)',ico:'play',cls:'yt'},{label:'Upload',value:srcCount('upload'),color:'var(--primary)',ico:'upload',cls:'up'},{label:'Stream URL',value:srcCount('url'),color:'var(--sky)',ico:'link',cls:'url'}];
- const srcTotal=jobs.length;
- const stats:[string,number,string,string,string][]= [
-  ['Total Jobs',m.total,'layers','blue',''],
-  ['Completed',m.completed,'check','green',pct(m.completed)+'%'],
-  ['Processing',m.processing+m.queued,'refresh','sky',pct(m.processing+m.queued)+'%'],
-  ['Failed',m.failed,'x','red',pct(m.failed)+'%'],
- ];
- return <>
-  <PageHead title="Dashboard" sub="Overview of video translation and dubbing"><span className="chip"><Icon name="calendar" size={15}/>Last {range} Days</span></PageHead>
-  <div className="stat-grid">{stats.map(([t,n,ic,k,p])=><div className={'card stat stat-'+k} key={t}><span className="stat-ico"><Icon name={ic} size={22}/></span><div><b>{n}</b><small>{t}</small></div>{p&&<div className="stat-foot"><Progress value={parseInt(p)} kind={k}/><em>{p}</em></div>}</div>)}</div>
-  <div className="dash-grid">
-   <section className="card pad"><div className="card-title"><h2>Job Activity</h2><Tabs items={[['7','7 Days'],['30','30 Days'],['90','90 Days']]} value={range} onChange={setRange}/></div><LineChart data={data}/>{jobs.length>=100&&<p className="muted small">Chart uses the 100 most recent jobs.</p>}</section>
-   <section className="card pad"><div className="card-title"><h2>Jobs by Source</h2></div><div className="donut-wrap"><Donut total={srcTotal} parts={sources}/>
-    <ul className="legend">{sources.map(x=><li key={x.label}><span className={'src-ico '+x.cls}><Icon name={x.ico} size={15}/></span>{x.label}<b>{srcTotal?Math.round(x.value*100/srcTotal):0}%</b></li>)}</ul></div></section>
-  </div>
-  <section className="card"><div className="card-title pad-x"><h2>Recent Jobs</h2><button className="btn btn-ghost" onClick={()=>ctx.go('/jobs')}>View all <Icon name="arrowR" size={15}/></button></div><JobTable jobs={jobs.slice(0,5)} go={ctx.go}/></section>
- </>;
-}
-
-/* ---------- 3/4. New translation wizard ---------- */
-export function NewJob({ctx}:{ctx:Ctx}){
- const [step,setStep]=useState<1|2|3>(1);
- const [source,setSource]=useState<'upload'|'url'|'youtube'>('upload');
- const [file,setFile]=useState<File|null>(null),[url,setUrl]=useState(''),[seconds,setSeconds]=useState(30);
- const [srcLang,setSrcLang]=useState<'en'|'km'>('en');
- const [busy,setBusy]=useState(false),[pct,setPct]=useState<number|null>(null),[err,setErr]=useState('');
- const [drag,setDrag]=useState(false);
- const input=useRef<HTMLInputElement>(null);
- const m=ctx.models;const real=isReal(m);const tgt=srcLang==='en'?'km':'en';
- const dub=dubbingFor(m,srcLang);
- const missing=real&&(m?.subtitle_translation_configured===false||(dub&&!m?.speech_dubbing_available));
- const choose=(f?:File)=>{if(!f)return;if(!f.name.toLowerCase().endsWith('.mp4')){setErr('Only MP4 files are supported. Export your video as MP4 (H.264).');return}setErr('');setFile(f)};
- const urlOk=/^https?:\/\/.+/i.test(url.trim());
- const ytMismatch=source==='youtube'&&urlOk&&!isYouTubeUrl(url);
- const ready1=source==='upload'?!!file:source==='youtube'?urlOk&&isYouTubeUrl(url):urlOk&&!isYouTubeUrl(url);
- const submit=async()=>{
-  setBusy(true);setErr('');
-  try{
-   let id:string;
-   if(source!=='upload'){id=(await req<{job_id:string}>('/api/jobs/from-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url.trim(),capture_seconds:seconds,source_lang:srcLang,target_lang:tgt})})).job_id}
-   else{setPct(0);const media=await uploadMedia(file!,setPct);id=(await req<{job_id:string}>('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_id:media.media_id,source_lang:srcLang,target_lang:tgt})})).job_id}
-   ctx.notify(real?'Translation job queued':'Demo job queued');void ctx.refresh();ctx.go('/job/'+id);
-  }catch(e){setErr(String(e instanceof Error?e.message:e))}finally{setBusy(false);setPct(null)}
- };
- const stepper=<div className="stepper">{(['Input','Settings','Review'] as const).map((l,i)=>{const n=(i+1) as 1|2|3;return <button key={l} className={'step'+(step===n?' current':'')+(step>n?' done':'')} onClick={()=>{if(n<step||(n===2&&ready1)||(n===3&&ready1))setStep(n)}}><span>{step>n?<Icon name="check" size={13}/>:n}</span>{l}</button>})}</div>;
- return <>
-  <PageHead title={step===2?'Translation Settings':'New Translation Job'} sub={step===2?'Configure translation and dubbing options':'Translate and dub a video with AI'}/>
-  <section className="card pad wizard">
-   {stepper}
-   {err&&<div className="alert alert-err">{err}</div>}
-   {missing&&<div className="alert alert-err"><b>Offline models missing.</b> Install Whisper, M2M100{dub?' and Khmer MMS TTS':''} under <code>models/</code> and restart the real worker before submitting.</div>}
-   {step===1&&<>
-    <h2 className="sec">Choose Video Source</h2>
-    <div className="source-cards">
-     <button className={'source-card'+(source==='upload'?' active':'')} onClick={()=>setSource('upload')}><Icon name="upload" size={22}/><span><b>Upload Video</b><small>MP4 (H.264)</small></span></button>
-     <button className={'source-card yt'+(source==='youtube'?' active':'')} onClick={()=>setSource('youtube')}><span className="yt-logo" aria-hidden="true"><Icon name="play" size={14}/></span><span><b>YouTube URL</b><small>youtube.com / youtu.be</small></span></button>
-     <button className={'source-card'+(source==='url'?' active':'')} onClick={()=>setSource('url')}><Icon name="link" size={22}/><span><b>Video URL</b><small>MP4 / HLS (.m3u8)</small></span></button>
-    </div>
-    {source==='upload'?<div className={'dropzone'+(drag?' drag':'')} role="button" tabIndex={0} onClick={()=>input.current?.click()} onKeyDown={e=>{if(e.key==='Enter'||e.key===' ')input.current?.click()}} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);choose(e.dataTransfer.files[0])}}>
-      <Icon name="cloud" size={44}/>
-      {file?<><b>{file.name}</b><span>{size(file.size)} · click to replace</span></>:<><b>Drag &amp; drop video here</b><span>or click to browse</span></>}
-      <small>Supported: MP4 (H.264) · size limit set by server MAX_UPLOAD_MB</small>
-      <input ref={input} type="file" accept=".mp4,video/mp4" hidden onChange={e=>choose(e.target.files?.[0])}/>
-     </div>
-     :source==='youtube'?<div className="url-box"><label className="field"><span>YouTube video link</span><input type="url" placeholder="https://www.youtube.com/watch?v=… or https://youtu.be/…" value={url} onChange={e=>setUrl(e.target.value)}/></label>{ytMismatch&&<p className="field-err">That is not a YouTube link. Use the Video URL option for direct MP4/HLS files.</p>}<p className="muted small">The server downloads the video (single public video, not live) and translates and dubs it like an upload. Videos longer than <code>MAX_VIDEO_DURATION_SECONDS</code> (default 10 min) are trimmed to their first 10 minutes. Only process videos you have the rights to use.</p></div>
-     :<div className="url-box"><label className="field"><span>Stream or file URL</span><input type="url" placeholder="https://video.example.org/live/index.m3u8" value={url} onChange={e=>setUrl(e.target.value)}/></label><label className="field"><span>Capture duration</span><select value={seconds} onChange={e=>setSeconds(Number(e.target.value))}>{[15,30,60,120].map(s=><option key={s} value={s}>{s} seconds</option>)}</select></label>{urlOk&&isYouTubeUrl(url)&&<p className="field-err">YouTube links go in the YouTube URL option.</p>}<p className="muted small">The host must be listed in the server's <code>STREAM_ALLOWED_HOSTS</code>. URL capture is restricted to administrators unless <code>STREAM_URL_ALLOW_USERS</code> is enabled.</p></div>}
-    <div className="wizard-foot"><span/><button className="btn btn-primary" disabled={!ready1} onClick={()=>setStep(2)}>Next <Icon name="arrowR" size={15}/></button></div>
-   </>}
-   {step===2&&<>
-    <h3 className="sub">Language</h3>
-    <div className="lang-row">
-     <label className="field"><span>Source Language</span><select value={srcLang} onChange={e=>setSrcLang(e.target.value as 'en'|'km')}><option value="en">🇬🇧 English (en)</option><option value="km">🇰🇭 Khmer (km)</option></select></label>
-     <button className="swap" aria-label="Swap languages" onClick={()=>setSrcLang(tgt)}><Icon name="arrowR"/></button>
-     <label className="field"><span>Target Language</span><select value={tgt} onChange={e=>setSrcLang(e.target.value==='km'?'en':'km')}><option value="km">🇰🇭 Khmer (km)</option><option value="en">🇬🇧 English (en)</option></select></label>
-    </div>
-    <h3 className="sub">Dubbing Options</h3>
-    <div className="opt"><div><b>Enable Dubbing</b><small>{dub?'Replace audio with offline Khmer voice (MMS TTS)':srcLang==='km'?'Khmer → English is subtitle-only':real?'Disabled on server (ENABLE_KHMER_DUBBING=false)':'Demo mode keeps the original audio'}</small></div><Toggle label="Enable dubbing" checked={dub} disabled/></div>
-    <div className="opt"><div><b>Generate Subtitles</b><small>{real?'Translated SRT + embedded subtitle track':'Demo mode produces placeholder text only'}</small></div><Toggle label="Generate subtitles" checked={real} disabled/></div>
-    <div className="opt"><div><b>Preserve Background Music</b><small>{dub?'Not separated: the dubbed track replaces source audio':'Original audio is kept unchanged'}</small></div><Toggle label="Preserve background music" checked={!dub} disabled/></div>
-    <h3 className="sub">Voice &amp; Synchronization</h3>
-    <div className="opt"><div><b>Voice</b><small>facebook/mms-tts-khm single-speaker model</small></div><span className="chip">{dub?'Khmer (MMS)':'—'}</span></div>
-    {source==='url'&&<div className="opt"><div><b>Capture duration</b><small>Bounded recording, not continuous dubbing</small></div><span className="chip">{seconds}s</span></div>}
-    <p className="muted small">Options are set by the server's <b>{real?'real_subtitles':'demo'}</b> mode; per-job overrides are not supported yet.</p>
-    <div className="wizard-foot"><button className="btn btn-light" onClick={()=>setStep(1)}><Icon name="arrowL" size={15}/> Back</button><button className="btn btn-primary" onClick={()=>setStep(3)}>Next <Icon name="arrowR" size={15}/></button></div>
-   </>}
-   {step===3&&<>
-    <h2 className="sec">Review</h2>
-    <dl className="kv">
-     <dt>Source</dt><dd className="break">{source==='upload'?(file?.name+' · '+size(file?.size)):source==='youtube'?'YouTube · '+url.trim()+' (first 10 min if longer)':url+' ('+seconds+'s capture)'}</dd>
-     <dt>Translation</dt><dd>{lang(srcLang)} → {lang(tgt)}</dd>
-     <dt>Mode</dt><dd><span className={'mode-pill '+(real?'real':'demo')}>{real?'Real (offline AI)':'Demo'}</span></dd>
-     <dt>Output</dt><dd>{!real?'Remuxed video with original audio (no AI processing)':dub?'Khmer dubbed MP4 + Khmer subtitles (SRT)':'MP4 with translated subtitles + SRT'}</dd>
-    </dl>
-    {pct!==null&&<div className="upload-pct">Uploading {pct}%<Progress value={pct}/></div>}
-    <div className="wizard-foot"><button className="btn btn-light" disabled={busy} onClick={()=>setStep(2)}><Icon name="arrowL" size={15}/> Back</button><button className="btn btn-primary" disabled={busy||missing||!ready1} onClick={()=>void submit()}>{busy?'Submitting…':'Start Translation'} <Icon name="arrowR" size={15}/></button></div>
-   </>}
-  </section>
- </>;
-}
-
-/* ---------- 5/6. Job processing + result ---------- */
-const stageLog=new Map<string,{t:Date;msg:string}[]>();
-function recordStage(j:Job){
- const log=stageLog.get(j.id)||[];const msg=j.stage||j.status;
- if(!log.length||log[log.length-1].msg!==msg){log.push({t:new Date(),msg});stageLog.set(j.id,log.slice(-40))}
- return log;
-}
-type StepState='done'|'run'|'wait'|'fail'|'skip';
-function steps(j:Job,dub:boolean):{title:string;state:StepState;note:string}[]{
- const p=j.progress||0,done=j.status==='completed',failed=isFailed(j.status)||j.status==='cancelled';
- const acqEnd=j.source_kind==='url'?15:25;
- const defs:[string,number,number,boolean][]=[
-  ['Video Acquisition',0,acqEnd,true],
-  ['Speech Recognition (ASR)',acqEnd,65,true],
-  ['Machine Translation (MT)',45,65,true],
-  ['Text-to-Speech (TTS)',70,85,dub],
-  ['Audio Synchronization',65,dub?70:85,true],
-  ['Video Rendering',85,101,true],
- ];
- return defs.map(([title,s,e,applies])=>{
-  if(!applies)return {title,state:'skip' as StepState,note:'Not used for this job'};
-  if(done)return {title,state:'done' as StepState,note:'Completed'};
-  if(p>=e||(title.startsWith('Audio')&&dub&&p>=85))return {title,state:'done' as StepState,note:'Completed'};
-  if(p>=s)return failed?{title,state:'fail' as StepState,note:j.status==='cancelled'?'Cancelled':'Stopped'}:{title,state:'run' as StepState,note:j.stage||'Running'};
-  return {title,state:'wait' as StepState,note:failed?'Not started':'Pending'};
- });
-}
-function VideoThumb({job,big}:{job:Job;big?:boolean}){
- return <div className={'thumb-art'+(big?' big':'')} aria-hidden="true"><span className="thumb-play"><Icon name="play" size={big?26:16}/></span><span className="thumb-lang">{job.source_lang.toUpperCase()} → {job.target_lang.toUpperCase()}</span></div>;
-}
-export function JobPage({ctx,id}:{ctx:Ctx;id:string}){
- const [job,setJob]=useState<Job|null>(null),[err,setErr]=useState('');
- const [view,setView]=useState<'auto'|'details'>('auto');
- const load=async()=>{try{const j=await req<Job>('/api/jobs/'+id);recordStage(j);setJob(j);setErr('')}catch(e){setErr(String(e instanceof Error?e.message:e))}};
- useEffect(()=>{setJob(null);setView('auto');void load()},[id]);
- useEffect(()=>{if(!job||!isActive(job.status))return;const t=window.setInterval(()=>void load(),2500);return()=>clearInterval(t)},[job?.status,id]);
- if(err&&!job)return <><PageHead title="Job" sub={id}/><div className="alert alert-err">{err}</div></>;
- if(!job)return <div className="card pad skeleton-block"/>;
- const action=async(which:'cancel'|'retry')=>{if(which==='cancel'&&!window.confirm('Cancel '+job.filename+'? The current step may need to finish first.'))return;try{await req('/api/jobs/'+job.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?'Cancellation requested':'Job re-queued');await load();void ctx.refresh()}catch(e){ctx.notify(String(e instanceof Error?e.message:e),'err')}};
- if(job.status==='completed'&&view==='auto')return <JobResult ctx={ctx} job={job} onDetails={()=>setView('details')}/>;
- return <JobProcessing ctx={ctx} job={job} action={action} onResult={job.status==='completed'?()=>setView('auto'):undefined}/>;
-}
-function JobProcessing({ctx,job,action,onResult}:{ctx:Ctx;job:Job;action:(w:'cancel'|'retry')=>void;onResult?:()=>void}){
- const [tab,setTab]=useState<'logs'|'metrics'>('logs');
- const dub=job.processing_mode==='real_subtitles'&&job.source_lang==='en'&&(job.has_khmer_voice||!!ctx.models?.khmer_dubbing_enabled);
- const list=steps(job,dub);const log=stageLog.get(job.id)||[];
- const statusChip=job.status==='completed'?<span className="badge badge-ok"><Icon name="check" size={13}/>Completed</span>:isActive(job.status)?<span className="badge badge-run"><span className="spin"/>{job.status==='queued'?'Queued':job.status==='cancelling'?'Cancelling':'Processing'}</span>:<Badge status={job.status}/>;
- return <>
-  <PageHead title="Job Details" sub={shortId(job.id)+' · '+baseName(job.filename)}>{onResult&&<button className="btn btn-light" onClick={onResult}>View result</button>}</PageHead>
-  <section className="card pad">
-   <div className="job-top"><VideoThumb job={job} big/><dl className="kv compact"><dt>Source</dt><dd>{job.source_kind==='url'?'Stream URL ('+(job.capture_seconds||30)+'s)':sourceLabel(job.source_kind,job.capture_seconds)+' · '+size(job.size_bytes)}</dd><dt>Source language</dt><dd>{lang(job.source_lang)}</dd><dt>Target</dt><dd>{lang(job.target_lang)}</dd><dt>Dubbing</dt><dd>{dub?'Enabled':'Disabled'}</dd><dt>Subtitles</dt><dd>{job.processing_mode==='real_subtitles'?'Enabled':'Demo'}</dd><dt>Created</dt><dd>{asDate(job.created_at)}</dd></dl><div className="job-status">{statusChip}</div></div>
-   <div className="proc-head"><b>{job.status==='completed'?'Completed':isActive(job.status)?'Processing…':job.status==='cancelled'?'Cancelled':'Stopped'}</b><b>{job.progress}%</b></div>
-   <Progress value={job.progress} kind={isFailed(job.status)?'red':job.status==='completed'?'green':''}/>
-   <div className="proc-grid">
-    <ol className="pipeline">{list.map((s,i)=><li key={s.title} className={'ps-'+s.state}><span className="ps-node">{s.state==='done'?<Icon name="check" size={14}/>:s.state==='run'?<span className="spin"/>:s.state==='fail'?<Icon name="x" size={14}/>:i+1}</span><div><b>{i+1}. {s.title}</b><small>{s.note}</small></div><em>{s.state==='done'?'Completed':s.state==='run'?'Running':s.state==='skip'?'Skipped':s.state==='fail'?'Stopped':'Pending'}</em></li>)}</ol>
-    <div className="logs"><Tabs variant="line" items={[['logs','Logs'],['metrics','Metrics']]} value={tab} onChange={setTab}/>
-     {tab==='logs'?<ul className="log-list">{log.map((l,i)=><li key={i}><time>{asTime(l.t)}</time><span>{l.msg}</span></li>)}{!log.length&&<li><span className="muted">Waiting for worker updates…</span></li>}</ul>
-     :<dl className="kv compact"><dt>Progress</dt><dd>{job.progress}%</dd><dt>Mode</dt><dd>{job.processing_mode==='real_subtitles'?'Real (offline AI)':'Demo'}</dd><dt>File size</dt><dd>{size(job.size_bytes)}</dd><dt>Last update</dt><dd>{asDate(job.updated_at)}</dd><dt>Job ID</dt><dd className="mono">{job.id}</dd></dl>}
-    </div>
-   </div>
-   {job.error&&<div className="alert alert-err"><b>Job failed.</b> {job.error}</div>}
-   <div className="row-end">{isActive(job.status)?<button className="btn btn-danger" disabled={job.status==='cancelling'} onClick={()=>action('cancel')}><Icon name="x" size={15}/>{job.status==='cancelling'?'Cancelling…':'Cancel Job'}</button>:job.status!=='completed'&&<button className="btn btn-primary" onClick={()=>action('retry')}><Icon name="refresh" size={15}/>Retry Job</button>}</div>
-  </section>
- </>;
-}
-function usePlayback(job:Job){
+function usePlayback(job:Job|null){
  const [p,setP]=useState<{video_url:string;captions_url:string|null}|null>(null),[err,setErr]=useState('');
- useEffect(()=>{let closed=false;setP(null);setErr('');
-  const load=async()=>{try{const r=await req<{video_url:string;captions_url:string|null}>('/api/jobs/'+job.id+'/player-token');if(!closed)setP(r)}catch(e){if(!closed)setErr(String(e instanceof Error?e.message:e))}};
-  void load();return()=>{closed=true}},[job.id]);
+ useEffect(()=>{let closed=false;setP(null);setErr('');if(!job||!job.has_output)return;
+  void req<{video_url:string;captions_url:string|null}>('/api/jobs/'+job.id+'/player-token').then(r=>{if(!closed)setP(r)}).catch(e=>{if(!closed)setErr(errText(e))});
+  return()=>{closed=true}},[job?.id,job?.has_output]);
  return {p,err};
 }
-function JobResult({ctx,job,onDetails}:{ctx:Ctx;job:Job;onDetails:()=>void}){
- const [tab,setTab]=useState<'output'|'transcript'|'subtitles'>('output');
- const [srt,setSrt]=useState<string|null>(null);
- const {p,err}=usePlayback(job);
- const video=useRef<HTMLVideoElement>(null);const resume=useRef(0);
- const [duration,setDuration]=useState<number|null>(null);
- useEffect(()=>{if(tab!=='subtitles'||srt!==null||!job.has_subtitles)return;void (async()=>{try{const h:Record<string,string>={};const k=getApiKey();if(k)h['X-API-Key']=k;const r=await fetch('/api/jobs/'+job.id+'/subtitles',{headers:h});setSrt(r.ok?await r.text():'Subtitles unavailable ('+r.status+')')}catch(e){setSrt(String(e))}})()},[tab,job.id]);
- const fmt=(s:number|null)=>s==null?'—':Math.floor(s/60).toString().padStart(2,'0')+':'+Math.floor(s%60).toString().padStart(2,'0');
- const transcriptTxt=`${lang(job.source_lang)} transcript\n\n${job.transcript||''}\n\n${lang(job.target_lang)} translation\n\n${job.translation||''}\n`;
- const fail=(e:unknown)=>ctx.notify(String(e instanceof Error?e.message:e),'err');
- const share=async()=>{try{await navigator.clipboard.writeText(location.origin+'/#/job/'+job.id);ctx.notify('Link copied (viewers need access to this job)')}catch{ctx.notify('Could not copy link','err')}};
+function VideoCard({job,go}:{job:Job;go:(p:string)=>void}){
+ const {p}=usePlayback(job);const [dur,setDur]=useState<number|null>(null);
+ return <button className="vcard" onClick={()=>go('/job/'+job.id)}>
+  <span className="vthumb">{p&&<video muted preload="metadata" src={p.video_url+'#t=2'} onLoadedMetadata={e=>setDur(e.currentTarget.duration)}/>}<span className="vplay"><Icon name="play" size={14}/></span>{dur!=null&&<em>{fmtDur(dur)}</em>}</span>
+  <span className="vmeta"><b title={job.filename}>{baseName(job.filename)}</b><small>{shortId(job.id)} · {outputsLabel(job)} · {asDate(job.updated_at||job.created_at)}</small></span>
+ </button>;
+}
+export function Dashboard({ctx}:{ctx:Ctx}){
+ const [range,setRange]=useState('7');const [link,setLink]=useState(''),[busy,setBusy]=useState(false);
+ const {metrics:m,jobs}=ctx;
+ const hour=new Date().getHours();const greet=hour<12?'Good morning':hour<18?'Good afternoon':'Good evening';
+ const active=jobs.filter(j=>isActive(j.status)),failed=jobs.filter(j=>isFailed(j.status)).slice(0,3),done=jobs.filter(j=>j.status==='completed'&&j.has_output).slice(0,4);
+ const data=useMemo(()=>perDay(jobs,Number(range)),[jobs,range]);
+ const busiest=data.reduce((a,b)=>b.v>a.v?b:a,data[0]);
+ const count=(k:string)=>jobs.filter(j=>(j.source_kind||'upload')===k).length;
+ const sources:[string,number,string][]=[['YouTube',count('youtube'),'s1'],['File upload',count('upload'),'s2'],['Video link',count('url'),'s3']];
+ const total=jobs.length;
+ const pct=(n:number)=>m.total?Math.round(n*100/m.total):0;
+ const quick=async()=>{const u=link.trim();if(!/^https?:\/\/.+/i.test(u)){ctx.notify('Paste a YouTube, MP4 or HLS link','err');return}
+  setBusy(true);try{const id=await createUrlJob(u,'en');setLink('');ctx.notify(isYouTubeUrl(u)?'YouTube video queued':'Video link queued');void ctx.refresh();ctx.go('/job/'+id)}catch(e){ctx.notify(errText(e),'err')}finally{setBusy(false)}};
+ const sub=[active.length?active.length+(active.length===1?' video is':' videos are')+' processing.':'Nothing is processing right now.',m.failed?' '+m.failed+' failed job'+(m.failed===1?' needs':'s need')+' your attention.':''].join('');
  return <>
-  <PageHead title="Job Result" sub={shortId(job.id)+' · '+baseName(job.filename)}><button className="btn btn-light" onClick={()=>void share()}><Icon name="share" size={15}/>Share</button><button className="btn btn-light" onClick={onDetails}>Pipeline</button></PageHead>
-  <div className="result-grid">
-   <section className="card pad">
-    <div className="row-end"><span className="badge badge-ok"><Icon name="check" size={13}/>Completed</span></div>
-    <div className="player">{p?<video ref={video} key={p.video_url} controls playsInline preload="metadata" src={p.video_url} onLoadedMetadata={e=>{setDuration(e.currentTarget.duration);if(resume.current)e.currentTarget.currentTime=resume.current}} onTimeUpdate={e=>{resume.current=e.currentTarget.currentTime}} aria-label="Translated video">{p.captions_url&&<track kind="subtitles" default srcLang={job.target_lang} label={lang(job.target_lang)+' subtitles'} src={p.captions_url}/>}</video>:<div className="player-empty"><Icon name="play" size={32}/><small>{err||'Loading secure preview…'}</small></div>}</div>
-    <p className="muted small">{job.has_khmer_voice?'Khmer voice dubbing + translated subtitles':job.has_subtitles?'Translated subtitles · original speech retained':'Demo output · original speech retained, no AI processing'}</p>
-   </section>
-   <section className="card pad">
-    <Tabs variant="line" items={[['output','Output'],['transcript','Transcript'],['subtitles','Subtitles']]} value={tab} onChange={setTab}/>
-    {tab==='output'&&<div className="outputs">
-     <button className="out-row" onClick={()=>void downloadVideo(job).catch(fail)}><Icon name="download"/><span><b>{job.has_khmer_voice?'Dubbed Video (MP4)':'Video (MP4)'}</b><small>{size(job.size_bytes)} source</small></span><Icon name="download" size={16}/></button>
-     <button className="out-row" disabled={!job.has_subtitles} onClick={()=>void downloadBlob('/api/jobs/'+job.id+'/subtitles',baseName(job.filename)+'-'+job.target_lang+'.srt').catch(fail)}><Icon name="file"/><span><b>Subtitles (SRT)</b><small>{job.has_subtitles?lang(job.target_lang):'Not generated in demo mode'}</small></span><Icon name="download" size={16}/></button>
-     <button className="out-row" disabled={!job.transcript&&!job.translation} onClick={()=>saveBlob(new Blob([transcriptTxt],{type:'text/plain;charset=utf-8'}),baseName(job.filename)+'-transcript.txt')}><Icon name="file"/><span><b>Transcript (TXT)</b><small>{lang(job.source_lang)} &amp; {lang(job.target_lang)}</small></span><Icon name="download" size={16}/></button>
-    </div>}
-    {tab==='transcript'&&<div className="transcript"><h4>{lang(job.source_lang)}</h4><p>{job.transcript||'No transcript'}</p><h4>{lang(job.target_lang)}</h4><p className="km">{job.translation||'No translation'}</p></div>}
-    {tab==='subtitles'&&<pre className="srt">{job.has_subtitles?(srt??'Loading…'):'No subtitle file for this job.'}</pre>}
-    <h3 className="sub">Job Info</h3>
-    <dl className="kv compact"><dt>Source</dt><dd>{sourceLabel(job.source_kind,job.capture_seconds)}</dd><dt>Duration</dt><dd>{fmt(duration)}</dd><dt>Created</dt><dd>{asDate(job.created_at)}</dd><dt>Mode</dt><dd>{job.processing_mode==='real_subtitles'?'Real':'Demo'}</dd></dl>
+  <Head title={greet+', '+ctx.userName.split(' ')[0]} sub={sub}>
+   <select className="select" value={range} onChange={e=>setRange(e.target.value)} aria-label="Date range"><option value="7">Last 7 days</option><option value="30">Last 30 days</option></select>
+   <button className="icon-btn" aria-label={'Notifications'+(ctx.unread?', '+ctx.unread+' new':'')} onClick={ctx.openBell}><Icon name="bell"/>{ctx.unread>0&&<i className="dot"/>}</button>
+   <NewBtn go={ctx.go}/>
+  </Head>
+  <Card title="Quick translate">
+   <form className="quick" onSubmit={e=>{e.preventDefault();void quick()}}>
+    <label className="input-icon"><Icon name="link"/><input value={link} onChange={e=>setLink(e.target.value)} placeholder="Paste a YouTube, MP4 or HLS link" aria-label="Video link"/></label>
+    <button className="btn btn-primary btn-lg" disabled={busy||!link.trim()}>{busy?'Starting…':'Translate'}</button>
+    <button type="button" className="btn btn-outline btn-lg" onClick={()=>ctx.go('/new?src=upload')}><Icon name="upload"/>Upload file</button>
+   </form>
+   <p className="hint">English → Khmer{real(ctx.models)&&ctx.models?.khmer_dubbing_enabled?', with dubbing and subtitles':real(ctx.models)?', with subtitles':' (demo mode — no AI processing)'}. Need other options? <a href="#/new">Open the full form</a>.</p>
+  </Card>
+  <div className="stats">
+   <div className="card pad stat"><small>Total jobs</small><b>{m.total}</b><span className="muted">All time</span></div>
+   <div className="card pad stat"><small>Completed</small><b>{m.completed}</b><span className="ok">{pct(m.completed)}% success rate</span></div>
+   <div className="card pad stat"><small>Processing</small><b>{m.processing+m.queued}</b><span className="info">{m.processing} running · {m.queued} queued</span></div>
+   <div className="card pad stat"><small>Failed</small><b>{m.failed}</b>{m.failed?<a className="bad" href="#/jobs?status=failed">Review failed jobs →</a>:<span className="muted">None</span>}</div>
+  </div>
+  <div className="grid2">
+   <Card title="In progress" extra={<a href="#/jobs?status=active">View all</a>}>
+    {active.slice(0,3).map(j=><button key={j.id} className="prog-row" onClick={()=>ctx.go('/job/'+j.id)}><Thumb/><span className="prog-body"><span className="prog-top"><b>{baseName(j.filename)}</b><em>{j.progress}%</em></span><Bar value={j.progress}/><small>{j.stage?j.stage.charAt(0).toUpperCase()+j.stage.slice(1):'Queued'}{timeLeft(j)&&' · '+timeLeft(j)}</small></span></button>)}
+    {!active.length&&<div className="empty-s"><Icon name="check"/>No jobs running. <a href="#/new">Start a translation</a></div>}
+   </Card>
+   <Card title="Needs attention" extra={failed.length?<span className="count-bad">{m.failed}</span>:undefined}>
+    {failed.map(j=><div key={j.id} className="attn"><Icon name="alert" size={20}/><div><b>{baseName(j.filename)}</b><p>{j.error||'The job failed.'}</p><div className="attn-act"><button className="btn btn-outline btn-sm" onClick={()=>void jobAction(ctx,j,'retry')}>Retry</button><button className="btn btn-ghost btn-sm" onClick={()=>ctx.go('/job/'+j.id)}>Details</button></div></div></div>)}
+    {!failed.length&&<div className="empty-s"><Icon name="check"/>Nothing needs your attention.</div>}
+   </Card>
+  </div>
+  <div className="grid2">
+   <Card title="Jobs per day">
+    <p className="hint top">{data[0].d.toLocaleDateString(undefined,{month:'short',day:'numeric'})} – {data[data.length-1].d.toLocaleDateString(undefined,{month:'short',day:'numeric'})}{busiest.v?' · busiest day was '+busiest.d.toLocaleDateString(undefined,{weekday:'long'})+' ('+busiest.v+')':''}</p>
+    <Bars data={data}/>
+   </Card>
+   <Card title="Where videos come from">
+    <div className="stack" aria-hidden="true">{sources.map(([l,v,c])=>v?<i key={l} className={c} style={{flexGrow:v}}/>:null)}{!total&&<i className="s3" style={{flexGrow:1}}/>}</div>
+    <ul className="src-list">{sources.map(([l,v,c])=><li key={l}><i className={c}/><span>{l}</span><em>{v} jobs</em><b>{total?Math.round(v*100/total):0}%</b></li>)}</ul>
+    {jobs.length>=100&&<p className="hint">Based on the 100 most recent jobs.</p>}
+   </Card>
+  </div>
+  <div className="sec-h"><h2>Recently completed</h2><a href="#/jobs?view=grid">Open library</a></div>
+  <div className="vgrid">{done.map(j=><VideoCard key={j.id} job={j} go={ctx.go}/>)}{!done.length&&<p className="muted">Finished videos will appear here.</p>}</div>
+ </>;
+}
+
+/* ================= New translation ================= */
+export function NewTranslation({ctx,initialSrc}:{ctx:Ctx;initialSrc?:string}){
+ const m=ctx.models;const isReal=real(m);
+ const [src,setSrc]=useState<'youtube'|'upload'|'url'>(initialSrc==='upload'?'upload':initialSrc==='url'?'url':'youtube');
+ const [yt,setYt]=useState(''),[info,setInfo]=useState<YouTubeInfo|null>(null),[infoState,setInfoState]=useState<'idle'|'loading'|'error'>('idle'),[infoErr,setInfoErr]=useState('');
+ const [file,setFile]=useState<File|null>(null),[fileDur,setFileDur]=useState<number|null>(null),[drag,setDrag]=useState(false);
+ const [url,setUrl]=useState(''),[seconds,setSeconds]=useState(30);
+ const [spoken,setSpoken]=useState<'en'|'km'>('en');
+ const [busy,setBusy]=useState(false),[pct,setPct]=useState<number|null>(null),[err,setErr]=useState('');
+ const input=useRef<HTMLInputElement>(null);
+ useEffect(()=>{if(initialSrc==='upload')setTimeout(()=>input.current?.click(),150)},[]);
+ // YouTube preview (debounced)
+ useEffect(()=>{setInfo(null);setInfoErr('');if(src!=='youtube'||!isYouTubeUrl(yt)){setInfoState('idle');return}
+  setInfoState('loading');let off=false;
+  const t=setTimeout(()=>{req<YouTubeInfo>('/api/youtube/info?url='+encodeURIComponent(yt.trim())).then(r=>{if(!off){setInfo(r);setInfoState('idle')}}).catch(e=>{if(!off){setInfoErr(errText(e).replace(/^\d+: /,''));setInfoState('error')}})},500);
+  return()=>{off=true;clearTimeout(t)}},[yt,src]);
+ const choose=(f?:File)=>{if(!f)return;if(!f.name.toLowerCase().endsWith('.mp4')){setErr('Only MP4 files are supported. Export your video as MP4 (H.264).');return}setErr('');setFile(f);setFileDur(null);
+  const v=document.createElement('video');v.preload='metadata';v.onloadedmetadata=()=>{setFileDur(v.duration);URL.revokeObjectURL(v.src)};v.src=URL.createObjectURL(f)};
+ const tgt=spoken==='en'?'km':'en';
+ const dub=isReal&&spoken==='en'&&!!m?.khmer_dubbing_enabled;
+ const missing=isReal&&(m?.subtitle_translation_configured===false||(dub&&!m?.speech_dubbing_available));
+ const ytOk=isYouTubeUrl(yt)&&infoState!=='error'&&!info?.is_live;
+ const urlOk=/^https?:\/\/.+/i.test(url.trim())&&!isYouTubeUrl(url);
+ const ready=src==='youtube'?ytOk:src==='upload'?!!file:urlOk;
+ const limit=m?.max_video_duration_seconds||600;
+ const length=src==='youtube'?(info?.duration?Math.min(info.duration,limit):null):src==='upload'?fileDur:seconds;
+ const estimate=length?(isReal?Math.max(1,Math.round(length*1.7/60)):1):null;
+ const outputs=[dub&&'Dubbing',isReal&&'SRT','Transcript'].filter(Boolean).join(', ');
+ let urlName='—';try{if(urlOk)urlName=new URL(url.trim()).pathname.split('/').pop()||'Video link'}catch{}
+ const title=src==='youtube'?(info?.title||(isYouTubeUrl(yt)?'YouTube video':'—')):src==='upload'?(file?baseName(file.name):'—'):urlName;
+ const submit=async()=>{setBusy(true);setErr('');
+  try{let id:string;
+   if(src==='upload'){setPct(0);id=await createUploadJob(file!,spoken,setPct)}
+   else id=await createUrlJob(src==='youtube'?yt:url,spoken,seconds);
+   ctx.notify('Translation started');void ctx.refresh();ctx.go('/job/'+id);
+  }catch(e){setErr(errText(e).replace(/^\d+: /,''))}finally{setBusy(false);setPct(null)}};
+ return <>
+  <Head crumb={<><a href="#/dashboard">Dashboard</a> / New translation</>} title="New translation" sub="Everything on one page. Defaults are filled in — most videos only need a source."/>
+  <div className="form-grid">
+   <div className="form-col">
+    <Card>
+     <h2 className="step-h"><span>1</span>Video source</h2>
+     <Seg label="Video source" value={src} onChange={setSrc} items={[['youtube','YouTube link'],['upload','Upload file'],['url','Video URL']]}/>
+     {src==='youtube'&&<>
+      <label className="field"><span>YouTube link</span><input value={yt} onChange={e=>setYt(e.target.value)} placeholder="https://www.youtube.com/watch?v=… or https://youtu.be/…" inputMode="url"/></label>
+      {yt.trim()&&!isYouTubeUrl(yt)&&<p className="field-err">That isn't a YouTube link. For MP4 or HLS files use “Video URL”.</p>}
+      {isYouTubeUrl(yt)&&<div className="preview">
+       <span className="pthumb">{info?.thumbnail?<img src={info.thumbnail} alt="" referrerPolicy="no-referrer"/>:null}{info?.duration!=null&&<em>{fmtDur(info.duration)}</em>}</span>
+       <div className="pinfo">{infoState==='loading'?<><span className="sk w60"/><span className="sk w40"/></>:infoState==='error'?<><b>Can't read this video</b><small className="bad">{infoErr}</small></>:info?<><b>{info.title}</b><small>{info.duration!=null&&fmtDur(info.duration)+' min'}{info.height?' · '+info.height+'p':''}{info.uploader?' · '+info.uploader:''}</small></>:null}</div>
+       {info&&!info.is_live&&<span className={info.trimmed_to_seconds?'pstate warn':'pstate ok'}><Icon name={info.trimmed_to_seconds?'warn':'check'} size={16}/>{info.trimmed_to_seconds?'First '+Math.round(info.trimmed_to_seconds/60)+' min will be used':'Ready'}</span>}
+       {info?.is_live&&<span className="pstate bad"><Icon name="x" size={16}/>Live streams aren't supported</span>}
+      </div>}
+     </>}
+     {src==='upload'&&<div className={'drop'+(drag?' drag':'')} role="button" tabIndex={0} onClick={()=>input.current?.click()} onKeyDown={e=>{if(e.key==='Enter'||e.key===' ')input.current?.click()}} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);choose(e.dataTransfer.files[0])}}>
+      <Icon name="upload" size={26}/>{file?<><b>{file.name}</b><span>{size(file.size)}{fileDur?' · '+fmtDur(fileDur):''} · click to replace</span></>:<><b>Drop an MP4 here or click to browse</b><span>H.264 video · longer videos are limited to {Math.round(limit/60)} min</span></>}
+      <input ref={input} type="file" accept=".mp4,video/mp4" hidden onChange={e=>choose(e.target.files?.[0])}/>
+     </div>}
+     {src==='url'&&<div className="row2">
+      <label className="field grow"><span>MP4 or HLS (.m3u8) link</span><input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://media.example.org/live/index.m3u8" inputMode="url"/></label>
+      <label className="field"><span>Record</span><select value={seconds} onChange={e=>setSeconds(Number(e.target.value))}>{[15,30,60,120].map(s=><option key={s} value={s}>{s} seconds</option>)}</select></label>
+     </div>}
+     {src==='url'&&url.trim()&&isYouTubeUrl(url)&&<p className="field-err">YouTube links go in the “YouTube link” tab.</p>}
+     {src==='url'&&<p className="hint">The host must be in the server's <code>STREAM_ALLOWED_HOSTS</code> allowlist.</p>}
+    </Card>
+    <Card>
+     <h2 className="step-h"><span>2</span>Language &amp; outputs</h2>
+     <div className="lang">
+      <label className="field"><span>Spoken language</span><select value={spoken} onChange={e=>setSpoken(e.target.value as 'en'|'km')}><option value="en">English</option><option value="km">Khmer (ខ្មែរ)</option></select></label>
+      <Icon name="arrowR" className="lang-arrow"/>
+      <label className="field"><span>Translate into</span><select value={tgt} onChange={e=>setSpoken(e.target.value==='km'?'en':'km')}><option value="km">Khmer (ខ្មែរ)</option><option value="en">English</option></select></label>
+     </div>
+     <p className="lbl">What you'll get</p>
+     <div className="opts">
+      <div className={'opt'+(dub?' on':' off')}><Icon name={dub?'check':'x'} size={16}/><div><b>Khmer dubbing</b><small>{dub?'Replaces the original voice with Khmer speech':spoken==='km'?'Khmer → English is subtitle-only':isReal?'Turned off on the server':'Not available in demo mode'}</small></div></div>
+      <div className={'opt'+(isReal?' on':' off')}><Icon name={isReal?'check':'x'} size={16}/><div><b>Subtitle file (SRT)</b><small>{isReal?'Also embedded as a subtitle track':'Not available in demo mode'}</small></div></div>
+      <div className="opt on"><Icon name="check" size={16}/><div><b>Bilingual transcript</b><small>{lang(spoken)} and {lang(tgt)}, as text</small></div></div>
+     </div>
+     <p className="hint">Outputs are decided by the server configuration ({isReal?'real AI mode':'demo mode'}); they can't be changed per job yet.</p>
+    </Card>
+    {dub&&<Card>
+     <h2 className="step-h"><span>3</span>Khmer voice</h2>
+     <div className="voice on"><div><b>MMS Khmer</b><small>facebook/mms-tts-khm · single voice · research licence (non-commercial)</small></div><Icon name="check"/></div>
+     <p className="hint">The dubbed track replaces the original audio — background music is not kept. Long lines are spoken faster so they fit their timing.</p>
+    </Card>}
+   </div>
+   <aside className="card pad summary">
+    <h2>Summary</h2>
+    <dl>
+     <dt>Video</dt><dd title={title}>{title}</dd>
+     <dt>Length</dt><dd>{length?fmtDur(length):'—'}</dd>
+     <dt>Language</dt><dd>{lang(spoken)} → {lang(tgt)}</dd>
+     <dt>Outputs</dt><dd>{outputs}</dd>
+     <dt>Voice</dt><dd>{dub?'MMS Khmer':'—'}</dd>
+    </dl>
+    {estimate&&<div className="eta"><Icon name="clock"/><div><b>Ready in about {estimate} minute{estimate===1?'':'s'}</b><small>You can leave this page — the job keeps running.</small></div></div>}
+    {missing&&<div className="alert alert-err">AI models are missing on the server. Install them before starting.</div>}
+    {err&&<div className="alert alert-err" role="alert">{err}</div>}
+    {pct!==null&&<div className="upl"><span>Uploading {pct}%</span><Bar value={pct}/></div>}
+    <button className="btn btn-primary btn-lg btn-block" disabled={!ready||busy||missing} onClick={()=>void submit()}>{busy?(pct!==null?'Uploading…':'Starting…'):'Start translation'}</button>
+    {!ready&&<p className="hint center">{src==='upload'?'Choose a video to continue.':'Paste a link to continue.'}</p>}
+   </aside>
+  </div>
+ </>;
+}
+
+/* ================= Job: in progress / review ================= */
+const stageLog=new Map<string,{t:Date;msg:string}[]>();
+function record(j:Job){const log=stageLog.get(j.id)||[];const msg=j.stage||j.status;if(!log.length||log[log.length-1].msg!==msg){log.push({t:new Date(),msg});stageLog.set(j.id,log.slice(-50))}}
+type StepState='done'|'run'|'next'|'wait'|'fail'|'skip';
+function stepsFor(j:Job,dub:boolean){
+ const p=j.progress||0,done=j.status==='completed',stopped=isFailed(j.status)||j.status==='cancelled';
+ const acq=j.source_kind==='url'?15:25;
+ const defs:[string,number,number,boolean][]=[['Download',0,acq,true],['Transcribe',acq,65,true],['Translate',45,65,true],['Khmer voice',70,85,dub],['Sync audio',65,dub?70:85,true],['Render video',85,101,true]];
+ let nextSet=false;
+ return defs.map(([title,s,e,applies])=>{
+  let state:StepState;
+  if(!applies)state='skip';
+  else if(done||p>=e||(title==='Sync audio'&&dub&&p>=85))state='done';
+  else if(p>=s)state=stopped?'fail':'run';
+  else if(!nextSet&&!stopped){state='next';nextSet=true}
+  else state='wait';
+  return {title,state};
+ });
+}
+export function JobPage({ctx,id}:{ctx:Ctx;id:string}){
+ const [job,setJob]=useState<Job|null>(null),[err,setErr]=useState(''),[forceProgress,setForceProgress]=useState(false);
+ const load=async()=>{try{const j=await req<Job>('/api/jobs/'+id);record(j);setJob(j);setErr('')}catch(e){setErr(errText(e))}};
+ useEffect(()=>{setJob(null);setForceProgress(false);void load()},[id]);
+ useEffect(()=>{if(!job||!isActive(job.status))return;const t=setInterval(()=>void load(),2500);return()=>clearInterval(t)},[job?.status,id]);
+ if(err&&!job)return <><Head crumb={<><a href="#/jobs">Jobs</a> / {id.slice(0,8)}</>} title="Job not found"/><div className="alert alert-err">{err}</div></>;
+ if(!job)return <div className="card pad"><span className="sk w60"/><span className="sk w40"/></div>;
+ if(job.status==='completed'&&!forceProgress)return <Review ctx={ctx} job={job} onPipeline={()=>setForceProgress(true)}/>;
+ return <Progress ctx={ctx} job={job} reload={load} onResult={job.status==='completed'?()=>setForceProgress(false):undefined}/>;
+}
+function jobMeta(j:Job,extra?:string){return [srcName(j),j.capture_seconds&&j.source_kind!=='youtube'?j.capture_seconds+' s capture':'',lang(j.source_lang)+' → '+lang(j.target_lang),outputsLabel(j),extra].filter(Boolean).join(' · ')}
+function Progress({ctx,job,reload,onResult}:{ctx:Ctx;job:Job;reload:()=>Promise<void>;onResult?:()=>void}){
+ const dub=job.processing_mode==='real_subtitles'&&job.target_lang==='km'&&(job.has_khmer_voice||!!ctx.models?.khmer_dubbing_enabled);
+ const steps=stepsFor(job,dub);const applicable=steps.filter(s=>s.state!=='skip');
+ const curIdx=applicable.findIndex(s=>s.state==='run'||s.state==='fail');
+ const cur=curIdx>=0?applicable[curIdx]:null;
+ const log=stageLog.get(job.id)||[];
+ const stopped=isFailed(job.status)||job.status==='cancelled';
+ const heading=job.status==='completed'?'All steps finished':stopped?(job.status==='cancelled'?'Cancelled':'Stopped at '+(cur?.title||'a step')):cur?'Step '+(curIdx+1)+' of '+applicable.length+' — '+(job.stage?job.stage.charAt(0).toUpperCase()+job.stage.slice(1):cur.title):'Waiting for a worker';
+ const lines=(job.translation||'').trim();
+ return <>
+  <Head crumb={<><a href="#/jobs">Jobs</a> / {shortId(job.id)}</>} title={<>{baseName(job.filename)} <span className="head-badge"><Badge status={job.status}/></span></>} sub={jobMeta(job,'Started '+asDate(job.created_at))}>
+   {onResult&&<button className="btn btn-outline" onClick={onResult}>View result</button>}
+   {isActive(job.status)?<button className="btn btn-outline btn-danger-text" disabled={job.status==='cancelling'} onClick={()=>void jobAction(ctx,job,'cancel',reload)}>{job.status==='cancelling'?'Cancelling…':'Cancel job'}</button>:stopped&&<button className="btn btn-primary" onClick={()=>void jobAction(ctx,job,'retry',reload)}><Icon name="refresh"/>Retry</button>}
+  </Head>
+  <Card>
+   <div className="pg-head"><h2>{heading}</h2><span><b>{job.progress}%</b>{timeLeft(job)&&' · '+timeLeft(job)}</span></div>
+   <Bar value={job.progress} kind={stopped?'bad':job.status==='completed'?'ok':''}/>
+   <ol className="steps">{steps.map(s=><li key={s.title} className={'st-'+s.state}>
+    <span className="st-state">{s.state==='done'?<><Icon name="check" size={14}/>Done</>:s.state==='run'?<><span className="spin"/>Running</>:s.state==='fail'?<><Icon name="x" size={14}/>Stopped</>:s.state==='next'?'Up next':s.state==='skip'?'Not used':'Waiting'}</span>
+    <b>{s.title}</b>
+    <small>{s.state==='run'?(job.stage||''):s.state==='skip'?(job.target_lang==='km'?'Dubbing is off':'Subtitle-only'):''}</small>
+   </li>)}</ol>
+   {job.error&&<div className="alert alert-err"><b>What went wrong:</b> {job.error}</div>}
+  </Card>
+  <div className="grid2">
+   <Card title="Translation preview" extra={<span className="hint">Lines appear as they're ready</span>}>
+    {lines?<div className="tp"><p className="tp-en">{job.transcript}</p><p className="tp-km km">{job.translation}</p></div>
+     :<div className="tp-wait"><span className="sk w80"/><span className="sk w60"/><span className="sk w70"/><p className="hint">{job.source_kind==='url'?'Captions appear after each recorded chunk.':'The transcript appears once speech recognition and translation finish.'}</p></div>}
+   </Card>
+   <Card title="Activity">
+    <ul className="activity">{[...log].reverse().map((l,i)=><li key={i}><time>{asTime(l.t)}</time><span>{l.msg.charAt(0).toUpperCase()+l.msg.slice(1)}</span></li>)}<li><time>{job.created_at?asTime(new Date(job.created_at)):''}</time><span>Job created</span></li></ul>
+    <details className="tech"><summary>Technical details</summary><dl><dt>Job ID</dt><dd className="mono">{job.id}</dd><dt>Mode</dt><dd>{job.processing_mode==='real_subtitles'?'Real AI':'Demo'}</dd><dt>Source size</dt><dd>{size(job.size_bytes)}</dd><dt>Last update</dt><dd>{asDate(job.updated_at)}</dd></dl></details>
+   </Card>
+  </div>
+ </>;
+}
+type Line={start:string;text:string};
+function parseSrt(s:string):Line[]{
+ return s.replace(/\r/g,'').split(/\n\n+/).map(b=>{const ls=b.trim().split('\n');const ti=ls.findIndex(l=>l.includes('-->'));if(ti<0)return null;
+  const st=ls[ti].split('-->')[0].trim().replace(/,\d+$/,'').replace(/^00:/,'');return {start:st,text:ls.slice(ti+1).join(' ')}}).filter((x):x is Line=>!!x&&!!x.text);
+}
+function Review({ctx,job,onPipeline}:{ctx:Ctx;job:Job;onPipeline:()=>void}){
+ const {p,err}=usePlayback(job);
+ const [lines,setLines]=useState<Line[]|null>(null),[q,setQ]=useState(''),[dur,setDur]=useState<number|null>(null);
+ const video=useRef<HTMLVideoElement>(null);
+ useEffect(()=>{setLines(null);if(!job.has_subtitles)return;(async()=>{try{const h:Record<string,string>={};const k=getApiKey();if(k)h['X-API-Key']=k;const r=await fetch('/api/jobs/'+job.id+'/subtitles',{headers:h});setLines(r.ok?parseSrt(await r.text()):[])}catch{setLines([])}})()},[job.id]);
+ const fail=(e:unknown)=>ctx.notify(errText(e),'err');
+ const txt=`${lang(job.source_lang)}\n\n${job.transcript||''}\n\n${lang(job.target_lang)}\n\n${job.translation||''}\n`;
+ const seek=(t:string)=>{const s=t.split(':').map(Number).reduce((a,b)=>a*60+b,0);if(video.current){video.current.currentTime=s;void video.current.play().catch(()=>{})}};
+ const shown=(lines||[]).filter(l=>!q||l.text.toLowerCase().includes(q.toLowerCase()));
+ const share=async()=>{try{await navigator.clipboard.writeText(location.origin+'/#/job/'+job.id);ctx.notify('Link copied — people need access to this workspace to open it')}catch{ctx.notify('Could not copy the link','err')}};
+ return <>
+  <Head crumb={<><a href="#/jobs">Jobs</a> / {shortId(job.id)}</>} title={<>{baseName(job.filename)} <span className="head-badge"><span className="badge badge-ok"><Icon name="check" size={13}/>Completed</span></span></>} sub={jobMeta(job,(dur?fmtDur(dur)+' · ':'')+'Finished '+asDate(job.updated_at))}>
+   <button className="btn btn-outline" onClick={onPipeline}>Pipeline</button>
+   <button className="btn btn-outline" onClick={()=>void share()}><Icon name="share"/>Share</button>
+   <button className="btn btn-primary" onClick={()=>void downloadVideo(job).catch(fail)}><Icon name="download"/>Download video</button>
+  </Head>
+  <div className="review">
+   <div className="review-l">
+    <div className="player">{p?<video ref={video} controls playsInline preload="metadata" src={p.video_url} onLoadedMetadata={e=>setDur(e.currentTarget.duration)} aria-label="Translated video">{p.captions_url&&<track kind="subtitles" default srcLang={job.target_lang} label={lang(job.target_lang)} src={p.captions_url}/>}</video>:<div className="player-empty"><Icon name="play" size={34}/><small>{err||'Loading secure preview…'}</small></div>}</div>
+    {job.processing_mode==='demo'&&<p className="hint">Demo output — the original audio is unchanged and no translation was performed.</p>}
+    <Card title="Downloads">
+     <div className="dl">
+      <button className="dl-i" onClick={()=>void downloadVideo(job).catch(fail)}><Icon name="download" size={20}/><span><b>{job.has_khmer_voice?'Dubbed video':'Video'}</b><small>MP4{dur?' · '+fmtDur(dur):''}</small></span></button>
+      <button className="dl-i" disabled={!job.has_subtitles} onClick={()=>void downloadBlob('/api/jobs/'+job.id+'/subtitles',baseName(job.filename)+'-'+job.target_lang+'.srt').catch(fail)}><Icon name="download" size={20}/><span><b>{lang(job.target_lang)} subtitles</b><small>{job.has_subtitles?'SRT':'Not created in demo mode'}</small></span></button>
+      <button className="dl-i" disabled={!job.transcript&&!job.translation} onClick={()=>saveBlob(new Blob([txt],{type:'text/plain;charset=utf-8'}),baseName(job.filename)+'-transcript.txt')}><Icon name="download" size={20}/><span><b>Transcript</b><small>TXT · {lang(job.source_lang)} &amp; {lang(job.target_lang)}</small></span></button>
+     </div>
+    </Card>
+   </div>
+   <section className="card lines-card">
+    <div className="card-h pad-x pt"><h2>Translation{lines?' · '+lines.length+' lines':''}</h2></div>
+    {job.has_subtitles?<>
+     <div className="pad-x"><label className="input-icon"><Icon name="search"/><input placeholder={'Search '+lang(job.target_lang)} value={q} onChange={e=>setQ(e.target.value)} aria-label="Search subtitles"/></label></div>
+     <ol className="lines">{lines===null?<li><span className="sk w80"/></li>:shown.map((l,i)=><li key={i}><button className="ts" onClick={()=>seek(l.start)} title="Play from here">{l.start}</button><p className={job.target_lang==='km'?'km':''}>{l.text}</p></li>)}{lines&&!shown.length&&<li className="muted">No matching lines.</li>}</ol>
+     <p className="lines-foot">Click a time to jump there. Line editing isn't available yet — download the SRT to edit.</p>
+    </>:<div className="pad"><div className="tp"><p className="tp-en">{job.transcript||'No transcript'}</p><p className="tp-km km">{job.translation||''}</p></div></div>}
    </section>
   </div>
  </>;
 }
 
-/* ---------- 7. My Jobs ---------- */
-export function JobTable({jobs,go,onAction}:{jobs:Job[];go:(p:string)=>void;onAction?:(j:Job,w:'cancel'|'retry')=>void}){
- return <div className="table-wrap"><table className="table"><thead><tr><th>#</th><th>Title</th><th>Source</th><th>Language</th><th>Status</th><th>Progress</th><th>Created</th>{onAction&&<th/>}</tr></thead><tbody>
-  {jobs.map(j=><tr key={j.id} onClick={()=>go('/job/'+j.id)} tabIndex={0} onKeyDown={e=>{if(e.key==='Enter')go('/job/'+j.id)}}>
-   <td className="mono">{shortId(j.id)}</td><td className="title-cell" title={j.filename}>{baseName(j.filename)}</td>
-   <td><span className={'src-ico '+(j.source_kind==='youtube'?'yt':j.source_kind==='url'?'url':'up')} title={sourceLabel(j.source_kind)}><Icon name={j.source_kind==='youtube'?'play':j.source_kind==='url'?'link':'upload'} size={15}/></span></td>
-   <td>{j.source_lang.toUpperCase()} → {j.target_lang.toUpperCase()}</td>
-   <td><Badge status={j.status}/></td>
-   <td><div className="prog-cell"><Progress value={j.progress} kind={j.status==='completed'?'':isFailed(j.status)?'red':''}/><span>{isFailed(j.status)||j.status==='cancelled'?'—':j.progress+'%'}</span></div></td>
-   <td className="muted nowrap">{asDate(j.created_at)}</td>
-   {onAction&&<td onClick={e=>e.stopPropagation()}>{j.has_output?<button className="btn btn-xs" title="Download MP4" onClick={()=>void downloadVideo(j)}><Icon name="download" size={14}/></button>:isActive(j.status)?<button className="btn btn-xs" disabled={j.status==='cancelling'} onClick={()=>onAction(j,'cancel')}>Cancel</button>:<button className="btn btn-xs" onClick={()=>onAction(j,'retry')}>Retry</button>}</td>}
-  </tr>)}
-  {!jobs.length&&<tr><td colSpan={8}><div className="empty"><b>No jobs yet</b><span>Start a new translation to see it here.</span><button className="btn btn-primary" onClick={()=>go('/new')}>New Translation</button></div></td></tr>}
- </tbody></table></div>;
-}
-export function MyJobs({ctx}:{ctx:Ctx}){
- const [filter,setFilter]=useState<'all'|'active'|'completed'|'failed'>('all');
- const [q,setQ]=useState(''),[search,setSearch]=useState(''),[offset,setOffset]=useState(0),[limit,setLimit]=useState(10);
- const [data,setData]=useState<{items:Job[];total:number}>({items:[],total:0}),[loading,setLoading]=useState(true);
- const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),status:filter});if(search)p.set('search',search);setData(await req('/api/jobs?'+p))}catch(e){ctx.notify(String(e instanceof Error?e.message:e),'err')}finally{setLoading(false)}};
- useEffect(()=>{void load()},[filter,search,offset,limit]);
- useEffect(()=>{const t=window.setInterval(()=>void load(),6000);return()=>clearInterval(t)},[filter,search,offset,limit]);
- useEffect(()=>{const t=window.setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
- const m=ctx.metrics;const pages=Math.max(1,Math.ceil(data.total/limit));const page=Math.floor(offset/limit)+1;
- const action=async(j:Job,w:'cancel'|'retry')=>{if(w==='cancel'&&!window.confirm('Cancel '+j.filename+'?'))return;try{await req('/api/jobs/'+j.id+'/'+w,{method:'POST'});ctx.notify(w==='cancel'?'Cancellation requested':'Job re-queued');void load();void ctx.refresh()}catch(e){ctx.notify(String(e instanceof Error?e.message:e),'err')}};
- const nums=Array.from(new Set([1,page-1,page,page+1,pages].filter(n=>n>=1&&n<=pages))).sort((a,b)=>a-b);
+/* ================= Jobs (with library grid) ================= */
+export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
+ const initial=query.get('status')||'';
+ const [status,setStatus]=useState<'all'|'active'|'completed'|'failed'>((['active','completed','failed'].includes(initial)?initial:'all') as 'all');
+ const [view,setView]=useState<'list'|'grid'>(query.get('view')==='grid'?'grid':'list');
+ const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[offset,setOffset]=useState(0);
+ const limit=view==='grid'?12:10;
+ const [data,setData]=useState<{items:Job[];total:number}|null>(null);
+ const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),status:view==='grid'&&status==='all'?'completed':status,source});if(search)p.set('search',search);setData(await req('/api/jobs?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[status,search,source,offset,view]);
+ useEffect(()=>{const t=setInterval(()=>void load(),6000);return()=>clearInterval(t)},[status,search,source,offset,view]);
+ useEffect(()=>{const t=setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
+ const m=ctx.metrics;
  return <>
-  <PageHead title="My Jobs" sub="Manage and track all translation jobs"><button className="btn btn-primary" onClick={()=>ctx.go('/new')}><Icon name="plus" size={16}/>New Translation</button></PageHead>
-  <section className="card">
-   <div className="toolbar"><Tabs items={[['all',`All (${m.total})`],['active',`Processing (${m.processing+m.queued})`],['completed',`Completed (${m.completed})`],['failed',`Failed (${m.failed})`]]} value={filter} onChange={v=>{setFilter(v);setOffset(0)}}/>
-    <label className="search"><Icon name="search" size={16}/><input placeholder="Search by title or job ID" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search jobs"/></label></div>
-   {loading?<div className="pad"><div className="skeleton-block"/></div>:<JobTable jobs={data.items} go={ctx.go} onAction={(j,w)=>void action(j,w)}/>}
-   <div className="pager"><label>Rows per page <select value={limit} onChange={e=>{setLimit(Number(e.target.value));setOffset(0)}}>{[10,25,50].map(n=><option key={n}>{n}</option>)}</select></label>
-    <div><button aria-label="Previous page" disabled={page<=1} onClick={()=>setOffset(offset-limit)}>‹</button>{nums.map((n,i)=><React.Fragment key={n}>{i>0&&n-nums[i-1]>1&&<span>…</span>}<button className={n===page?'active':''} onClick={()=>setOffset((n-1)*limit)}>{n}</button></React.Fragment>)}<button aria-label="Next page" disabled={page>=pages} onClick={()=>setOffset(offset+limit)}>›</button></div></div>
-  </section>
+  <Head title="Jobs" sub="Every translation, in progress or finished. Switch to grid to browse finished videos."><NewBtn go={ctx.go}/></Head>
+  <div className="toolbar">
+   <Seg label="Status" value={status} onChange={v=>{setStatus(v);setOffset(0)}} items={[['all',<>All <em>{m.total}</em></>],['active',<>In progress <em>{m.processing+m.queued}</em></>],['completed',<>Completed <em>{m.completed}</em></>],['failed',<>Failed <em>{m.failed}</em></>]]}/>
+   <div className="toolbar-r">
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search title or ID" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search jobs"/></label>
+    <select className="select" value={source} onChange={e=>{setSource(e.target.value);setOffset(0)}} aria-label="Source"><option value="all">All sources</option><option value="youtube">YouTube</option><option value="upload">Upload</option><option value="url">Video link</option></select>
+    <Seg label="View" value={view} onChange={v=>{setView(v);setOffset(0)}} items={[['list',<Icon name="list" key="l"/>],['grid',<Icon name="grid" key="g"/>]]}/>
+   </div>
+  </div>
+  {view==='list'?<section className="card">
+   <div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Source</th><th>Status</th><th>Created</th><th><span className="sr">Action</span></th></tr></thead><tbody>
+    {data?.items.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}>
+     <td><div className="vcell"><Thumb label={j.source_lang.toUpperCase()+'→'+j.target_lang.toUpperCase()}/><div><b title={j.filename}>{baseName(j.filename)}</b><small>{shortId(j.id)} · {outputsLabel(j)}</small></div></div></td>
+     <td>{sourceLabel(j.source_kind,j.capture_seconds)}</td>
+     <td><div className="scell"><Badge status={j.status}/>{isActive(j.status)&&j.status!=='queued'&&<><Bar value={j.progress}/><small>{j.stage||''} · {j.progress}%</small></>}{j.status==='queued'&&<small>Waiting for a worker</small>}{isFailed(j.status)&&<small className="clip" title={j.error||''}>{j.error||'Failed'}</small>}</div></td>
+     <td className="nowrap">{asDate(j.created_at)}</td>
+     <td className="act" onClick={e=>e.stopPropagation()}>{isFailed(j.status)||j.status==='cancelled'?<button className="btn btn-outline btn-sm" onClick={()=>void jobAction(ctx,j,'retry',load)}>Retry</button>:<button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/job/'+j.id)}>{j.status==='completed'?'Open':'View'}</button>}</td>
+    </tr>)}
+    {data&&!data.items.length&&<tr><td colSpan={5}><div className="empty"><b>No jobs match</b><span>Try another filter, or start a new translation.</span></div></td></tr>}
+    {!data&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
+   </tbody></table></div>
+   <Pager data={data} offset={offset} limit={limit} setOffset={setOffset}/>
+  </section>:<>
+   <div className="vgrid">{data?.items.map(j=>j.has_output?<VideoCard key={j.id} job={j} go={ctx.go}/>:<button key={j.id} className="vcard" onClick={()=>ctx.go('/job/'+j.id)}><span className="vthumb"><span className="vplay"><Icon name="play" size={14}/></span></span><span className="vmeta"><b>{baseName(j.filename)}</b><small><Badge status={j.status}/></small></span></button>)}</div>
+   {data&&!data.items.length&&<div className="card pad empty"><b>No finished videos yet</b></div>}
+   <Pager data={data} offset={offset} limit={limit} setOffset={setOffset} bare/>
+  </>}
  </>;
 }
-
-/* ---------- 8. Video Library ---------- */
-function LibraryCard({job,go,grid}:{job:Job;go:(p:string)=>void;grid:boolean}){
- const {p}=usePlayback(job);const [dur,setDur]=useState<number|null>(null);
- return <button className={'lib-card'+(grid?'':' row')} onClick={()=>go('/job/'+job.id)}>
-  <div className="lib-thumb"><VideoThumb job={job}/>{p&&<video muted preload="metadata" src={p.video_url+'#t=1'} onLoadedMetadata={e=>setDur(e.currentTarget.duration)}/>}<span className="thumb-play"><Icon name="play" size={16}/></span>{dur!=null&&<em>{Math.floor(dur/60).toString().padStart(2,'0')}:{Math.floor(dur%60).toString().padStart(2,'0')}</em>}</div>
-  <div className="lib-meta"><b title={job.filename}>{baseName(job.filename)}</b><small>{shortId(job.id)} · {asDate(job.created_at)}</small><small>{job.has_khmer_voice?'Khmer dubbed':job.has_subtitles?'Subtitled':'Demo'} · {job.source_lang.toUpperCase()}→{job.target_lang.toUpperCase()}</small></div>
- </button>;
-}
-export function Library({ctx}:{ctx:Ctx}){
- const [q,setQ]=useState(''),[grid,setGrid]=useState(true);
- const items=ctx.jobs.filter(j=>j.status==='completed'&&j.has_output&&(!q||j.filename.toLowerCase().includes(q.toLowerCase())));
- return <>
-  <PageHead title="Video Library" sub="Manage your translated videos"/>
-  <section className="card pad">
-   <div className="toolbar flat"><label className="search"><Icon name="search" size={16}/><input placeholder="Search videos…" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search videos"/></label><div className="seg"><button aria-label="Grid view" className={grid?'active':''} onClick={()=>setGrid(true)}><Icon name="grid" size={16}/></button><button aria-label="List view" className={!grid?'active':''} onClick={()=>setGrid(false)}><Icon name="list" size={16}/></button></div></div>
-   <div className={grid?'lib-grid':'lib-list'}>{items.map(j=><LibraryCard key={j.id} job={j} go={ctx.go} grid={grid}/>)}</div>
-   {!items.length&&<div className="empty"><b>No translated videos yet</b><span>Completed jobs with an output video appear here.</span></div>}
-  </section>
- </>;
+function Pager({data,offset,limit,setOffset,bare}:{data:{total:number;items:Job[]}|null;offset:number;limit:number;setOffset:(n:number)=>void;bare?:boolean}){
+ if(!data)return null;
+ return <div className={'pager'+(bare?' bare':'')}><span>Showing {data.total?offset+1:0}–{offset+data.items.length} of {data.total}</span><div><button className="btn btn-outline btn-sm" disabled={offset===0} onClick={()=>setOffset(Math.max(0,offset-limit))}>Previous</button><button className="btn btn-outline btn-sm" disabled={offset+limit>=data.total} onClick={()=>setOffset(offset+limit)}>Next</button></div></div>;
 }
 
-/* ---------- 9. AI Models ---------- */
-export function Models({ctx}:{ctx:Ctx}){
- const m=ctx.models;const real=isReal(m);
- const [help,setHelp]=useState(false);
- const st=(ok:boolean|undefined,off?:boolean)=>!real?['Demo stub','badge-wait']:off?['Disabled','badge-muted']:ok?['Ready','badge-ok']:['Not installed','badge-bad'];
- const rows:[string,string,string,string[]][]=[
-  ['Whisper (ASR)','mic','faster-whisper · models/asr',st(m?.subtitle_translation_configured)],
-  ['M2M100 (MT)','translate','facebook/m2m100 · models/mt',st(m?.subtitle_translation_configured)],
-  ['Khmer TTS (MMS)','voice','facebook/mms-tts-khm · models/tts',st(m?.speech_dubbing_available,!m?.khmer_dubbing_enabled)],
+/* ================= System health & models ================= */
+const SVC:[string,string,string][]=[['api','API','FastAPI'],['database','Database','PostgreSQL'],['redis','Cache','Redis'],['storage','File storage','MinIO'],['worker','Job workers','Celery']];
+export function System({ctx}:{ctx:Ctx}){
+ const s=ctx.system?.services||{},lat=ctx.system?.latency_ms||{},h=ctx.system?.host,m=ctx.models;
+ const down=SVC.filter(([k])=>s[k]==='offline'),unknown=SVC.filter(([k])=>!s[k]||s[k]==='unknown');
+ const pct=(u?:number|null,t?:number|null)=>u!=null&&t?u*100/t:null;
+ const res:[string,number|null,string][]=[
+  ['CPU (load)',h?.cpu_percent??null,h?.cpu_percent!=null?h.cpu_percent+'%':'—'],
+  ['Memory',pct(h?.memory_used_bytes,h?.memory_total_bytes),h?.memory_used_bytes!=null?size(h.memory_used_bytes)+' of '+size(h.memory_total_bytes):'—'],
+  ['Disk',pct(h?.disk_used_bytes,h?.disk_total_bytes),h?.disk_used_bytes!=null?size(h.disk_used_bytes)+' of '+size(h.disk_total_bytes):'—'],
  ];
+ const isReal=real(m);
+ const modelRow=(step:string,comp:string,ok:boolean|undefined,off?:boolean)=>{const inst=m?.installed?.[comp];const st=!isReal?['Demo','muted']:off?['Off','muted']:ok?['Ready','ok']:['Missing','bad'];
+  return <tr key={comp}><td><b>{step}</b></td><td>{inst?<><span>{inst.id.split('/').pop()}</span><small className="mono">{inst.id}</small></>:<span className="muted">Not installed</span>}</td><td>{inst?.license?<span className={inst.license.includes('nc')?'lic nc':'lic'}>{inst.license.toUpperCase()}</span>:'—'}</td><td><span className={'badge badge-'+st[1]}>{st[0]}</span></td></tr>};
  return <>
-  <PageHead title="AI Models" sub="Manage and monitor AI models"><span className={'mode-pill '+(real?'real':'demo')}>{real?'MODEL_MODE=real_subtitles':'MODEL_MODE=demo'}</span></PageHead>
-  <section className="card pad">
-   {rows.map(([name,ic,path,[s,cls]])=><div className="model-row" key={name}><span className="model-ico"><Icon name={ic} size={22}/></span><div><b>{name}</b><small>{path}</small></div><span className={'badge '+cls}>{s==='Ready'&&<Icon name="check" size={13}/>}{s}</span></div>)}
-   {m?.note&&<p className="muted small">{m.note}{' '}TTS weights are CC-BY-NC 4.0 (non-commercial).</p>}
-   <div className="center"><button className="btn btn-primary" onClick={()=>setHelp(v=>!v)}><Icon name="download" size={16}/>Download / Update Models</button></div>
-   {help&&<div className="code-help"><p>Model weights are installed on the server, not from the browser. On the host run:</p><pre>python3 scripts/download-models.py{'\n'}scripts/verify-local-models.sh{'\n'}docker compose -f compose.yaml -f compose.real.yaml up -d --build</pre></div>}
+  <Head title="System health" sub="Services, server resources and the AI models behind each step. Refreshes every few seconds."><button className="btn btn-outline" onClick={()=>void ctx.refresh()}><Icon name="refresh"/>Refresh now</button></Head>
+  <div className={'banner '+(down.length?'bad':unknown.length?'warn':'ok')}><Icon name={down.length?'alert':'check'} size={22}/><div><b>{down.length?down.map(d=>d[1]).join(', ')+(down.length>1?' are':' is')+' offline':unknown.length?'Most services are running · '+unknown.map(u=>u[1]).join(', ')+' not responding to pings':'All 5 services are running normally'}</b><span>{isReal?'Real AI mode':'Demo mode'} · {m?.installed&&Object.keys(m.installed).length?Object.keys(m.installed).length+' models installed':'no models installed'}</span></div></div>
+  <div className="grid2">
+   <Card title="Services">
+    <ul className="svc">{SVC.map(([k,n,sub])=>{const v=s[k]||'unknown';return <li key={k}><i className={'sdot '+v}/><div><b>{n}</b><small>{sub}</small></div><em>{lat[k]!=null&&v==='online'?lat[k]+' ms':'—'}</em><span className={'badge badge-'+(v==='online'?'ok':v==='offline'?'bad':'muted')}>{v==='online'?'Healthy':v==='offline'?'Offline':'Unknown'}</span></li>})}</ul>
+   </Card>
+   <Card title="Resources">
+    {res.map(([n,v,label])=><div className="res" key={n}><div><span>{n}</span><b>{label}</b></div><Bar value={v??0} kind={v!=null&&v>85?'warn':''}/></div>)}
+    <p className="hint">Measured inside the API container.</p>
+   </Card>
+  </div>
+  <section className="card">
+   <div className="card-h pad-x pt"><div><h2>AI models</h2><p className="hint top">One model per pipeline step, loaded offline from <code>models/</code>.</p></div></div>
+   <div className="table-wrap"><table className="table"><thead><tr><th>Step</th><th>Model</th><th>Licence</th><th>Status</th></tr></thead><tbody>
+    {modelRow('Transcribe','asr',m?.subtitle_translation_configured)}
+    {modelRow('Translate','mt',m?.subtitle_translation_configured)}
+    {modelRow('Khmer voice','tts',m?.speech_dubbing_available,!m?.khmer_dubbing_enabled)}
+   </tbody></table></div>
+   <p className="hint pad-x pb">To add or update models run <code>python3 scripts/download-models.py</code> on the server, then restart the worker.</p>
   </section>
  </>;
 }
 
-/* ---------- Datasets (parallel text gathered from finished jobs) ---------- */
+/* ================= Datasets ================= */
 export function Datasets({ctx}:{ctx:Ctx}){
  const rows=ctx.jobs.filter(j=>j.status==='completed'&&j.transcript&&j.translation&&j.processing_mode==='real_subtitles');
  const exportJsonl=()=>saveBlob(new Blob([rows.map(j=>JSON.stringify({job_id:j.id,source_lang:j.source_lang,target_lang:j.target_lang,source:j.transcript,target:j.translation})).join('\n')+'\n'],{type:'application/jsonl'}),'khmerlive-parallel-text.jsonl');
  return <>
-  <PageHead title="Datasets" sub="Parallel EN ⇔ KM text produced by completed real-mode jobs"><button className="btn btn-primary" disabled={!rows.length} onClick={exportJsonl}><Icon name="download" size={16}/>Export JSONL</button></PageHead>
-  <section className="card">
-   <div className="table-wrap"><table className="table"><thead><tr><th>#</th><th>Title</th><th>Pair</th><th>Source text</th><th>Translation</th></tr></thead><tbody>
-    {rows.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}><td className="mono">{shortId(j.id)}</td><td className="title-cell">{baseName(j.filename)}</td><td>{j.source_lang.toUpperCase()}→{j.target_lang.toUpperCase()}</td><td className="clip">{j.transcript}</td><td className="clip km">{j.translation}</td></tr>)}
-    {!rows.length&&<tr><td colSpan={5}><div className="empty"><b>No parallel text yet</b><span>Demo-mode jobs produce placeholder text and are excluded.</span></div></td></tr>}
-   </tbody></table></div>
-  </section>
+  <Head title="Datasets" sub="Parallel English ⇔ Khmer text produced by finished real-mode jobs."><button className="btn btn-primary" disabled={!rows.length} onClick={exportJsonl}><Icon name="download"/>Export JSONL</button></Head>
+  <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Pair</th><th>Source text</th><th>Translation</th></tr></thead><tbody>
+   {rows.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}><td><b>{baseName(j.filename)}</b><small className="mono">{shortId(j.id)}</small></td><td>{j.source_lang.toUpperCase()}→{j.target_lang.toUpperCase()}</td><td className="clip">{j.transcript}</td><td className="clip km">{j.translation}</td></tr>)}
+   {!rows.length&&<tr><td colSpan={4}><div className="empty"><b>No parallel text yet</b><span>Demo-mode jobs only produce placeholder text, so they're excluded.</span></div></td></tr>}
+  </tbody></table></div></section>
  </>;
 }
 
-/* ---------- 10. Users & Access ---------- */
+/* ================= Users ================= */
 export function Users({ctx}:{ctx:Ctx}){
- const [tab,setTab]=useState<'users'|'roles'|'activity'>('users');
  const [dir,setDir]=useState<{items:DirectoryUser[];total:number}|null>(null),[err,setErr]=useState('');
- useEffect(()=>{if(!ctx.isAdmin)return;req<{items:DirectoryUser[];total:number}>('/api/users?limit=100').then(setDir).catch(e=>setErr(String(e instanceof Error?e.message:e)))},[ctx.isAdmin]);
+ useEffect(()=>{if(!ctx.isAdmin)return;req<{items:DirectoryUser[];total:number}>('/api/users?limit=100').then(setDir).catch(e=>setErr(errText(e)))},[ctx.isAdmin]);
  const a=ctx.account;
  return <>
-  <PageHead title="Users &amp; Access" sub="Manage users, roles and permissions"/>
-  <section className="card">
-   <div className="toolbar"><Tabs variant="line" items={[['users','Users'],['roles','Roles'],['activity','Activity']]} value={tab} onChange={setTab}/></div>
-   {tab==='users'&&<>{err&&<div className="alert alert-err m">{err}</div>}<div className="table-wrap"><table className="table"><thead><tr><th>User</th><th>Role</th><th>Providers</th><th>Registered</th><th>Status</th></tr></thead><tbody>
-    {ctx.isAdmin&&<tr><td><div className="user-cell"><Avatar name="API Admin" size={28}/><span>API key administrator<small>Local .env key</small></span></div></td><td>Administrator</td><td>API key</td><td>—</td><td><span className="badge badge-ok">Active</span></td></tr>}
-    {ctx.isAdmin?dir?.items.map(u=><tr key={u.id}><td><div className="user-cell"><Avatar name={u.display_name} size={28}/><span>{u.display_name}<small>{u.email||'No email'}</small></span></div></td><td>User</td><td>{u.providers.join(', ')||'—'}</td><td className="muted">{asDate(u.created_at)}</td><td><span className={'badge '+(u.providers.length?'badge-ok':'badge-bad')}>{u.providers.length?'Active':'Inactive'}</span></td></tr>)
-     :a?.user&&<tr><td><div className="user-cell"><Avatar name={a.user.name} src={a.user.avatar_url} size={28}/><span>{a.user.name}<small>{a.user.email||'No email'}</small></span></div></td><td>User</td><td>{a.identities.map(i=>i.provider).join(', ')}</td><td>—</td><td><span className="badge badge-ok">Active</span></td></tr>}
-   </tbody></table></div>
-   {!ctx.isAdmin&&<p className="muted small pad-x">Only API-key administrators can see the full user directory.</p>}
-   {a?.authenticated&&<div className="pad-x link-providers"><h3 className="sub">Connected accounts</h3>{ctx.providers.map(p=>{const linked=a.identities.some(i=>i.provider===p.id);return <button key={p.id} className="btn btn-light" disabled={!p.enabled||linked} onClick={()=>{window.location.href='/api/auth/link/'+p.id}}>{linked?'✓ '+p.name+' linked':'Link '+p.name}</button>})}</div>}</>}
-   {tab==='roles'&&<div className="pad roles"><div className="role"><b>Administrator</b><p>Authenticates with the server <code>API_KEY</code>. Sees every job, the user directory and may ingest stream URLs.</p></div><div className="role"><b>User</b><p>Signs in with Google, GitHub or Facebook OAuth. Sees and manages only their own jobs and media.</p></div></div>}
-   {tab==='activity'&&<ul className="activity">{ctx.jobs.slice(0,15).map(j=><li key={j.id} onClick={()=>ctx.go('/job/'+j.id)}><Badge status={j.status}/><span><b>{baseName(j.filename)}</b><small>{shortId(j.id)} · {j.stage||j.status}</small></span><time>{asDate(j.updated_at||j.created_at)}</time></li>)}{!ctx.jobs.length&&<li className="muted">No activity yet.</li>}</ul>}
-  </section>
+  <Head title="Users" sub="Who can sign in, and how."/>
+  {err&&<div className="alert alert-err">{err}</div>}
+  <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>User</th><th>Role</th><th>Sign-in</th><th>Joined</th></tr></thead><tbody>
+   {ctx.isAdmin&&<tr><td><div className="ucell"><Avatar name="Administrator" size={32}/><div><b>Administrator</b><small>API key from .env</small></div></div></td><td>Admin</td><td>API key</td><td>—</td></tr>}
+   {ctx.isAdmin?dir?.items.map(u=><tr key={u.id}><td><div className="ucell"><Avatar name={u.display_name} size={32}/><div><b>{u.display_name}</b><small>{u.email||'No email'}</small></div></div></td><td>Member</td><td>{u.providers.join(', ')||'—'}</td><td>{asDate(u.created_at)}</td></tr>)
+    :a?.user&&<tr><td><div className="ucell"><Avatar name={a.user.name} src={a.user.avatar_url} size={32}/><div><b>{a.user.name}</b><small>{a.user.email||'No email'}</small></div></div></td><td>Member</td><td>{a.identities.map(i=>i.provider).join(', ')}</td><td>—</td></tr>}
+  </tbody></table></div></section>
+  <div className="grid2">
+   <Card title="Admin"><p className="hint top">Signs in with the server's <code>API_KEY</code>. Sees every job, the user list, and can submit YouTube and stream links.</p></Card>
+   <Card title="Member"><p className="hint top">Signs in with Google or GitHub. Sees and manages only their own jobs.</p>
+    {a?.authenticated&&<div className="link-row">{ctx.providers.map(p=>{const linked=a.identities.some(i=>i.provider===p.id);return <button key={p.id} className="btn btn-outline btn-sm" disabled={!p.enabled||linked} onClick={()=>{window.location.href='/api/auth/link/'+p.id}}>{linked?'✓ '+p.name+' linked':'Link '+p.name}</button>})}</div>}
+   </Card>
+  </div>
  </>;
 }
 
-/* ---------- 11. System Health & Settings ---------- */
-const svcName:Record<string,string>={api:'API Service',database:'Database (PostgreSQL)',redis:'Cache (Redis)',storage:'Storage (MinIO)',worker:'Worker (Celery)'};
-export function SystemPage({ctx,initial='health',theme,setTheme,onSignOut}:{ctx:Ctx;initial?:'health'|'settings';theme:string;setTheme:(t:string)=>void;onSignOut:()=>void}){
- const [tab,setTab]=useState<'health'|'settings'>(initial);
- useEffect(()=>setTab(initial),[initial]);
- const s=ctx.system?.services||{};const h=ctx.system?.host;const hh=ctx.hostHistory;
- const pct=(u?:number|null,t?:number|null)=>u!=null&&t?Math.round(u*100/t):null;
+/* ================= Settings ================= */
+export function Settings({ctx,theme,setTheme,onSignOut}:{ctx:Ctx;theme:string;setTheme:(t:string)=>void;onSignOut:()=>void}){
+ const m=ctx.models;
+ const row=(t:string,d:React.ReactNode,c:React.ReactNode)=><div className="set-row"><div><b>{t}</b><small>{d}</small></div>{c}</div>;
  return <>
-  <PageHead title={tab==='health'?'System Health':'Settings'} sub={tab==='health'?'Monitor system and service status':'Workspace, appearance and access'}><button className="btn btn-light" onClick={()=>void ctx.refresh()}><Icon name="refresh" size={15}/>Refresh</button></PageHead>
-  <section className="card">
-   <div className="toolbar"><Tabs variant="line" items={[['health','System Health'],['settings','Settings']]} value={tab} onChange={setTab}/></div>
-   {tab==='health'?<div className="pad">
-    <ul className="svc">{Object.keys(svcName).map(k=>{const v=s[k]||'unknown';return <li key={k}><span className={'svc-dot '+v}><Icon name={v==='online'?'check':v==='offline'?'x':'help'} size={13}/></span><b>{svcName[k]}</b><span className={'badge '+(v==='online'?'badge-ok':v==='offline'?'badge-bad':'badge-wait')}>{v==='online'?'Healthy':v==='offline'?'Offline':'Unknown'}</span></li>})}</ul>
-    <div className="host-grid">
-     <div className="host"><small>CPU (load)</small><Sparkline points={hh.cpu} color="var(--green)"/><b>{h?.cpu_percent!=null?h.cpu_percent+'%':'—'}</b></div>
-     <div className="host"><small>Memory</small><Sparkline points={hh.mem} color="var(--primary)"/><b>{h?.memory_used_bytes!=null?size(h.memory_used_bytes)+' / '+size(h.memory_total_bytes):'—'}</b></div>
-     <div className="host"><small>Disk</small><Sparkline points={hh.disk} color="var(--amber)"/><b>{h?.disk_used_bytes!=null?size(h.disk_used_bytes)+' / '+size(h.disk_total_bytes):'—'}</b>{pct(h?.disk_used_bytes,h?.disk_total_bytes)!=null&&<Progress value={pct(h?.disk_used_bytes,h?.disk_total_bytes)!}/>}</div>
-    </div>
-    <p className="muted small">Metrics are measured inside the API container. Worker ping can report "unknown" while it is busy.</p>
-   </div>:<div className="pad settings">
-    <div className="opt"><div><b>Processing mode</b><small>Set with MODEL_MODE on the server; restart API + worker to change.</small></div><span className={'mode-pill '+(isReal(ctx.models)?'real':'demo')}>{isReal(ctx.models)?'Real (offline AI)':'Demo'}</span></div>
-    <div className="opt"><div><b>Khmer dubbing</b><small>ENABLE_KHMER_DUBBING · {ctx.models?.speech_dubbing_available?'TTS model installed':'TTS model not available'}</small></div><Toggle label="Khmer dubbing" checked={!!ctx.models?.khmer_dubbing_enabled} disabled/></div>
-    <div className="opt"><div><b>Dark theme</b><small>Stored in this browser</small></div><Toggle label="Dark theme" checked={theme==='dark'} onChange={v=>setTheme(v?'dark':'light')}/></div>
-    <div className="opt"><div><b>Signed in as</b><small>{ctx.account?.authenticated?ctx.account.user?.name+' (OAuth)':'API key administrator'}</small></div><button className="btn btn-light" onClick={onSignOut}><Icon name="logout" size={15}/>Sign out</button></div>
-    <div className="opt"><div><b>API documentation</b><small>OpenAPI / Swagger UI</small></div><a className="btn btn-light" href="/api/docs" target="_blank" rel="noopener">Open</a></div>
-   </div>}
-  </section>
+  <Head title="Settings" sub="Appearance, account and server configuration."/>
+  <Card title="Appearance">{row('Theme','Saved in this browser',<Seg label="Theme" value={theme||'system'} onChange={v=>setTheme(v==='system'?'':v)} items={[['system','System'],['light','Light'],['dark','Dark']]}/>)}</Card>
+  <Card title="Account">
+   {row('Signed in as',ctx.account?.authenticated?ctx.account.user?.name+' (Google/GitHub)':'Administrator (API key)',<button className="btn btn-outline" onClick={onSignOut}><Icon name="logout"/>Sign out</button>)}
+   {row('API documentation','OpenAPI / Swagger UI',<a className="btn btn-outline" href="/api/docs" target="_blank" rel="noopener">Open</a>)}
+  </Card>
+  <Card title="Server (read-only)">
+   {row('Processing mode',<>Set with <code>MODEL_MODE</code>; restart the API and worker to change.</>,<span className={'badge badge-'+(real(m)?'ok':'muted')}>{real(m)?'Real AI':'Demo'}</span>)}
+   {row('Khmer dubbing',<code>ENABLE_KHMER_DUBBING</code>,<span className={'badge badge-'+(m?.khmer_dubbing_enabled?'ok':'muted')}>{m?.khmer_dubbing_enabled?'On':'Off'}</span>)}
+   {row('YouTube links',<code>YOUTUBE_ENABLED</code>,<span className={'badge badge-'+(m?.youtube_enabled?'ok':'muted')}>{m?.youtube_enabled?'On':'Off'}</span>)}
+   {row('Longest video',<code>MAX_VIDEO_DURATION_SECONDS</code>,<b>{m?.max_video_duration_seconds?Math.round(m.max_video_duration_seconds/60)+' min':'—'}</b>)}
+  </Card>
  </>;
 }
 
-export type {Status};
+/* ================= Search (⌘K) ================= */
+export function SearchDialog({onClose,go}:{onClose:()=>void;go:(p:string)=>void}){
+ const [q,setQ]=useState(''),[items,setItems]=useState<Job[]>([]),[i,setI]=useState(0);
+ const pages:[string,string][]=[['Dashboard','/dashboard'],['New translation','/new'],['Jobs','/jobs'],['System health','/system'],['Settings','/settings']];
+ useEffect(()=>{const t=setTimeout(()=>{req<{items:Job[]}>('/api/jobs?limit=8&offset=0&status=all'+(q.trim()?'&search='+encodeURIComponent(q.trim()):'')).then(r=>{setItems(r.items);setI(0)}).catch(()=>setItems([]))},150);return()=>clearTimeout(t)},[q]);
+ const pg=pages.filter(([n])=>!q||n.toLowerCase().includes(q.toLowerCase()));
+ const all:[string,string,React.ReactNode][]=[...pg.map(([n,p]):[string,string,React.ReactNode]=>[n,p,<span className="muted">Page</span>]),...items.map((j):[string,string,React.ReactNode]=>[baseName(j.filename),'/job/'+j.id,<Badge status={j.status}/>])];
+ const pick=(p:string)=>{onClose();go(p)};
+ return <div className="overlay" onClick={onClose}><div className="dialog" role="dialog" aria-modal="true" aria-label="Search" onClick={e=>e.stopPropagation()}>
+  <label className="dlg-search"><Icon name="search"/><input autoFocus placeholder="Search jobs and pages…" value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>{if(e.key==='Escape')onClose();if(e.key==='ArrowDown'){e.preventDefault();setI(v=>Math.min(all.length-1,v+1))}if(e.key==='ArrowUp'){e.preventDefault();setI(v=>Math.max(0,v-1))}if(e.key==='Enter'&&all[i])pick(all[i][1])}}/><kbd>Esc</kbd></label>
+  <ul className="dlg-list">{all.map(([n,p,meta],k)=><li key={p}><button className={k===i?'on':''} onMouseEnter={()=>setI(k)} onClick={()=>pick(p)}><span>{n}</span>{meta}</button></li>)}{!all.length&&<li className="muted pad">No results</li>}</ul>
+ </div></div>;
+}

@@ -43,3 +43,13 @@ def test_download_uses_only_canonical_url_and_limits():
     assert "!is_live" in cmd
     assert cmd[cmd.index("--download-sections") + 1] == "*0-597"
     assert cmd[cmd.index("--max-filesize") + 1] == "1024"
+
+def test_parse_printed_metadata():
+    from app.youtube import parse_printed
+    info = parse_printed("duration=2053\ntitle=Speak = English\nheight=NA\nis_live=False\njunk\nother=1\n")
+    assert info == {"duration": 2053.0, "title": "Speak = English", "is_live": False}
+
+def test_safe_title_strips_path_and_control_chars():
+    from app.youtube import safe_title
+    assert safe_title("a/b\\c\x00d", "x") == "a b c d"
+    assert safe_title("", "YouTube abc") == "YouTube abc"
