@@ -309,6 +309,13 @@ def unload_llm(timeout: float = 10.0) -> bool:
         root = endpoint[:-3] if endpoint.endswith("/v1") else endpoint
         with httpx.Client(timeout=timeout, trust_env=False) as client:
             client.post(root + "/api/generate", json={"model": settings.llm_model, "keep_alive": 0}).raise_for_status()
+            # Ollama frees VRAM just after replying; wait until it no longer lists the model.
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                loaded = client.get(root + "/api/ps").json().get("models", [])
+                if not any(_model_matches(settings.llm_model, [m.get("name") or m.get("model") or ""]) for m in loaded):
+                    break
+                time.sleep(0.25)
         return True
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Could not unload the post-edit LLM: %s", exc)

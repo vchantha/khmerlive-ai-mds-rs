@@ -51,6 +51,17 @@ say "Building and starting services (first GPU build downloads ~6 GB of CUDA lib
 docker compose up -d --build
 
 if [[ "$MODE" != demo ]]; then
+  if [[ "$MODE" == gpu && ! -f models/asr-large-v3-turbo/model.bin && -z "$(getenv GPU_WHISPER_MODEL_PATH)" ]]; then
+    say "Downloading Whisper large-v3-turbo for GPU speech recognition (1.6 GB, one time)"
+    if docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_OFFLINE=0 -v "$PWD/models:/models" \
+         -v "$PWD/scripts:/scripts:ro" khmerlive-worker:real-gpu \
+         python /scripts/download-models.py --output /models --only asr-large-v3-turbo; then
+      docker compose restart worker
+    else
+      say "Download failed; using Whisper small on the GPU instead"
+      setenv GPU_WHISPER_MODEL_PATH /models/asr; docker compose up -d worker
+    fi
+  fi
   if [[ ! -f models/mt-ct2/model.bin ]]; then
     say "Converting the translation model to CTranslate2 (one time, ~1 min)"
     WORKER_IMAGE="khmerlive-worker:real-$MODE" ./scripts/convert-mt-ct2.sh

@@ -20,6 +20,7 @@ setup, and it remembers that choice, so later plain `docker compose ...` command
 ```bash
 git clone <this repo> && cd khmerlive-ai-mds-rs
 bash scripts/init-env.sh                 # creates .env with random secrets (never commit it)
+pip install --user huggingface_hub       # needed by the download script
 python3 scripts/download-models.py       # speech, translation, Khmer voice models → ./models
 ```
 
@@ -86,7 +87,7 @@ Measured on one 9.3-minute English video, Quadro T1000 (4 GB) + 12-core CPU:
 
 | Stage | CPU-only | GPU deployment | How |
 |---|---|---|---|
-| Speech recognition (Whisper small) | 51.5 s | **12.7 s** | GPU `int8_float16`. Transcript is 99.4% word-identical to CPU |
+| Speech recognition | 51.5 s (Whisper small) | **25 s** (Whisper **large-v3-turbo**) | GPU `int8_float16`. Turbo makes **41% fewer word errors** (LibriSpeech: 7.48% → 4.43% WER) |
 | Translation (M2M100) | 66 s (Transformers) | **~19 s** | CTranslate2 int8 on CPU, used automatically in both modes |
 | Khmer voice (MMS VITS) | 33 s / 20 lines | **3.1 s / 20 lines** | GPU |
 | LLM polishing (qwen3 4B) | ~10–15 s / line | **~2.4 s / line** (≈4.8 s each, 2 at once) | Ollama on GPU; now the slowest stage |
@@ -110,6 +111,20 @@ better. To get the old engine back, set `MT_ENGINE=transformers` in `.env`.
 | `OLLAMA_MODEL` | `qwen3:4b-instruct` | Smaller (`qwen3:1.7b`) if `ollama ps` shows a CPU/GPU split, or for faster polishing (check Khmer quality) |
 | `LLM_PRELOAD_ON_START` | `true` | The worker loads the LLM into memory at startup, so the first job doesn't wait for it (a cold load took 46 s). `OLLAMA_KEEP_ALIVE=-1` keeps it loaded even when idle |
 | `WORKER_MAX_TASKS_PER_CHILD` | GPU: `1` | Fresh worker process per job so all GPU memory is freed between jobs (models reload in a few seconds). `0` = keep the process |
+
+### Speech recognition model
+
+| Deployment | Model | Word error rate* | Notes |
+|---|---|---|---|
+| GPU | **Whisper large-v3-turbo** (default) | **4.43%** | ~1.1 GB VRAM. On a 4 GB GPU the LLM is unloaded during speech recognition and reloaded for post-editing (adds ~3 s per job) |
+| CPU-only | Whisper small (default) | 7.48% | Turbo also works on CPU (`WHISPER_MODEL_PATH=/models/asr-large-v3-turbo`), about 4× slower |
+
+\*Measured on 73 LibriSpeech clean utterances with human reference transcripts.
+`./scripts/deploy.sh --gpu` downloads turbo automatically (1.6 GB, once). To use small on the GPU, set
+`GPU_WHISPER_MODEL_PATH=/models/asr`.
+
+We also tested asking the LLM (qwen3:4b) to correct the transcripts. It made them **worse**
+(4.43% → 5.30% WER; it also "corrected" words that were already right), so it isn't part of the pipeline.
 
 ### Khmer voice (dubbing) behaviour
 

@@ -19,5 +19,13 @@ services:
       TTS_DEVICE: ${TTS_DEVICE:-cuda}
       MT_DEVICE: ${MT_DEVICE:-cpu}
       ASR_RELEASE_AFTER_USE: ${ASR_RELEASE_AFTER_USE:-true}
+      # Whisper large-v3-turbo: 41% fewer word errors than small. On a 4 GB GPU it doesn't fit next
+      # to the LLM, so the LLM is unloaded during speech recognition and reloaded for post-editing.
+      WHISPER_MODEL_PATH: ${GPU_WHISPER_MODEL_PATH:-/models/asr-large-v3-turbo}
+      LLM_UNLOAD_BEFORE_GPU_ASR: ${LLM_UNLOAD_BEFORE_GPU_ASR:-true}
       # Fresh process per job: all GPU memory (Whisper, TTS, CUDA context) is freed between jobs.
       WORKER_MAX_TASKS_PER_CHILD: ${WORKER_MAX_TASKS_PER_CHILD:-1}
+  api:
+    environment:
+      # Same speech model as the worker, so System health reports what jobs use.
+      WHISPER_MODEL_PATH: ${GPU_WHISPER_MODEL_PATH:-/models/asr-large-v3-turbo}

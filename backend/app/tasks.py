@@ -249,7 +249,19 @@ def _translate_media(job_id:str):
                 s3=client()
                 streamed_rows=None
                 clock.mark("download")
-                if media.source_kind=="youtube":
+                reused=False
+                if media.source_kind in ("youtube","url") and media.sha256 not in (None,"","pending"):
+                    # Already downloaded/captured by an earlier run: replay the stored copy
+                    # instead of fetching again (faster, and immune to YouTube/network hiccups).
+                    try:
+                        s3.download_file(settings.minio_bucket,media.object_key,str(source))
+                        reused=True
+                        clock.note(reused_stored_copy=True)
+                    except Exception as exc:
+                        logger.warning("Stored copy of %s unavailable (%s); fetching again",media.id,exc)
+                if reused:
+                    pass
+                elif media.source_kind=="youtube":
                     check_cancel(db,job)
                     set_state(db,job,"processing",progress=10,stage="downloading YouTube video")
                     video_id=youtube_video_id(media.source_url)

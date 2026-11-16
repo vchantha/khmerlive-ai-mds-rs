@@ -124,6 +124,11 @@ def models():
                                                "revision":(m.get("revision") or "")[:12]}
     except (OSError,ValueError):
         pass
+    # Several Whisper sizes may be installed (models/asr, models/asr-large-v3-turbo);
+    # report the one actually configured as "asr" and hide the others.
+    active=os.path.basename(settings.whisper_model_path.rstrip("/"))
+    if active in installed:installed["asr"]=installed[active]
+    for key in [k for k in installed if k.startswith("asr-")]:installed.pop(key)
     return {"mode":settings.model_mode,"subtitle_translation_configured":configured,
             "installed":installed,"max_video_duration_seconds":settings.max_video_duration_seconds,
             "youtube_enabled":settings.youtube_enabled,

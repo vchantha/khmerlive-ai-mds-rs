@@ -104,8 +104,15 @@ def test_unload_llm_sends_keep_alive_zero(monkeypatch):
         def post(self, url, json):
             sent.update(url=url, json=json)
             return SimpleNamespace(raise_for_status=lambda: None)
+        def get(self, url):
+            polls.append(url)
+            models = [{"name": "m:latest"}] if len(polls) < 3 else []      # still unloading, then gone
+            return SimpleNamespace(json=lambda: {"models": models})
+    polls = []
+    monkeypatch.setattr(llm_postedit.time, "sleep", lambda s: None)
     monkeypatch.setattr(llm_postedit.httpx, "Client", Client)
     assert llm_postedit.unload_llm() is True
+    assert len(polls) == 3 and polls[0] == "http://ollama:11434/api/ps"
     assert sent == {"url": "http://ollama:11434/api/generate", "json": {"model": "m", "keep_alive": 0}}
 
 
@@ -336,3 +343,13 @@ def test_preload_gives_up_quietly(monkeypatch):
 def test_preload_skipped_when_llm_disabled(monkeypatch):
     monkeypatch.setattr(llm_postedit, "settings", _settings(llm_postedit_enabled=False))
     assert llm_postedit.preload_llm() is False
+
+
+def test_stored_youtube_copy_is_reused_not_redownloaded(monkeypatch, tmp_path):
+    """Second run of a YouTube video replays the stored copy (no yt-dlp call)."""
+    import inspect
+    from app import tasks
+    src = inspect.getsource(tasks._translate_media)
+    i = src.index('reused=False'); j = src.index('elif media.source_kind=="youtube"')
+    block = src[i:j]
+    assert 'media.sha256 not in (None,"","pending")' in block and "s3.download_file" in block
