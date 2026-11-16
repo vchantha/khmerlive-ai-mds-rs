@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     translation_model_path:str="/models/mt"
     khmer_tts_model_path:str="/models/tts"
     enable_khmer_dubbing:bool=True
+    llm_postedit_enabled:bool=False
+    llm_provider:str="ollama"
+    llm_base_url:str="http://ollama:11434/v1"
+    llm_model:str="qwen3:4b-instruct"
+    llm_timeout_seconds:float=180.0
+    llm_max_tokens:int=256
+    llm_fail_open:bool=True
     vllm_postedit_enabled:bool=False
     vllm_base_url:str="http://vllm:8000/v1"
     vllm_model:str="khmerlive-postedit"
