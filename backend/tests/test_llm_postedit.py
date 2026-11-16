@@ -1,0 +1,43 @@
+from dataclasses import dataclass
+from types import SimpleNamespace
+import pytest
+from app import llm_postedit
+
+@dataclass(frozen=True)
+class Row:
+    start_ms: int
+    end_ms: int
+    source_text: str
+    target_text: str
+
+def test_disabled_does_not_call_network(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", SimpleNamespace(vllm_postedit_enabled=False))
+    rows = [Row(0, 1000, "Hello", "សួស្តី")]
+    assert llm_postedit.postedit_rows(rows, "en", "km") is rows
+
+@pytest.mark.parametrize("url", ["https://example.com/v1", "http://169.254.169.254/v1", "http://vllm:8000/v1/extra", "http://user:pass@vllm:8000/v1"])
+def test_reject_unsafe_endpoints(url):
+    with pytest.raises(ValueError):
+        llm_postedit.validate_local_endpoint(url)
+
+def test_valid_endpoint():
+    assert llm_postedit.validate_local_endpoint("http://vllm:8000/v1/") == "http://vllm:8000/v1"
+
+def test_postedit_preserves_timestamps(monkeypatch):
+    monkeypatch.setattr(llm_postedit, "settings", SimpleNamespace(vllm_postedit_enabled=True, vllm_base_url="http://vllm:8000/v1", vllm_model="test", vllm_timeout_seconds=3, vllm_max_tokens=100, vllm_fail_open=False))
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"choices":[{"message":{"content":"សួស្តីអ្នកទាំងអស់គ្នា"}}]}
+    class Client:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def post(self, url, json):
+            assert url == "http://vllm:8000/v1/chat/completions"
+            return Response()
+    monkeypatch.setattr(llm_postedit.httpx, "Client", Client)
+    rows = [Row(100, 900, "Hello everyone", "សួស្តី")]
+    result = llm_postedit.postedit_rows(rows, "en", "km")
+    assert result[0].start_ms == 100 and result[0].end_ms == 900
+    assert result[0].target_text == "សួស្តីអ្នកទាំងអស់គ្នា"
+    assert rows[0].target_text == "សួស្តី"
