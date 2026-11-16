@@ -12,7 +12,7 @@ This optional component post-edits M2M100 English→Khmer text before Khmer TTS 
 ```bash
 docker compose -f compose.yaml -f compose.real.yaml -f compose.vllm.yaml --profile vllm config
 docker compose -f compose.yaml -f compose.real.yaml -f compose.vllm.yaml --profile vllm up -d --build
-docker compose -f compose.yaml -f compose.real.yaml -f compose.vllm.yaml --profile vllm exec vllm curl -fsS http://localhost:8000/v1/models
+docker compose -f compose.yaml -f compose.real.yaml -f compose.vllm.yaml --profile vllm exec worker python -c 'import httpx; r=httpx.get("http://vllm:8000/v1/models",timeout=15); r.raise_for_status(); print(r.json())'
 ```
 
 Only **after** the model server is healthy, set `VLLM_POSTEDIT_ENABLED=true` in the deployment environment and recreate the worker. The overlay forwards that variable to the worker. If `VLLM_FAIL_OPEN=true` (default), network/response errors revert the entire job to the unedited M2M100 translation; set it to false for strict research experiments.
