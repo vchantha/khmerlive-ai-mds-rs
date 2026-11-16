@@ -206,7 +206,7 @@ def translate_media(self,job_id:str):
                         translated=mt.translate(text,job.source_lang,job.target_lang)
                 if mode=="real_subtitles" and rows_for_dubbing is not None:
                     check_cancel(db,job)
-                    if settings.vllm_postedit_enabled and job.source_lang=="en" and job.target_lang=="km":
+                    if (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) and job.source_lang=="en" and job.target_lang=="km":
                         set_state(db,job,"processing",progress=60,stage="offline LLM translation post-editing")
                         rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang)
                         translated=" ".join(row.target_text for row in rows_for_dubbing)
