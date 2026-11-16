@@ -20,6 +20,23 @@ def load_pairs(path, src, dst):
     return rows
 
 
+def source_key(text):
+    """Same as app.evaluation.source_key (kept in sync by tests/test_evaluation.py)."""
+    import re, unicodedata
+    t = " ".join(unicodedata.normalize("NFC", text or "").translate({0x200B: None, 0xFEFF: None}).split()).lower()
+    t = re.sub(r"[^\w\s]", "", t)
+    return hashlib.sha256(" ".join(t.split()).encode()).hexdigest()[:16]
+
+
+def drop_eval_sentences(rows, key_files):
+    """Never train on evaluation sentences (eval_source_keys.txt from scripts/build-eval-set.py)."""
+    keys = set()
+    for f in key_files:
+        keys |= {k.strip() for k in Path(f).read_text(encoding="utf-8").splitlines() if k.strip()}
+    kept = [r for r in rows if source_key(r["source"]) not in keys]
+    return kept, len(rows) - len(kept)
+
+
 def split_by_video(rows, dev_frac, seed):
     """Whole videos go to dev, so the score reflects unseen content."""
     jobs = sorted({r["job_id"] for r in rows})
@@ -68,6 +85,8 @@ def main():
     ap.add_argument("--min-pairs", type=int, default=100)
     ap.add_argument("--min-gain", type=float, default=1.0, help="chrF++ points required to recommend deploying")
     ap.add_argument("--seed", type=int, default=13)
+    ap.add_argument("--exclude-keys", action="append", default=[],
+                    help="eval_source_keys.txt of a held-out evaluation set; its sentences are removed")
     a = ap.parse_args()
 
     import torch
@@ -77,6 +96,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     rows = load_pairs(a.data, a.src, a.dst)
+    rows, dropped = drop_eval_sentences(rows, a.exclude_keys)
+    if a.exclude_keys:
+        print(f"Removed {dropped} line(s) that belong to a held-out evaluation set", flush=True)
     print(f"{len(rows)} verified {a.src}->{a.dst} pairs from {len({r['job_id'] for r in rows})} video(s)", flush=True)
     if len(rows) < a.min_pairs:
         sys.exit(f"Need at least {a.min_pairs} verified lines (have {len(rows)}). Review more videos first.")

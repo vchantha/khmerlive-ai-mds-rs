@@ -64,6 +64,8 @@ still need human adequacy/fluency review.
 
 1. **Baseline (E0)**: M2M100 outputs + complete MP4 pipeline, no LLM.
 2. **Prompt post-editing (E1/E2)**: small/large local LLM, fixed dataset and prompt.
+   E0 vs E1 tooling and a frozen FLORES-200 held-out set (1012 sentences, split by article)
+   are in place: see `docs/EVALUATION_E0_E1.md`. In-domain video references still need a translator.
 3. **LoRA/QLoRA (E3)**: separate GPU-based training code, not implemented yet.
 4. **Context-aware (E4)**: evaluate neighboring segments; not implemented yet.
 5. **Duration-constrained (E5)**: implement and compare alignment metrics using

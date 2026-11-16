@@ -39,11 +39,19 @@ docker compose stop worker >/dev/null
 # 'up -d' (not 'start') so a changed MT_CT2_PATH in .env takes effect.
 trap 'say "Resuming the worker"; docker compose up -d worker >/dev/null 2>&1' EXIT
 
+# Held-out evaluation sentences must never be trained on (scripts/build-eval-set.py writes the keys).
+EXCLUDE=()
+for keys in benchmarks/private/eval/*/eval_source_keys.txt; do
+  [[ -f "$keys" ]] || continue
+  name=$(basename "$(dirname "$keys")"); cp "$keys" "models/finetune/eval-keys-$name.txt"
+  EXCLUDE+=(--exclude-keys "/models/finetune/eval-keys-$name.txt")
+done
+
 OUT="/models/mt-ft-$STAMP"
 docker run --rm "${GPU_ARGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_OFFLINE=1 \
   -v "$PWD/models:/models" -v "$PWD/backend/training:/training:ro" -v "$PWD/scripts:/scripts:ro" "$IMAGE" sh -c "
     pip install --quiet --user --no-warn-script-location peft==0.15.2 &&
-    python /training/finetune_mt.py --data /models/finetune/$(basename "$DATA") --out $OUT &&
+    python /training/finetune_mt.py --data /models/finetune/$(basename "$DATA") --out $OUT ${EXCLUDE[*]} &&
     python /scripts/convert_mt_ct2.py $OUT ${OUT}-ct2"
 REPORT="models/mt-ft-$STAMP/report.json"
 [[ -f "$REPORT" ]] || die "Training did not produce a report"
