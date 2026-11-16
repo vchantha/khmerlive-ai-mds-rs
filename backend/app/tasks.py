@@ -11,6 +11,7 @@ from app.storage import client
 from app.adapters import get_adapters
 from app.real_inference import translate_audio, build_srt, TimedText
 from app.khmer_tts import build_dubbed_audio
+from app.llm_postedit import postedit_rows
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
 from app.youtube import download_youtube,youtube_video_id,safe_title
@@ -203,6 +204,13 @@ def translate_media(self,job_id:str):
                         set_state(db,job,"processing",progress=45,stage="demo transcription")
                         text=asr.transcribe(audio,job.source_lang).text
                         translated=mt.translate(text,job.source_lang,job.target_lang)
+                if mode=="real_subtitles" and rows_for_dubbing is not None:
+                    check_cancel(db,job)
+                    if settings.vllm_postedit_enabled and job.source_lang=="en" and job.target_lang=="km":
+                        set_state(db,job,"processing",progress=60,stage="offline LLM translation post-editing")
+                        rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang)
+                        translated=" ".join(row.target_text for row in rows_for_dubbing)
+                        subtitle_path.write_text(build_srt(rows_for_dubbing),encoding="utf-8")
                 check_cancel(db,job)
                 set_state(db,job,"processing",progress=65,stage="muxing subtitles" if mode=="real_subtitles" else "remuxing demo video")
                 codec_args=output_codec_args(source)
