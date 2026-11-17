@@ -93,6 +93,37 @@ and renamed only when complete; files are made read-only.
 | `human_eval_sheet.csv` | Blind direct-assessment sheet (default 100 random sentences) |
 | `human_eval_key.json` | Which system produced each sheet item — keep it away from raters |
 
+### Results: first full run (2026-11-16, automatic metrics only)
+
+Run `20261116T193510Z-flores200-en-km-v1-heldout_test` · commit `baec5f4` · FLORES-200
+devtest, 1012 sentences / 281 articles · E1 = Ollama `qwen3:4b-instruct`, prompt
+`polish-6aad1b376d` · E0 = M2M100 418M (CTranslate2 int8, beam 4) · Quadro T1000 4 GB.
+
+| System | chrF++ (95% CI) | spBLEU-flores200 (95% CI) |
+| --- | --- | --- |
+| E0 | 23.13 ± 0.46 | 4.67 ± 0.32 |
+| E1 | 25.56 ± 0.53 | 7.01 ± 0.43 |
+
+- Corpus chrF++ E1−E0 = **+2.43** (paired bootstrap p = 0.001; approximate randomization
+  p = 0.0001, 10 000 trials).
+- Sentence chrF++ mean delta +2.47 (95% CI 2.14 to 2.78), Cohen's dz = 0.47; E1 better on
+  702, equal on 19, worse on 291 sentences.
+- By domain (corpus chrF++ E0 → E1): wikibooks 21.98 → 24.91 (n = 351), wikinews
+  24.52 → 26.52 (n = 341), wikivoyage 22.40 → 24.86 (n = 320).
+- Number fidelity (196 sentences with digits): all numbers kept E0 92.9% → E1 96.9%;
+  sentences with invented numbers E0 56, E1 50 (upper bound, see §3).
+- LLM outcomes: edited 994 (98.2%), unchanged 2 (0.2%), rejected by output guards and kept
+  E0 text 16 (1.6%): changed/dropped number 8, introduced number 5, mostly Latin script 3.
+- Latency: E1 mean 8.7 s/line (median 8.5, p95 14.1) on the T1000; E0 668 s for all 1012
+  lines on CPU.
+
+**Status of this result.** One E1 run with `LLM_CONCURRENCY` > 1, so it is not
+bit-reproducible; repeat E1 at least twice more (or once with `LLM_CONCURRENCY=1`) before
+reporting it as final. The blind human-rating sheet (198 items from 100 sentences) has
+been generated but **not yet rated**: these automatic scores do not answer RQ1 on their
+own. Domain mismatch and possible FLORES contamination (§4) apply. Per-sentence outputs,
+full scores and configuration are in the run folder (git-ignored, read-only).
+
 ## 3. Metrics and their limits for Khmer
 
 - **chrF++** (primary): character n-grams handle unspaced Khmer script reasonably.
