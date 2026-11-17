@@ -1,5 +1,8 @@
 # KhmerLive AI — Monthly Real Model Quality Check
 
+> For the research comparison of M2M100 (E0) and LLM post-editing (E1) on a frozen held-out
+> set, see [docs/EVALUATION_E0_E1.md](../docs/EVALUATION_E0_E1.md).
+
 This project does not ship **trained Khmer model weights** or claim perfect accuracy.
 A monthly quality benchmark is available so the team can measure real improvements
 and detect regressions after installing approved local Whisper + M2M100 model snapshots.

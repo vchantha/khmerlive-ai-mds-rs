@@ -6,9 +6,12 @@ services:
       MODEL_MODE: real_subtitles
       INFERENCE_DEVICE: cpu
   worker:
+    image: khmerlive-worker:real-cpu
     build:
       context: ./backend
       dockerfile: Dockerfile.real
+      args:
+        TORCH_VARIANT: cpu
     environment:
       MODEL_MODE: real_subtitles
       INFERENCE_DEVICE: cpu

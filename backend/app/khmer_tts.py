@@ -7,12 +7,23 @@ using it in any commercial product.
 from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
+import logging
 import subprocess
 import wave
 
+logger=logging.getLogger(__name__)
 
-# Faster than this sounds rushed; any remaining overflow is compressed below.
-MAX_NATIVE_SPEAKING_RATE=1.6
+
+# Speed-ups beyond this through VITS' own duration control start to sound rushed.
+MAX_NATIVE_SPEAKING_RATE=1.5
+# Total speed-up allowed (native rate x pitch-preserving tempo). Longer lines are trimmed with a fade.
+MAX_TOTAL_SPEEDUP=2.0
+# The dub may start this much before the English speech when it needs the room.
+MAX_LEAD_SECONDS=0.2
+FADE_IN_SECONDS=0.008
+FADE_OUT_SECONDS=0.025
+# Every line is normalised to the same loudness (RMS) so the voice level doesn't jump.
+TARGET_RMS=0.08
 
 def require_tts_model(path:str)->Path:
     root=Path(path)
@@ -45,6 +56,8 @@ def synthesize_khmer(text:str,model_path:str,device:str="cpu",speaking_rate:floa
     default_rate=model.speaking_rate
     try:
         model.speaking_rate=speaking_rate
+        # VITS samples noise for prosody; a fixed seed keeps the voice consistent run to run.
+        torch.manual_seed(1234)
         with torch.inference_mode():
             output=model(**inputs).waveform.squeeze().float().cpu().numpy()
     finally:
@@ -72,38 +85,104 @@ def resample_to_length(audio:np.ndarray,sample_rate:int,samples:int)->np.ndarray
     positions=np.linspace(0,len(audio)-1,samples)
     return np.interp(positions,np.arange(len(audio)),audio).astype(np.float32)
 
+def time_stretch(audio:np.ndarray,sample_rate:int,factor:float)->np.ndarray:
+    """Pitch-preserving speed change (ffmpeg atempo, WSOLA). factor>1 = faster/shorter."""
+    import numpy as np
+    if abs(factor-1.0)<0.01 or len(audio)==0:
+        return audio
+    proc=subprocess.run(["ffmpeg","-v","error","-nostdin","-f","f32le","-ar",str(sample_rate),"-ac","1",
+                         "-i","pipe:0","-filter:a",f"atempo={factor:.4f}","-f","f32le","pipe:1"],
+                        input=audio.astype("<f4").tobytes(),capture_output=True,check=True,timeout=60)
+    return np.frombuffer(proc.stdout,dtype="<f4").astype(np.float32)
+
+def _resample(audio:np.ndarray,src:int,dst:int)->np.ndarray:
+    """Band-limited sample-rate conversion via ffmpeg (only used if lines differ in rate)."""
+    import numpy as np
+    if src==dst or len(audio)==0:
+        return audio
+    proc=subprocess.run(["ffmpeg","-v","error","-nostdin","-f","f32le","-ar",str(src),"-ac","1","-i","pipe:0",
+                         "-ar",str(dst),"-f","f32le","pipe:1"],input=audio.astype("<f4").tobytes(),
+                        capture_output=True,check=True,timeout=60)
+    return np.frombuffer(proc.stdout,dtype="<f4").astype(np.float32)
+
+def _polish(piece:np.ndarray,rate:int)->np.ndarray:
+    """Even loudness plus short fades so lines don't click or jump in volume."""
+    import numpy as np
+    piece=piece.astype(np.float32).copy()
+    rms=float(np.sqrt(np.mean(piece**2))) if len(piece) else 0.0
+    if rms>1e-4:
+        piece*=min(4.0,max(0.3,TARGET_RMS/rms))
+    fi=min(len(piece)//2,int(FADE_IN_SECONDS*rate));fo=min(len(piece)//2,int(FADE_OUT_SECONDS*rate))
+    if fi:piece[:fi]*=np.linspace(0,1,fi,dtype=np.float32)
+    if fo:piece[-fo:]*=np.linspace(1,0,fo,dtype=np.float32)
+    return piece
+
+def fit_line(waveform:np.ndarray,rate:int,available:int,native=None)->tuple[np.ndarray,str]:
+    """Fit one synthesized line into `available` samples without ever slowing it down.
+
+    native(speed) re-synthesizes with VITS' own speaking rate (most natural); the rest
+    is a pitch-preserving tempo change; beyond MAX_TOTAL_SPEEDUP the line is trimmed.
+    """
+    import numpy as np
+    if len(waveform)<=available:
+        return waveform,"natural"
+    need=len(waveform)/max(available,1)
+    how=""
+    if native is not None:
+        speed=min(MAX_NATIVE_SPEAKING_RATE,need)
+        waveform,src=native(speed)
+        if src!=rate:waveform=_resample(waveform,src,rate)
+        how="native"
+        if len(waveform)<=available:
+            return waveform,how
+    # 1% margin: atempo output can run a few ms long.
+    factor=min(len(waveform)/available*1.01,MAX_TOTAL_SPEEDUP/(min(MAX_NATIVE_SPEAKING_RATE,need) if native else 1.0))
+    if factor>1.0:
+        waveform=time_stretch(waveform,rate,factor);how=(how+"+tempo").lstrip("+")
+    if len(waveform)>available:
+        if len(waveform)>available*1.02:how+="+trimmed"
+        waveform=waveform[:available]
+    return waveform,how or "natural"
+
 def build_dubbed_audio(rows,output:Path,duration_seconds:float,model_path:str,
-                       device:str="cpu",synthesizer=None)->Path:
-    """Produce a 24kHz mono PCM track with silence outside translated speech."""
+                       device:str="cpu",synthesizer=None,stats_out:dict|None=None)->Path:
+    """Produce a mono PCM track: each Khmer line at natural pitch, placed at its subtitle time.
+
+    Lines play at natural speed. Lines longer than the gap to the next one are sped up
+    (native VITS rate first, then pitch-preserving tempo); they are never slowed down or
+    resampled in a way that changes pitch. Silence outside translated speech.
+    """
     import numpy as np
     if duration_seconds<=0 or duration_seconds>3600:
         raise ValueError("Invalid video duration")
-    rate=24000
-    timeline=np.zeros(round(duration_seconds*rate),dtype=np.float32)
     synth=synthesizer or (lambda text:synthesize_khmer(text,model_path,device))
     # Native (pitch-preserving) speed-up is only possible with the real model.
-    fast_synth=None if synthesizer else (lambda text,r:synthesize_khmer(text,model_path,device,speaking_rate=r))
-    populated=0
+    native_for=None if synthesizer else (lambda text:(lambda r:synthesize_khmer(text,model_path,device,speaking_rate=r)))
     spoken=sorted((r for r in rows if r.target_text.strip()),key=lambda r:r.start_ms)
-    for index,row in enumerate(spoken):
-        start=max(0,round(row.start_ms*rate/1000))
-        end=min(len(timeline),round(row.end_ms*rate/1000))
-        if end<=start:continue
-        # Khmer is usually longer than the English source. Let the dub use the
-        # pause before the next segment (or the end of the video) so it needs
-        # less compression; the speedup guard still rejects unintelligible audio.
-        following=[round(r.start_ms*rate/1000) for r in spoken[index+1:] if r.start_ms>row.start_ms]
-        limit=min(following[0] if following else len(timeline),len(timeline))
-        waveform,source_rate=synth(row.target_text)
-        natural=round(len(waveform)*rate/source_rate)
-        end=max(end,min(start+natural,limit))
-        if fast_synth and natural>end-start:
-            waveform,source_rate=fast_synth(row.target_text,min(MAX_NATIVE_SPEAKING_RATE,natural/(end-start)))
-        piece=resample_to_length(waveform,source_rate,end-start)
-        timeline[start:end]+=piece
-        populated+=1
-    if not populated:
+    if not spoken:
         raise ValueError("No translated Khmer speech segments available for dubbing")
+    rate=None;timeline=None;written_to=0;stats={}
+    for index,row in enumerate(spoken):
+        waveform,src=synth(row.target_text)
+        if rate is None:
+            rate=int(src);timeline=np.zeros(round(duration_seconds*rate),dtype=np.float32)
+        if src!=rate:waveform=_resample(waveform,src,rate)
+        start=min(len(timeline),round(row.start_ms*rate/1000))
+        following=[r.start_ms for r in spoken[index+1:] if r.start_ms>row.start_ms]
+        limit=min(round(following[0]*rate/1000) if following else len(timeline),len(timeline))
+        if limit<=start:continue
+        # Borrow up to MAX_LEAD_SECONDS before the English line if the speech needs room.
+        if len(waveform)>limit-start:
+            start=max(written_to,start-int(MAX_LEAD_SECONDS*rate),0)
+        piece,how=fit_line(waveform,rate,limit-start,native_for(row.target_text) if native_for else None)
+        piece=_polish(piece,rate)
+        timeline[start:start+len(piece)]+=piece
+        written_to=start+len(piece)
+        stats[how]=stats.get(how,0)+1
+    if not stats:
+        raise ValueError("No translated Khmer speech segments available for dubbing")
+    logger.info("Khmer dub: %d lines placed %s",sum(stats.values()),stats)
+    if stats_out is not None:stats_out.update(stats)
     peak=float(np.max(np.abs(timeline)))
     if peak>0.95:timeline*=0.95/peak
     output.parent.mkdir(parents=True,exist_ok=True)

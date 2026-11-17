@@ -1,21 +1,62 @@
 import hashlib
+import logging
+from datetime import datetime,timezone
 import uuid
 from contextlib import contextmanager
-from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header,Query,Request
+from fastapi import FastAPI,UploadFile,File,Depends,HTTPException,Header,Query,Request,Path
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel,Field
-from sqlalchemy import select,text,func,or_
+from sqlalchemy import select,text,func,or_,delete
 from app.db import SessionLocal
-from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity
+from app.models import MediaAsset,TranslationJob,AppUser,SocialIdentity,JobEvent,TranslationCorrection,GlossaryTerm
+from app.joblog import log_event
 from app.storage import client
 from app.config import settings
 from app.stream_urls import validate_stream_url,capture_seconds_valid,StreamURLRejected
 from app.youtube import is_youtube_host,youtube_video_id,canonical_url,fetch_info,YouTubeURLRejected
 from app.tasks import translate_media
+from app.llm_postedit import llm_status,llm_smoke_test
 from app.media_preview import issue_playback_token,check_playback_token,parse_byte_range,srt_to_webvtt,InvalidPlaybackToken,InvalidByteRange
 from starlette.background import BackgroundTask
 from app.auth import router as auth_router, actor_from_request
 from starlette.middleware.sessions import SessionMiddleware
+
+logger=logging.getLogger(__name__)
+
+ACTIVE_STATUSES=("queued","processing","cancelling")
+JOB_SORTS={
+    "newest":lambda:(TranslationJob.created_at.desc(),TranslationJob.id.desc()),
+    "oldest":lambda:(TranslationJob.created_at.asc(),TranslationJob.id.asc()),
+    "name_asc":lambda:(func.lower(MediaAsset.filename).asc(),TranslationJob.created_at.desc()),
+    "name_desc":lambda:(func.lower(MediaAsset.filename).desc(),TranslationJob.created_at.desc()),
+    "status":lambda:(TranslationJob.status.asc(),TranslationJob.created_at.desc()),
+    "updated":lambda:(TranslationJob.updated_at.desc(),TranslationJob.id.desc()),
+}
+MEDIA_SORTS={
+    "newest":lambda:(MediaAsset.created_at.desc(),MediaAsset.id.desc()),
+    "oldest":lambda:(MediaAsset.created_at.asc(),MediaAsset.id.asc()),
+    "name_asc":lambda:(func.lower(MediaAsset.filename).asc(),MediaAsset.id.asc()),
+    "name_desc":lambda:(func.lower(MediaAsset.filename).desc(),MediaAsset.id.asc()),
+    "size_desc":lambda:(MediaAsset.size_bytes.desc(),MediaAsset.id.asc()),
+    "size_asc":lambda:(MediaAsset.size_bytes.asc(),MediaAsset.id.asc()),
+}
+
+def search_term(search:str|None)->str|None:
+    """ILIKE pattern with %, _ and \\ escaped so user input matches literally."""
+    if not search or not search.strip():return None
+    esc=search.strip().replace("\\","\\\\").replace("%","\\%").replace("_","\\_")
+    return f"%{esc}%"
+
+def delete_storage(keys)->bool:
+    """Best-effort removal of S3 objects after their DB rows are gone. Returns False on failure."""
+    keys=sorted({k for k in keys if k})
+    if not keys:return True
+    try:
+        client().delete_objects(Bucket=settings.minio_bucket,Delete={"Objects":[{"Key":k} for k in keys],"Quiet":True})
+        return True
+    except Exception as exc:
+        logger.warning("Could not delete %d storage object(s): %s",len(keys),exc)
+        return False
 
 app=FastAPI(title="KhmerLive AI — Offline Translation Research MVP",version="0.3.0")
 app.add_middleware(SessionMiddleware,secret_key=settings.auth_session_secret,
@@ -31,9 +72,20 @@ def only_owned(query, actor, table):
         return query
     return query.where(table.owner_user_id==actor["user_id"])
 
+def visible(query, actor, table):
+    """only_owned plus hiding rows that are in the Trash."""
+    return only_owned(query,actor,table).where(table.deleted_at.is_(None))
+
 def owned_job(db, job_id, actor):
-    q=only_owned(select(TranslationJob).where(TranslationJob.id==job_id),actor,TranslationJob)
+    q=visible(select(TranslationJob).where(TranslationJob.id==job_id),actor,TranslationJob)
     return db.scalar(q)
+
+def require_admin(actor):
+    require_admin_for("the Trash",actor)
+
+def require_admin_for(what:str,actor):
+    if not actor["admin"]:
+        raise HTTPException(403,f"Admin access required to change {what}")
 
 
 @contextmanager
@@ -75,11 +127,17 @@ def models():
                                                "revision":(m.get("revision") or "")[:12]}
     except (OSError,ValueError):
         pass
+    # Several Whisper sizes may be installed (models/asr, models/asr-large-v3-turbo);
+    # report the one actually configured as "asr" and hide the others.
+    active=os.path.basename(settings.whisper_model_path.rstrip("/"))
+    if active in installed:installed["asr"]=installed[active]
+    for key in [k for k in installed if k.startswith("asr-")]:installed.pop(key)
     return {"mode":settings.model_mode,"subtitle_translation_configured":configured,
             "installed":installed,"max_video_duration_seconds":settings.max_video_duration_seconds,
             "youtube_enabled":settings.youtube_enabled,
             "speech_dubbing_available":dubbing_ready,
             "khmer_dubbing_enabled":settings.enable_khmer_dubbing,
+            "llm":llm_status(),
             "note":"English to Khmer jobs replace source audio with offline Khmer TTS when enabled. Khmer to English remains subtitle-only."}
 
 @app.post("/api/media",status_code=201,dependencies=[Depends(authorize)])
@@ -134,7 +192,7 @@ def create_job(payload:JobCreate,actor:dict=Depends(authorize)):
     ensure_translation_ready(payload.target_lang)
     with session() as db:
         media=db.get(MediaAsset,payload.media_id)
-        if media is None or (not actor["admin"] and media.owner_user_id!=actor["user_id"]):
+        if media is None or media.deleted_at is not None or (not actor["admin"] and media.owner_user_id!=actor["user_id"]):
             raise HTTPException(404,"Media not found")
         jid=str(uuid.uuid4())
         job=TranslationJob(id=jid,media_id=payload.media_id,source_lang=payload.source_lang,target_lang=payload.target_lang,status="queued",processing_mode=settings.model_mode,owner_user_id=actor["user_id"])
@@ -233,12 +291,18 @@ def format_job(job,media):
         "processing_mode":job.processing_mode,"has_subtitles":bool(job.subtitle_key),
         "has_khmer_voice":bool(job.output_key and job.output_key.endswith(".khmer-dubbed.mp4")),
         "error":job.error,"has_output":bool(job.output_key),"mode":settings.model_mode,
+        "timings":_timings(job.timings),
     }
+
+def _timings(raw):
+    import json
+    try:return json.loads(raw) if raw else None
+    except ValueError:return None
 
 @app.get("/api/dashboard",dependencies=[Depends(authorize)])
 def dashboard(actor:dict=Depends(authorize)):
     with session() as db:
-        q=only_owned(select(TranslationJob.status,func.count(TranslationJob.id)),actor,TranslationJob)
+        q=visible(select(TranslationJob.status,func.count(TranslationJob.id)),actor,TranslationJob)
         rows=db.execute(q.group_by(TranslationJob.status)).all()
         counts=dict(rows)
     return {"total":sum(counts.values()),"queued":counts.get("queued",0),
@@ -288,6 +352,12 @@ def host_metrics():
     except OSError:pass
     return out
 
+@app.post("/api/system/llm/smoke")
+def llm_smoke(actor:dict=Depends(authorize)):
+    """Admin: run one real post-edit request through the output guards (model readiness, not just liveness)."""
+    require_admin_for("the LLM smoke test",actor)
+    return llm_smoke_test()
+
 @app.get("/api/system",dependencies=[Depends(authorize)])
 def system_status():
     import time
@@ -320,9 +390,11 @@ def system_status():
 def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
               status:str|None=Query(None),search:str|None=Query(None,max_length=200),
               source:str|None=Query(None,pattern="^(all|upload|url|youtube)$"),
+              sort:str=Query("newest",pattern="^("+"|".join(JOB_SORTS)+")$"),
+              media_id:str|None=Query(None,max_length=36),
               actor:dict=Depends(authorize)):
     with session() as db:
-        q=only_owned(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id),actor,TranslationJob)
+        q=visible(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id),actor,TranslationJob)
         if status and status!="all":
             if status=="active":q=q.where(TranslationJob.status.in_(["queued","processing","cancelling"]))
             elif status=="failed":q=q.where(TranslationJob.status.in_(["failed","dispatch_failed"]))
@@ -331,26 +403,349 @@ def list_jobs(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
             else:raise HTTPException(422,"Unsupported job status")
         if source and source!="all":
             q=q.where(MediaAsset.source_kind==source)
-        if search:
-            term=f"%{search.strip()}%"
-            q=q.where(or_(MediaAsset.filename.ilike(term),TranslationJob.id.ilike(term)))
+        if media_id:
+            q=q.where(TranslationJob.media_id==media_id)
+        if term:=search_term(search):
+            q=q.where(or_(MediaAsset.filename.ilike(term,escape="\\"),TranslationJob.id.ilike(term,escape="\\"),
+                          MediaAsset.source_url.ilike(term,escape="\\")))
         total=db.scalar(select(func.count()).select_from(q.order_by(None).subquery())) or 0
-        rows=db.execute(q.order_by(TranslationJob.created_at.desc(),TranslationJob.id.desc()).offset(offset).limit(limit)).all()
+        rows=db.execute(q.order_by(*JOB_SORTS[sort]()).offset(offset).limit(limit)).all()
         return {"items":[format_job(j,m) for j,m in rows],"total":total,"limit":limit,"offset":offset}
 
 @app.get("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
 def get_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        q=only_owned(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id).where(TranslationJob.id==job_id),actor,TranslationJob)
+        q=visible(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id).where(TranslationJob.id==job_id),actor,TranslationJob)
         row=db.execute(q).first()
         if row is None:raise HTTPException(404,"Not found")
         return format_job(*row)
 
 
+def actor_label(actor)->str:
+    return actor["user_id"] or "admin"
+
+@app.get("/api/jobs/{job_id}/events",dependencies=[Depends(authorize)])
+def job_events(job_id:str,stage:str|None=Query(None,max_length=40),actor:dict=Depends(authorize)):
+    """Pipeline log for a job. stage=llm returns only the LLM post-edit line records."""
+    import json
+    with session() as db:
+        if owned_job(db,job_id,actor) is None:raise HTTPException(404,"Job not found")
+        q=select(JobEvent).where(JobEvent.job_id==job_id)
+        if stage:q=q.where(JobEvent.stage==stage)
+        rows=db.scalars(q.order_by(JobEvent.id.asc()).limit(5000)).all()
+        def data(raw):
+            try:return json.loads(raw) if raw else None
+            except ValueError:return None
+        return {"items":[{"id":e.id,"at":e.created_at.isoformat() if e.created_at else None,"stage":e.stage,
+                          "level":e.level,"message":e.message,"seconds":e.seconds,"data":data(e.data)} for e in rows]}
+
+# ---------------- Translation corrections (fine-tuning data) ----------------
+
+MAX_LINE_CHARS=1000
+RECOMMENDED_PAIRS=300
+
+def _segments(job)->list:
+    import json
+    try:return json.loads(job.segments) if job.segments else []
+    except ValueError:return []
+
+@app.get("/api/jobs/{job_id}/segments",dependencies=[Depends(authorize)])
+def job_segments(job_id:str,actor:dict=Depends(authorize)):
+    """Subtitle lines with English, machine draft, LLM output, final text and any human correction."""
+    with session() as db:
+        job=owned_job(db,job_id,actor)
+        if job is None:raise HTTPException(404,"Job not found")
+        fixes={c.segment_index:c for c in db.scalars(select(TranslationCorrection).where(TranslationCorrection.job_id==job_id))}
+        items=[]
+        for i,seg in enumerate(_segments(job)):
+            c=fixes.get(i)
+            items.append({"index":i,**seg,"corrected":c.corrected_text if c else None,
+                          "approved_unchanged":bool(c and c.approved_unchanged)})
+        return {"items":items,"source_lang":job.source_lang,"target_lang":job.target_lang,
+                "available":bool(job.segments),"verified":len(fixes)}
+
+class CorrectionItem(BaseModel):
+    index:int=Field(ge=0)
+    # null/empty removes the correction; otherwise the verified translation of this line.
+    corrected_text:str|None=Field(default=None,max_length=MAX_LINE_CHARS)
+
+class CorrectionsPayload(BaseModel):
+    items:list[CorrectionItem]=Field(max_length=2000)
+
+@app.put("/api/jobs/{job_id}/corrections",dependencies=[Depends(authorize)])
+def save_corrections(job_id:str,payload:CorrectionsPayload,actor:dict=Depends(authorize)):
+    with session() as db:
+        job=owned_job(db,job_id,actor)
+        if job is None:raise HTTPException(404,"Job not found")
+        segs=_segments(job)
+        if not segs:raise HTTPException(409,"This job has no stored lines. Run it again to enable corrections.")
+        existing={c.segment_index:c for c in db.scalars(select(TranslationCorrection).where(
+            TranslationCorrection.job_id==job_id).with_for_update())}
+        saved=removed=0
+        for item in payload.items:
+            if item.index>=len(segs):raise HTTPException(422,f"Line {item.index+1} does not exist")
+            text=(item.corrected_text or "").strip()
+            c=existing.get(item.index)
+            if not text:
+                if c:db.delete(c);removed+=1
+                continue
+            if job.target_lang=="km" and not any("\u1780"<=ch<="\u17ff" for ch in text):
+                raise HTTPException(422,f"Line {item.index+1}: the Khmer translation must contain Khmer script")
+            seg=segs[item.index]
+            if c is None:
+                c=TranslationCorrection(job_id=job_id,segment_index=item.index,start_ms=seg["start_ms"],end_ms=seg["end_ms"],
+                    source_lang=job.source_lang,target_lang=job.target_lang,source_text=seg["source"],
+                    machine_text=seg.get("machine"),llm_text=seg.get("llm"),corrected_text=text)
+                db.add(c)
+            c.corrected_text=text
+            c.approved_unchanged=text==(seg.get("final") or "").strip()
+            c.created_by=actor_label(actor)
+            saved+=1
+        db.commit()
+        total=db.scalar(select(func.count()).select_from(TranslationCorrection).where(TranslationCorrection.job_id==job_id))
+    log_event(job_id,"job",f"Translation review saved: {saved} line(s) verified"+(f", {removed} cleared" if removed else ""),
+              by=actor_label(actor))
+    return {"saved":saved,"removed":removed,"verified":total}
+
+def _owned_corrections(actor):
+    q=(select(TranslationCorrection,TranslationJob).join(TranslationJob,TranslationCorrection.job_id==TranslationJob.id)
+       .where(TranslationJob.deleted_at.is_(None)))
+    return only_owned(q,actor,TranslationJob)
+
+@app.get("/api/dataset/corrections",dependencies=[Depends(authorize)])
+def correction_dataset(format:str=Query("summary",pattern="^(summary|jsonl)$"),actor:dict=Depends(authorize)):
+    """Verified line pairs. format=jsonl downloads the fine-tuning dataset."""
+    import json
+    with session() as db:
+        rows=db.execute(_owned_corrections(actor).order_by(TranslationCorrection.job_id,TranslationCorrection.segment_index)).all()
+    if format=="jsonl":
+        body="".join(json.dumps({"job_id":c.job_id,"segment":c.segment_index,"source_lang":c.source_lang,"target_lang":c.target_lang,
+                                 "source":c.source_text,"target":c.corrected_text,"machine":c.machine_text,"llm":c.llm_text,
+                                 "edited":not c.approved_unchanged},ensure_ascii=False)+"\n" for c,_ in rows)
+        return PlainTextResponse(body,media_type="application/jsonl",
+                                 headers={"Content-Disposition":'attachment; filename="khmerlive-corrections.jsonl"'})
+    by_pair={}
+    for c,_ in rows:by_pair[f"{c.source_lang}-{c.target_lang}"]=by_pair.get(f"{c.source_lang}-{c.target_lang}",0)+1
+    return {"pairs":len(rows),"edited":sum(1 for c,_ in rows if not c.approved_unchanged),
+            "approved_unchanged":sum(1 for c,_ in rows if c.approved_unchanged),
+            "jobs":len({c.job_id for c,_ in rows}),"by_language_pair":by_pair,"recommended_minimum":RECOMMENDED_PAIRS}
+
+# ---------------- Glossary (required terminology) ----------------
+
+class GlossaryIn(BaseModel):
+    source_term:str=Field(min_length=1,max_length=200)
+    target_term:str=Field(min_length=1,max_length=200)
+    note:str|None=Field(default=None,max_length=500)
+    source_lang:str=Field(default="en",pattern="^(en|km)$")
+    target_lang:str=Field(default="km",pattern="^(en|km)$")
+
+def _glossary_out(g):
+    return {"id":g.id,"source_term":g.source_term,"target_term":g.target_term,"note":g.note,
+            "source_lang":g.source_lang,"target_lang":g.target_lang,"created_by":g.created_by,
+            "created_at":g.created_at.isoformat() if g.created_at else None}
+
+@app.get("/api/glossary",dependencies=[Depends(authorize)])
+def list_glossary(search:str|None=Query(None,max_length=200)):
+    with session() as db:
+        q=select(GlossaryTerm)
+        if term:=search_term(search):
+            q=q.where(or_(GlossaryTerm.source_term.ilike(term,escape="\\"),GlossaryTerm.target_term.ilike(term,escape="\\")))
+        return {"items":[_glossary_out(g) for g in db.scalars(q.order_by(func.lower(GlossaryTerm.source_term)))]}
+
+@app.post("/api/glossary",status_code=201,dependencies=[Depends(authorize)])
+def add_glossary(payload:GlossaryIn,actor:dict=Depends(authorize)):
+    require_admin_for("the glossary",actor)
+    if payload.source_lang==payload.target_lang:raise HTTPException(422,"Language pair must differ")
+    src=" ".join(payload.source_term.split()).lower() if payload.source_lang=="en" else payload.source_term.strip()
+    dst=payload.target_term.strip()
+    if payload.target_lang=="km" and not any("\u1780"<=ch<="\u17ff" for ch in dst):
+        raise HTTPException(422,"The Khmer term must contain Khmer script")
+    with session() as db:
+        g=db.scalar(select(GlossaryTerm).where(GlossaryTerm.source_lang==payload.source_lang,
+            GlossaryTerm.target_lang==payload.target_lang,GlossaryTerm.source_term==src))
+        if g is None:
+            g=GlossaryTerm(source_lang=payload.source_lang,target_lang=payload.target_lang,source_term=src);db.add(g)
+        g.target_term=dst;g.note=payload.note;g.created_by=actor_label(actor)
+        db.commit();db.refresh(g)
+        return _glossary_out(g)
+
+@app.delete("/api/glossary/{term_id}",dependencies=[Depends(authorize)])
+def delete_glossary(term_id:int,actor:dict=Depends(authorize)):
+    require_admin_for("the glossary",actor)
+    with session() as db:
+        g=db.get(GlossaryTerm,term_id)
+        if g is None:raise HTTPException(404,"Term not found")
+        db.delete(g);db.commit()
+    return {"id":term_id,"deleted":True}
+
+@app.delete("/api/jobs/{job_id}",dependencies=[Depends(authorize)])
+def delete_job(job_id:str,actor:dict=Depends(authorize)):
+    """Move a finished, failed or cancelled job to the Trash. Files are kept until an admin purges it."""
+    with session() as db:
+        j=db.scalar(visible(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
+        if j is None:raise HTTPException(404,"Job not found")
+        if j.status in ACTIVE_STATUSES:
+            raise HTTPException(409,"Cancel the job before deleting it")
+        j.deleted_at=datetime.now(timezone.utc);j.deleted_by=actor_label(actor)
+        db.commit()
+    log_event(job_id,"job","Moved to Trash",level="warning",by=actor_label(actor))
+    return {"id":job_id,"trashed":True}
+
+@app.get("/api/media",dependencies=[Depends(authorize)])
+def list_media(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),
+               search:str|None=Query(None,max_length=200),
+               source:str|None=Query(None,pattern="^(all|upload|url|youtube)$"),
+               sort:str=Query("newest",pattern="^("+"|".join(MEDIA_SORTS)+")$"),
+               actor:dict=Depends(authorize)):
+    """Source videos (uploads and links) with how many translation jobs use each one."""
+    with session() as db:
+        q=visible(select(MediaAsset),actor,MediaAsset)
+        if source and source!="all":q=q.where(MediaAsset.source_kind==source)
+        if term:=search_term(search):
+            q=q.where(or_(MediaAsset.filename.ilike(term,escape="\\"),MediaAsset.id.ilike(term,escape="\\"),
+                          MediaAsset.source_url.ilike(term,escape="\\")))
+        total=db.scalar(select(func.count()).select_from(q.order_by(None).subquery())) or 0
+        media=db.scalars(q.order_by(*MEDIA_SORTS[sort]()).offset(offset).limit(limit)).all()
+        stats={}
+        if media:
+            rows=db.execute(select(TranslationJob.media_id,TranslationJob.status,func.count())
+                            .where(TranslationJob.media_id.in_([m.id for m in media]),TranslationJob.deleted_at.is_(None))
+                            .group_by(TranslationJob.media_id,TranslationJob.status)).all()
+            for mid,status,n in rows:
+                st=stats.setdefault(mid,{"jobs":0,"active":0,"completed":0})
+                st["jobs"]+=n
+                if status in ACTIVE_STATUSES:st["active"]+=n
+                if status=="completed":st["completed"]+=n
+        items=[{"id":m.id,"filename":m.filename,"size_bytes":m.size_bytes,"source_kind":m.source_kind,
+                "source_url":m.source_url,"capture_seconds":m.capture_seconds,
+                "created_at":m.created_at.isoformat() if m.created_at else None,
+                **stats.get(m.id,{"jobs":0,"active":0,"completed":0})} for m in media]
+        return {"items":items,"total":total,"limit":limit,"offset":offset}
+
+@app.delete("/api/media/{media_id}",dependencies=[Depends(authorize)])
+def delete_media(media_id:str,actor:dict=Depends(authorize)):
+    """Move a source video and all of its jobs to the Trash (restorable by an admin)."""
+    with session() as db:
+        m=db.scalar(visible(select(MediaAsset).where(MediaAsset.id==media_id).with_for_update(),actor,MediaAsset))
+        if m is None:raise HTTPException(404,"Video not found")
+        jobs=db.scalars(select(TranslationJob).where(TranslationJob.media_id==media_id,
+                                                      TranslationJob.deleted_at.is_(None)).with_for_update()).all()
+        if any(j.status in ACTIVE_STATUSES for j in jobs):
+            raise HTTPException(409,"This video has jobs in progress. Cancel them before deleting the video")
+        now=datetime.now(timezone.utc);who=actor_label(actor)
+        m.deleted_at=now;m.deleted_by=who
+        for j in jobs:j.deleted_at=now;j.deleted_by=who   # same timestamp: restored together
+        db.commit()
+    return {"id":media_id,"trashed":True,"jobs_trashed":len(jobs)}
+
+# ---------------- Trash (admin only) ----------------
+
+TRASH_SORTS={"deleted_newest":lambda c:c.deleted_at.desc(),"deleted_oldest":lambda c:c.deleted_at.asc(),
+             "name_asc":lambda c:func.lower(c.filename).asc(),"name_desc":lambda c:func.lower(c.filename).desc()}
+
+@app.get("/api/trash",dependencies=[Depends(authorize)])
+def list_trash(kind:str=Query("all",pattern="^(all|job|video)$"),search:str|None=Query(None,max_length=200),
+               sort:str=Query("deleted_newest",pattern="^("+"|".join(TRASH_SORTS)+")$"),
+               limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),actor:dict=Depends(authorize)):
+    require_admin(actor)
+    term=search_term(search)
+    with session() as db:
+        items=[]
+        if kind in ("all","video"):
+            q=select(MediaAsset).where(MediaAsset.deleted_at.is_not(None))
+            if term:q=q.where(or_(MediaAsset.filename.ilike(term,escape="\\"),MediaAsset.id.ilike(term,escape="\\")))
+            for m in db.scalars(q):
+                n=db.scalar(select(func.count()).where(TranslationJob.media_id==m.id)) or 0
+                items.append({"kind":"video","id":m.id,"filename":m.filename,"source_kind":m.source_kind,
+                              "size_bytes":m.size_bytes,"status":None,"jobs":n,"media_id":m.id,
+                              "owner_user_id":m.owner_user_id,"deleted_by":m.deleted_by,"deleted_at":m.deleted_at})
+        if kind in ("all","job"):
+            # Jobs trashed along with their video are listed under that video, not separately.
+            q=(select(TranslationJob,MediaAsset).join(MediaAsset,TranslationJob.media_id==MediaAsset.id)
+               .where(TranslationJob.deleted_at.is_not(None),MediaAsset.deleted_at.is_(None)))
+            if term:q=q.where(or_(MediaAsset.filename.ilike(term,escape="\\"),TranslationJob.id.ilike(term,escape="\\")))
+            for j,m in db.execute(q):
+                items.append({"kind":"job","id":j.id,"filename":m.filename,"source_kind":m.source_kind,
+                              "size_bytes":m.size_bytes,"status":j.status,"jobs":None,"media_id":m.id,
+                              "owner_user_id":j.owner_user_id,"deleted_by":j.deleted_by,"deleted_at":j.deleted_at})
+        names=dict(db.execute(select(AppUser.id,AppUser.display_name)).all())
+    key={"deleted_newest":(lambda i:i["deleted_at"],True),"deleted_oldest":(lambda i:i["deleted_at"],False),
+         "name_asc":(lambda i:i["filename"].lower(),False),"name_desc":(lambda i:i["filename"].lower(),True)}[sort]
+    items.sort(key=key[0],reverse=key[1])
+    for i in items:
+        i["deleted_at"]=i["deleted_at"].isoformat() if i["deleted_at"] else None
+        i["owner_name"]=names.get(i["owner_user_id"])
+        i["deleted_by_name"]="Administrator" if i["deleted_by"]=="admin" else names.get(i["deleted_by"],i["deleted_by"])
+    return {"items":items[offset:offset+limit],"total":len(items),"limit":limit,"offset":offset}
+
+def _trashed(db,kind,item_id):
+    model=MediaAsset if kind=="video" else TranslationJob
+    row=db.scalar(select(model).where(model.id==item_id,model.deleted_at.is_not(None)).with_for_update())
+    if row is None:raise HTTPException(404,"Not in the Trash")
+    return row
+
+@app.post("/api/trash/{kind}/{item_id}/restore",dependencies=[Depends(authorize)])
+def restore_trash(kind:str=Path(pattern="^(job|video)$"),item_id:str=Path(max_length=36),actor:dict=Depends(authorize)):
+    require_admin(actor)
+    with session() as db:
+        row=_trashed(db,kind,item_id)
+        restored=0
+        if kind=="video":
+            # Bring back the jobs that were trashed together with the video.
+            for j in db.scalars(select(TranslationJob).where(TranslationJob.media_id==row.id,
+                                                              TranslationJob.deleted_at==row.deleted_at)):
+                j.deleted_at=None;j.deleted_by=None;restored+=1
+        else:
+            m=db.get(MediaAsset,row.media_id)
+            if m is not None and m.deleted_at is not None:
+                m.deleted_at=None;m.deleted_by=None   # a job needs its source video
+        row.deleted_at=None;row.deleted_by=None
+        db.commit()
+    if kind=="job":log_event(item_id,"job","Restored from Trash")
+    return {"kind":kind,"id":item_id,"restored":True,"jobs_restored":restored}
+
+def _purge(db,kind,row)->list:
+    """Hard-delete a trashed row (a video takes all of its jobs). Returns storage keys to remove."""
+    if kind=="job":
+        db.execute(delete(JobEvent).where(JobEvent.job_id==row.id))
+        db.execute(delete(TranslationCorrection).where(TranslationCorrection.job_id==row.id))
+        keys=[row.output_key,row.subtitle_key];db.delete(row);return keys
+    jobs=db.scalars(select(TranslationJob).where(TranslationJob.media_id==row.id)).all()
+    if any(j.deleted_at is None for j in jobs):
+        raise HTTPException(409,"Restore or trash this video's remaining jobs first")
+    keys=[row.object_key]+[k for j in jobs for k in (j.output_key,j.subtitle_key)]
+    db.execute(delete(JobEvent).where(JobEvent.job_id.in_([j.id for j in jobs])))
+    db.execute(delete(TranslationCorrection).where(TranslationCorrection.job_id.in_([j.id for j in jobs])))
+    db.execute(delete(TranslationJob).where(TranslationJob.media_id==row.id))
+    db.delete(row);return keys
+
+@app.delete("/api/trash/{kind}/{item_id}",dependencies=[Depends(authorize)])
+def purge_trash_item(kind:str=Path(pattern="^(job|video)$"),item_id:str=Path(max_length=36),actor:dict=Depends(authorize)):
+    """Permanently delete one Trash item and its stored files. Cannot be undone."""
+    require_admin(actor)
+    with session() as db:
+        keys=_purge(db,kind,_trashed(db,kind,item_id));db.commit()
+    return {"kind":kind,"id":item_id,"deleted":True,"storage_cleaned":delete_storage(keys)}
+
+@app.delete("/api/trash",dependencies=[Depends(authorize)])
+def empty_trash(actor:dict=Depends(authorize)):
+    """Empty the Trash: permanently delete every trashed job and video and their files."""
+    require_admin(actor)
+    keys=[];jobs=0;videos=0
+    with session() as db:
+        for j in db.scalars(select(TranslationJob).join(MediaAsset,TranslationJob.media_id==MediaAsset.id)
+                            .where(TranslationJob.deleted_at.is_not(None),MediaAsset.deleted_at.is_(None)).with_for_update()):
+            keys+=_purge(db,"job",j);jobs+=1
+        for m in db.scalars(select(MediaAsset).where(MediaAsset.deleted_at.is_not(None)).with_for_update()):
+            jobs+=db.scalar(select(func.count()).where(TranslationJob.media_id==m.id)) or 0
+            keys+=_purge(db,"video",m);videos+=1
+        db.commit()
+    return {"deleted":True,"jobs_deleted":jobs,"videos_deleted":videos,"storage_cleaned":delete_storage(keys)}
+
 @app.post("/api/jobs/{job_id}/cancel",dependencies=[Depends(authorize)])
 def cancel_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        j=db.scalar(only_owned(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
+        j=db.scalar(visible(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
         if j is None:raise HTTPException(404,"Job not found")
         if j.status not in ("queued","processing","cancelling"):
             raise HTTPException(409,"Job is not cancellable")
@@ -362,12 +757,41 @@ def cancel_job(job_id:str,actor:dict=Depends(authorize)):
             j.status="cancelling"
             j.stage="cancellation requested"
         db.commit()
-        return {"id":j.id,"status":j.status}
+        status=j.status
+    log_event(job_id,"job","Cancel requested",level="warning",by=actor_label(actor))
+    if status=="cancelling":
+        status=abort_running_job(job_id) or status
+    return {"id":job_id,"status":status}
+
+def abort_running_job(job_id:str)->str|None:
+    """Terminate the worker process running this job right away (SIGTERM → job unwinds and cleans up).
+
+    If no live worker is running it (orphaned by a restart), mark it cancelled now.
+    Returns the new status when it is already final, else None (worker finishes the abort).
+    """
+    from app.tasks import celery_app
+    try:
+        active=celery_app.control.inspect(timeout=1.0).active()
+    except Exception as exc:
+        logger.warning("Could not reach workers to abort job %s: %s",job_id,exc)
+        return None
+    # The worker's main process answers even while a job runs, so no reply means no live worker.
+    for tasks in (active or {}).values():
+        for t in tasks:
+            if (t.get("args") or [None])[0]==job_id:
+                celery_app.control.revoke(t["id"],terminate=True,signal="SIGTERM")
+                return None
+    with session() as db:
+        j=db.scalar(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update())
+        if j is not None and j.status=="cancelling":
+            j.status="cancelled";j.stage="cancelled";db.commit()
+            return "cancelled"
+    return None
 
 @app.post("/api/jobs/{job_id}/retry",dependencies=[Depends(authorize)])
 def retry_job(job_id:str,actor:dict=Depends(authorize)):
     with session() as db:
-        j=db.scalar(only_owned(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
+        j=db.scalar(visible(select(TranslationJob).where(TranslationJob.id==job_id).with_for_update(),actor,TranslationJob))
         if j is None:raise HTTPException(404,"Job not found")
         if j.status not in ("failed","dispatch_failed","cancelled"):
             raise HTTPException(409,"Only failed or cancelled jobs can be retried")
@@ -375,6 +799,9 @@ def retry_job(job_id:str,actor:dict=Depends(authorize)):
         j.cancel_requested=False
         j.progress=0
         j.stage="queued for retry"
+        j.timings=None
+        j.segments=None
+        log_event(j.id,"job","Retry requested",by=actor_label(actor))
         j.error=None
         j.output_key=None
         j.subtitle_key=None
@@ -411,7 +838,7 @@ def player_token(job_id:str,actor:dict=Depends(authorize)):
 def playback_job(job_id:str,token:str):
     with session() as db:
         job=db.get(TranslationJob,job_id)
-        if job is None or job.status!="completed" or not job.output_key:
+        if job is None or job.deleted_at is not None or job.status!="completed" or not job.output_key:
             raise HTTPException(404,"Video not available")
         try:
             check_playback_token(token,job_id,job.owner_user_id,settings.auth_session_secret)

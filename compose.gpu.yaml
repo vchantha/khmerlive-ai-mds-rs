@@ -1,0 +1,31 @@
+# NVIDIA GPU worker: speech recognition + Khmer voice on the GPU, translation on CPU (CTranslate2).
+# Requires the NVIDIA driver + NVIDIA Container Toolkit. Use scripts/deploy.sh, or:
+# docker compose -f compose.yaml -f compose.real.yaml -f compose.gpu.yaml [-f compose.ollama.yaml -f compose.ollama-gpu.yaml] up -d --build
+#
+# Defaults are measured on a 4 GB Quadro T1000 sharing the GPU with Ollama (qwen3:4b, ~2.9 GB).
+# On a GPU with 8 GB or more, also set MT_DEVICE=cuda and ASR_RELEASE_AFTER_USE=false in .env.
+services:
+  worker:
+    image: khmerlive-worker:real-gpu
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.real
+      args:
+        TORCH_VARIANT: cu124
+    gpus: all
+    environment:
+      INFERENCE_DEVICE: cpu
+      ASR_DEVICE: ${ASR_DEVICE:-cuda}
+      TTS_DEVICE: ${TTS_DEVICE:-cuda}
+      MT_DEVICE: ${MT_DEVICE:-cpu}
+      ASR_RELEASE_AFTER_USE: ${ASR_RELEASE_AFTER_USE:-true}
+      # Whisper large-v3-turbo: 41% fewer word errors than small. On a 4 GB GPU it doesn't fit next
+      # to the LLM, so the LLM is unloaded during speech recognition and reloaded for post-editing.
+      WHISPER_MODEL_PATH: ${GPU_WHISPER_MODEL_PATH:-/models/asr-large-v3-turbo}
+      LLM_UNLOAD_BEFORE_GPU_ASR: ${LLM_UNLOAD_BEFORE_GPU_ASR:-true}
+      # Fresh process per job: all GPU memory (Whisper, TTS, CUDA context) is freed between jobs.
+      WORKER_MAX_TASKS_PER_CHILD: ${WORKER_MAX_TASKS_PER_CHILD:-1}
+  api:
+    environment:
+      # Same speech model as the worker, so System health reports what jobs use.
+      WHISPER_MODEL_PATH: ${GPU_WHISPER_MODEL_PATH:-/models/asr-large-v3-turbo}

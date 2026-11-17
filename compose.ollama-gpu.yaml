@@ -1,0 +1,25 @@
+# Optional NVIDIA GPU acceleration for Ollama post-editing.
+# Requires a loaded NVIDIA driver (nvidia-smi works) and nvidia-container-toolkit
+# configured for Docker (`docker info` lists the `nvidia` runtime). See docs/OFFLINE_OLLAMA.md.
+# docker compose -f compose.yaml -f compose.real.yaml -f compose.ollama.yaml -f compose.ollama-gpu.yaml up -d
+#
+# Defaults are sized for a small (4 GB) card such as a Quadro T1000: qwen3:4b-instruct
+# (~2.5 GB Q4) plus a 2048-token q8_0 KV cache fits fully in VRAM.
+services:
+  ollama:
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      # Flash attention + quantized KV cache roughly halve KV memory, keeping all layers on GPU.
+      OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-1}
+      OLLAMA_KV_CACHE_TYPE: ${OLLAMA_KV_CACHE_TYPE:-q8_0}
+      # Keep the model resident; reloading to VRAM per job wastes seconds.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      # 2 subtitle lines at once. Context is per line, so 2 x 1024 uses the same VRAM as 1 x 2048.
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-1024}
+  worker:
+    environment:
+      # GPU responses take ~1 s per segment; fail fast instead of waiting on a stuck request.
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      LLM_CONCURRENCY: ${LLM_CONCURRENCY:-2}

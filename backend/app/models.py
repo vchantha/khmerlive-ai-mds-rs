@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String,Text,ForeignKey,DateTime,BigInteger,func,UniqueConstraint
+from sqlalchemy import String,Text,ForeignKey,DateTime,BigInteger,Integer,Float,func,UniqueConstraint
 from sqlalchemy.orm import Mapped,mapped_column
 from app.db import Base
 
@@ -16,6 +16,9 @@ class MediaAsset(Base):
     source_kind:Mapped[str]=mapped_column(String(16),default="upload",server_default="upload")
     capture_seconds:Mapped[int|None]=mapped_column(nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+    # Soft delete: set when moved to the Trash; only an admin purge removes the row and files.
+    deleted_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True,index=True)
+    deleted_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
 
 class TranslationJob(Base):
     __tablename__="translation_jobs"
@@ -33,9 +36,15 @@ class TranslationJob(Base):
     output_key:Mapped[str|None]=mapped_column(String(500),nullable=True)
     subtitle_key:Mapped[str|None]=mapped_column(String(500),nullable=True)
     processing_mode:Mapped[str]=mapped_column(String(32),default="demo",server_default="demo")
+    # JSON: seconds per pipeline stage, devices and engines used (performance tuning).
+    timings:Mapped[str|None]=mapped_column(Text,nullable=True)
+    # JSON list of subtitle lines: start_ms, end_ms, source, machine (MT draft), llm, final.
+    segments:Mapped[str|None]=mapped_column(Text,nullable=True)
     owner_user_id:Mapped[str|None]=mapped_column(ForeignKey("app_users.id"),nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())
+    deleted_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True,index=True)
+    deleted_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
 
 
 class AppUser(Base):
@@ -54,4 +63,53 @@ class SocialIdentity(Base):
     provider:Mapped[str]=mapped_column(String(30))
     subject:Mapped[str]=mapped_column(String(255))
     display_name:Mapped[str|None]=mapped_column(String(200),nullable=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+
+
+class JobEvent(Base):
+    """Pipeline log: one row per step event, and one per LLM post-edit line (stage='llm')."""
+    __tablename__="job_events"
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    job_id:Mapped[str]=mapped_column(ForeignKey("translation_jobs.id",ondelete="CASCADE"),index=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+    stage:Mapped[str]=mapped_column(String(40))
+    level:Mapped[str]=mapped_column(String(10),default="info")
+    message:Mapped[str]=mapped_column(Text)
+    seconds:Mapped[float|None]=mapped_column(Float,nullable=True)
+    data:Mapped[str|None]=mapped_column(Text,nullable=True)   # JSON details
+
+
+class TranslationCorrection(Base):
+    """A human-verified translation of one subtitle line: training data for fine-tuning."""
+    __tablename__="translation_corrections"
+    __table_args__=(UniqueConstraint("job_id","segment_index",name="uq_correction_job_segment"),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    job_id:Mapped[str]=mapped_column(ForeignKey("translation_jobs.id",ondelete="CASCADE"),index=True)
+    segment_index:Mapped[int]=mapped_column(Integer)
+    start_ms:Mapped[int]=mapped_column(Integer)
+    end_ms:Mapped[int]=mapped_column(Integer)
+    source_lang:Mapped[str]=mapped_column(String(2))
+    target_lang:Mapped[str]=mapped_column(String(2))
+    source_text:Mapped[str]=mapped_column(Text)
+    machine_text:Mapped[str|None]=mapped_column(Text,nullable=True)
+    llm_text:Mapped[str|None]=mapped_column(Text,nullable=True)
+    corrected_text:Mapped[str]=mapped_column(Text)
+    # True when the reviewer accepted the existing translation unchanged.
+    approved_unchanged:Mapped[bool]=mapped_column(default=False,server_default="false")
+    created_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+    updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now(),onupdate=func.now())
+
+
+class GlossaryTerm(Base):
+    """Required terminology for translation (e.g. elephant -> ដំរី), applied by the LLM post-editor."""
+    __tablename__="glossary_terms"
+    __table_args__=(UniqueConstraint("source_lang","target_lang","source_term",name="uq_glossary_term"),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    source_lang:Mapped[str]=mapped_column(String(2))
+    target_lang:Mapped[str]=mapped_column(String(2))
+    source_term:Mapped[str]=mapped_column(String(200))
+    target_term:Mapped[str]=mapped_column(String(200))
+    note:Mapped[str|None]=mapped_column(String(500),nullable=True)
+    created_by:Mapped[str|None]=mapped_column(String(200),nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())

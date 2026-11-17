@@ -1,11 +1,18 @@
 FROM python:3.12-slim-bookworm
+# TORCH_VARIANT=cpu (default, small image) or cu124 (NVIDIA GPU; CUDA libraries come from pip,
+# the host only needs the NVIDIA driver + NVIDIA Container Toolkit).
+ARG TORCH_VARIANT=cpu
+ARG TORCH_VERSION=2.5.1
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt requirements-real.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir torch==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir "torch==${TORCH_VERSION}+${TORCH_VARIANT}" --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
     && pip install --no-cache-dir -r requirements-real.txt
+# CTranslate2 (Whisper + converted M2M100) loads cuBLAS/cuDNN from the pip-installed NVIDIA wheels.
+# On the CPU image these directories don't exist and the setting is ignored.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
 COPY . .
 RUN useradd --system --create-home appuser && chown -R appuser:appuser /app
 USER appuser

@@ -78,7 +78,8 @@ services:
   worker:
     build: ./backend
     restart: unless-stopped
-    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    # WORKER_CONCURRENCY = videos processed at the same time (CPU threads are split between them).
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=${WORKER_CONCURRENCY:-1}"]
     env_file: .env
     environment:
       HF_HUB_OFFLINE: "1"

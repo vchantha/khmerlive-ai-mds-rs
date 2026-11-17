@@ -1,6 +1,6 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {Job,Metrics,ModelInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
-import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb} from './ui';
+import {Job,JobEvent,Segment,CorrectionSummary,GlossaryItem,MediaItem,TrashItem,Metrics,ModelInfo,LLMInfo,SystemData,Account,Provider,DirectoryUser,YouTubeInfo,req,uploadMedia,downloadVideo,downloadBlob,saveBlob,getApiKey,baseName,shortId,asDate,asTime,size,lang,isActive,isFailed,isYouTubeUrl,sourceLabel,fmtDur,timeLeft,outputsLabel} from './api';
+import {Icon,Logo,Badge,Bar,Avatar,Seg,Card,Thumb,confirmDialog} from './ui';
 
 export type Ctx={
  account:Account|null;providers:Provider[];isAdmin:boolean;userName:string;
@@ -28,10 +28,22 @@ async function createUploadJob(file:File,source:'en'|'km',onPct:(n:number)=>void
  const r=await req<{job_id:string}>('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_id:media.media_id,source_lang:source,target_lang:source==='en'?'km':'en'})});
  return r.job_id;
 }
-async function jobAction(ctx:Ctx,j:Job,which:'cancel'|'retry',after?:()=>void){
- if(which==='cancel'&&!window.confirm('Cancel “'+baseName(j.filename)+'”? The current step may need to finish first.'))return;
- try{await req('/api/jobs/'+j.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?'Cancellation requested':'Job queued again');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
+async function jobAction(ctx:Ctx,j:Job,which:'cancel'|'retry',after?:()=>void,force?:boolean){
+ if(which==='cancel'&&!force&&!await confirmDialog({tone:'warn',icon:'x',title:'Cancel this job?',
+  message:<>“<b>{baseName(j.filename)}</b>” stops right away. The step that's running is interrupted and nothing is published.</>,
+  details:['You can start it again later with Retry.'],confirmLabel:'Cancel job',cancelLabel:'Keep running'}))return;
+ try{const r=await req<{status?:string}>('/api/jobs/'+j.id+'/'+which,{method:'POST'});ctx.notify(which==='cancel'?(r.status==='cancelled'?'Job cancelled':'Stopping job…'):'Job queued again');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
 }
+
+async function trashJob(ctx:Ctx,j:Job,after?:()=>void){
+ if(isActive(j.status)){ctx.notify('Cancel the job before deleting it','err');return}
+ if(!await confirmDialog({tone:'danger',title:'Move job to Trash?',
+  message:<>“<b>{baseName(j.filename)}</b>” will disappear from your Jobs list.</>,
+  details:[ctx.isAdmin?'You can restore it from the Trash.':'An administrator can restore it if needed.','The source video is kept.'],
+  confirmLabel:'Move to Trash',cancelLabel:'Keep job'}))return;
+ try{await req('/api/jobs/'+j.id,{method:'DELETE'});ctx.notify('Job moved to the Trash');after?.();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}
+}
+const JOB_SORTS:[string,string][]=[['newest','Newest first'],['oldest','Oldest first'],['updated','Recently updated'],['name_asc','Name A–Z'],['name_desc','Name Z–A'],['status','Status']];
 
 /* ================= Sign in ================= */
 export function Login({providers,onKey,error}:{providers:Provider[];onKey:(k:string,remember:boolean)=>Promise<void>;error:string}){
@@ -297,8 +309,64 @@ export function JobPage({ctx,id}:{ctx:Ctx;id:string}){
  useEffect(()=>{if(!job||!isActive(job.status))return;const t=setInterval(()=>void load(),2500);return()=>clearInterval(t)},[job?.status,id]);
  if(err&&!job)return <><Head crumb={<><a href="#/jobs">Jobs</a> / {id.slice(0,8)}</>} title="Job not found"/><div className="alert alert-err">{err}</div></>;
  if(!job)return <div className="card pad"><span className="sk w60"/><span className="sk w40"/></div>;
- if(job.status==='completed'&&!forceProgress)return <Review ctx={ctx} job={job} onPipeline={()=>setForceProgress(true)}/>;
- return <Progress ctx={ctx} job={job} reload={load} onResult={job.status==='completed'?()=>setForceProgress(false):undefined}/>;
+ const view=job.status==='completed'&&!forceProgress?<Review ctx={ctx} job={job} onPipeline={()=>setForceProgress(true)}/>
+  :<Progress ctx={ctx} job={job} reload={load} onResult={job.status==='completed'?()=>setForceProgress(false):undefined}/>;
+ return <>{view}<JobLogs ctx={ctx} job={job}/></>;
+}
+
+/* ---------- Pipeline log (steps + LLM tasks) ---------- */
+const STAGE_NAMES:Record<string,string>={job:'Job',prepare:'Prepare',download:'Source',extract_audio:'Audio',asr_translate:'Speech + translation',
+ llm_postedit:'LLM post-edit',llm:'LLM',tts:'Khmer voice',mux:'Mux',upload:'Publish'};
+const fmtSec=(s:number|null)=>s==null?'':s<1?Math.round(s*1000)+' ms':s<90?s.toFixed(1)+' s':Math.floor(s/60)+' min '+Math.round(s%60)+' s';
+const fmtVal=(v:unknown):string=>v==null?'—':typeof v==='object'?Object.entries(v as Record<string,unknown>).map(([k,x])=>k+': '+fmtVal(x)).join(', '):String(v);
+function JobLogs({ctx,job}:{ctx:Ctx;job:Job}){
+ const [open,setOpen]=useState(isActive(job.status)||isFailed(job.status));
+ const [tab,setTab]=useState<'steps'|'llm'>('steps');
+ const [events,setEvents]=useState<JobEvent[]|null>(null);
+ const [filter,setFilter]=useState<'all'|'changed'|'kept'>('all'),[q,setQ]=useState('');
+ const load=async()=>{try{setEvents((await req<{items:JobEvent[]}>('/api/jobs/'+job.id+'/events')).items)}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{if(open)void load()},[open,job.id,job.status,job.progress]);
+ useEffect(()=>{if(!open||!isActive(job.status))return;const t=setInterval(()=>void load(),3000);return()=>clearInterval(t)},[open,job.status,job.id]);
+ const steps=(events||[]).filter(e=>e.stage!=='llm');
+ const llm=(events||[]).filter(e=>e.stage==='llm').map(e=>({...(e.data as Record<string,unknown>),level:e.level,id:e.id}) as {id:number;index:number;english:string;draft:string;output:string|null;status:string;seconds:number|null;error:string|null;level:string});
+ const ok=(t:{status:string})=>t.status==='edited'||t.status==='unchanged';
+ const changed=llm.filter(t=>t.status==='edited'&&t.output!==t.draft).length;
+ const shown=llm.filter(t=>(filter==='all'||(filter==='changed'?t.status==='edited'&&t.output!==t.draft:!(t.status==='edited'&&t.output!==t.draft)))&&(!q||[t.english,t.draft,t.output].some(x=>x&&x.toLowerCase().includes(q.toLowerCase()))));
+ const download=()=>saveBlob(new Blob([JSON.stringify(events||[],null,2)],{type:'application/json'}),'job-'+shortId(job.id)+'-log.json');
+ return <section className="card logs">
+  <button className="logs-toggle" aria-expanded={open} onClick={()=>setOpen(v=>!v)}>
+   <Icon name="file"/><span><b>Pipeline log</b><small>Every step with timings{llm.length?' · '+llm.length+' LLM tasks':''}</small></span><Icon name={open?'chevron-up':'chevron-down'} size={18}/>
+  </button>
+  {open&&<div className="logs-body">
+   <div className="logs-bar">
+    <Seg label="Log view" value={tab} onChange={setTab} items={[['steps',<>Steps <em>{steps.length}</em></>],['llm',<>LLM tasks <em>{llm.length}</em></>]]}/>
+    <div className="toolbar-r">
+     {tab==='llm'&&<><label className="input-icon"><Icon name="search"/><input placeholder="Search text" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search LLM tasks"/></label>
+      <select className="select" value={filter} onChange={e=>setFilter(e.target.value as 'all')} aria-label="Filter LLM tasks"><option value="all">All lines</option><option value="changed">Edited by LLM</option><option value="kept">Kept original / failed</option></select></>}
+     <button className="btn btn-outline btn-sm" onClick={()=>void load()}><Icon name="refresh" size={15}/>Refresh</button>
+     <button className="btn btn-outline btn-sm" disabled={!events?.length} onClick={download}><Icon name="download" size={15}/>JSON</button>
+    </div>
+   </div>
+   {!events&&<span className="sk w80"/>}
+   {events&&tab==='steps'&&(steps.length?<ol className="logs-steps">{steps.map(e=><li key={e.id} className={'lv-'+e.level}>
+     <time>{e.at?new Date(e.at).toLocaleTimeString(undefined,{hour12:false}):''}</time>
+     <span className="logs-stage">{STAGE_NAMES[e.stage]||e.stage}</span>
+     <div className="logs-msg"><b>{e.message}</b>{e.data&&<small>{Object.entries(e.data).map(([k,v])=><span key={k}><i>{k.replace(/_/g,' ')}</i> {fmtVal(v)}</span>)}</small>}</div>
+     <span className="logs-dur">{fmtSec(e.seconds)}</span>
+    </li>)}</ol>:<div className="empty"><b>No log entries yet</b><span>Jobs processed before this update have no step log.</span></div>)}
+   {events&&tab==='llm'&&(llm.length?<>
+    <p className="hint">{llm.length} lines sent to the LLM · {changed} changed · {llm.length-changed} kept the machine translation · avg {fmtSec(llm.reduce((a,t)=>a+(t.seconds||0),0)/llm.length)} per line</p>
+    <div className="table-wrap"><table className="table logs-llm"><thead><tr><th>#</th><th>English</th><th>Machine draft</th><th>LLM output</th><th>Result</th><th>Time</th></tr></thead><tbody>
+     {shown.map(t=><tr key={t.id} className="no-click">
+      <td className="nowrap">{t.index+1}</td><td>{t.english}</td><td className="km">{t.draft}</td>
+      <td className="km">{t.output??<span className="muted">—</span>}</td>
+      <td><span className={'badge badge-'+(ok(t)?'ok':'warn')} title={t.error||undefined}>{ok(t)?(t.output===t.draft?'Unchanged':'Edited'):t.status}</span>{t.error&&<small className="clip" title={t.error}>{t.error}</small>}</td>
+      <td className="nowrap">{fmtSec(t.seconds)}</td></tr>)}
+     {!shown.length&&<tr><td colSpan={6}><div className="empty"><b>No lines match</b></div></td></tr>}
+    </tbody></table></div></>
+    :<div className="empty"><b>No LLM tasks</b><span>LLM post-editing was off for this job or hasn't run yet.</span></div>)}
+  </div>}
+ </section>;
 }
 function jobMeta(j:Job,extra?:string){return [srcName(j),j.capture_seconds&&j.source_kind!=='youtube'?j.capture_seconds+' s capture':'',lang(j.source_lang)+' → '+lang(j.target_lang),outputsLabel(j),extra].filter(Boolean).join(' · ')}
 function Progress({ctx,job,reload,onResult}:{ctx:Ctx;job:Job;reload:()=>Promise<void>;onResult?:()=>void}){
@@ -313,7 +381,7 @@ function Progress({ctx,job,reload,onResult}:{ctx:Ctx;job:Job;reload:()=>Promise<
  return <>
   <Head crumb={<><a href="#/jobs">Jobs</a> / {shortId(job.id)}</>} title={<>{baseName(job.filename)} <span className="head-badge"><Badge status={job.status}/></span></>} sub={jobMeta(job,'Started '+asDate(job.created_at))}>
    {onResult&&<button className="btn btn-outline" onClick={onResult}>View result</button>}
-   {isActive(job.status)?<button className="btn btn-outline btn-danger-text" disabled={job.status==='cancelling'} onClick={()=>void jobAction(ctx,job,'cancel',reload)}>{job.status==='cancelling'?'Cancelling…':'Cancel job'}</button>:stopped&&<button className="btn btn-primary" onClick={()=>void jobAction(ctx,job,'retry',reload)}><Icon name="refresh"/>Retry</button>}
+   {isActive(job.status)?<button className="btn btn-outline btn-danger-text" title={job.status==='cancelling'?'Stop it now':undefined} onClick={()=>void jobAction(ctx,job,'cancel',reload,job.status==='cancelling')}>{job.status==='cancelling'?'Cancelling… · Stop now':'Cancel job'}</button>:stopped&&<><button className="btn btn-outline btn-danger-text" onClick={()=>void trashJob(ctx,job,()=>ctx.go('/jobs'))}><Icon name="trash"/>Delete</button><button className="btn btn-primary" onClick={()=>void jobAction(ctx,job,'retry',reload)}><Icon name="refresh"/>Retry</button></>}
   </Head>
   <Card>
    <div className="pg-head"><h2>{heading}</h2><span><b>{job.progress}%</b>{timeLeft(job)&&' · '+timeLeft(job)}</span></div>
@@ -354,6 +422,7 @@ function Review({ctx,job,onPipeline}:{ctx:Ctx;job:Job;onPipeline:()=>void}){
  const share=async()=>{try{await navigator.clipboard.writeText(location.origin+'/#/job/'+job.id);ctx.notify('Link copied — people need access to this workspace to open it')}catch{ctx.notify('Could not copy the link','err')}};
  return <>
   <Head crumb={<><a href="#/jobs">Jobs</a> / {shortId(job.id)}</>} title={<>{baseName(job.filename)} <span className="head-badge"><span className="badge badge-ok"><Icon name="check" size={13}/>Completed</span></span></>} sub={jobMeta(job,(dur?fmtDur(dur)+' · ':'')+'Finished '+asDate(job.updated_at))}>
+   <button className="btn btn-outline btn-danger-text" onClick={()=>void trashJob(ctx,job,()=>ctx.go('/jobs'))}><Icon name="trash"/>Delete</button>
    <button className="btn btn-outline" onClick={onPipeline}>Pipeline</button>
    <button className="btn btn-outline" onClick={()=>void share()}><Icon name="share"/>Share</button>
    <button className="btn btn-primary" onClick={()=>void downloadVideo(job).catch(fail)}><Icon name="download"/>Download video</button>
@@ -375,11 +444,81 @@ function Review({ctx,job,onPipeline}:{ctx:Ctx;job:Job;onPipeline:()=>void}){
     {job.has_subtitles?<>
      <div className="pad-x"><label className="input-icon"><Icon name="search"/><input placeholder={'Search '+lang(job.target_lang)} value={q} onChange={e=>setQ(e.target.value)} aria-label="Search subtitles"/></label></div>
      <ol className="lines">{lines===null?<li><span className="sk w80"/></li>:shown.map((l,i)=><li key={i}><button className="ts" onClick={()=>seek(l.start)} title="Play from here">{l.start}</button><p className={job.target_lang==='km'?'km':''}>{l.text}</p></li>)}{lines&&!shown.length&&<li className="muted">No matching lines.</li>}</ol>
-     <p className="lines-foot">Click a time to jump there. Line editing isn't available yet — download the SRT to edit.</p>
+     <p className="lines-foot">Click a time to jump there. To fix the translation, use <b>Review translation</b> below. Your corrections also train a better model.</p>
     </>:<div className="pad"><div className="tp"><p className="tp-en">{job.transcript||'No transcript'}</p><p className="tp-km km">{job.translation||''}</p></div></div>}
    </section>
   </div>
+  <TranslationReview ctx={ctx} job={job} seek={(ms:number)=>{if(video.current){video.current.currentTime=ms/1000;void video.current.play().catch(()=>{})}}}/>
  </>;
+}
+
+/* ---------- Review translation: verified lines become fine-tuning data ---------- */
+const clock=(ms:number)=>{const s=Math.floor(ms/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+function TranslationReview({ctx,job,seek}:{ctx:Ctx;job:Job;seek:(ms:number)=>void}){
+ const [open,setOpen]=useState(false);
+ const [data,setData]=useState<{items:Segment[];available:boolean;verified:number}|null>(null);
+ const [draft,setDraft]=useState<Record<number,string>>({});      // unsaved edits / approvals
+ const [busy,setBusy]=useState(false),[showMt,setShowMt]=useState(false),[only,setOnly]=useState<'all'|'todo'>('all');
+ const load=async()=>{try{setData(await req('/api/jobs/'+job.id+'/segments'));setDraft({})}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{if(open&&!data)void load()},[open]);
+ const dirty=Object.keys(draft).length;
+ useEffect(()=>{if(!dirty)return;const h=(e:BeforeUnloadEvent)=>{e.preventDefault()};window.addEventListener('beforeunload',h);return()=>window.removeEventListener('beforeunload',h)},[dirty]);
+ const current=(s:Segment)=>draft[s.index]??s.corrected??s.final;
+ const state=(s:Segment)=>draft[s.index]!==undefined?'unsaved':s.corrected!=null?(s.approved_unchanged?'approved':'edited'):'todo';
+ const save=async()=>{
+  if(!dirty)return;setBusy(true);
+  try{const r=await req<{saved:number;verified:number}>('/api/jobs/'+job.id+'/corrections',{method:'PUT',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items:Object.entries(draft).map(([i,t])=>({index:Number(i),corrected_text:t}))})});
+   ctx.notify(r.saved+' line'+(r.saved===1?'':'s')+' saved · '+r.verified+' verified in this video');await load()}
+  catch(e){ctx.notify(errText(e),'err')}finally{setBusy(false)}};
+ const approveRest=async()=>{
+  const rest=(data?.items||[]).filter(s=>state(s)==='todo');if(!rest.length)return;
+  if(!await confirmDialog({tone:'primary',icon:'check',title:`Mark ${rest.length} line${rest.length===1?'':'s'} as correct?`,
+   message:<>Only do this if you've read them. These lines are used <b>as-is</b> to train the translation model, so wrong lines teach it mistakes.</>,
+   confirmLabel:'Mark as correct',cancelLabel:'Go back'}))return;
+  setDraft(d=>{const n={...d};rest.forEach(s=>{n[s.index]=s.final});return n})};
+ const items=(data?.items||[]).filter(s=>only==='all'||state(s)==='todo'||state(s)==='unsaved');
+ const verified=(data?.items||[]).filter(s=>s.corrected!=null).length,total=data?.items.length||0;
+ return <section className="card review">
+  <button className="logs-toggle" aria-expanded={open} onClick={()=>setOpen(v=>!v)}>
+   <Icon name="translate"/><span><b>Review translation</b><small>Correct or confirm each line. Verified lines train a better translation model{data?` · ${verified}/${total} verified`:''}</small></span><Icon name={open?'chevron-up':'chevron-down'} size={18}/>
+  </button>
+  {open&&<div className="logs-body">
+   {!data&&<span className="sk w80"/>}
+   {data&&!data.available&&<div className="empty"><b>Line review isn't available for this job</b><span>It was processed before line storage was added. Run the video again to review it.</span></div>}
+   {data&&data.available&&<>
+    <div className="review-progress"><Bar value={total?verified*100/total:0}/><span>{verified} of {total} lines verified</span></div>
+    <div className="logs-bar">
+     <Seg label="Show" value={only} onChange={setOnly} items={[['all','All lines'],['todo','Not reviewed']]}/>
+     <div className="toolbar-r">
+      <label className="check"><input type="checkbox" checked={showMt} onChange={e=>setShowMt(e.target.checked)}/> Show machine draft &amp; LLM</label>
+      <button className="btn btn-outline btn-sm" onClick={()=>void approveRest()}><Icon name="check" size={15}/>Mark rest as correct</button>
+     </div>
+    </div>
+    <ol className="review-lines">{items.map(s=>{const st=state(s);return <li key={s.index} className={'rv-'+st}>
+     <div className="rv-meta"><button className="ts" onClick={()=>seek(s.start_ms)} title="Play this line">{clock(s.start_ms)}</button>
+      <span className={'badge badge-'+(st==='todo'?'muted':st==='unsaved'?'run':'ok')}>{st==='todo'?'Not reviewed':st==='unsaved'?'Unsaved':st==='approved'?'Correct':'Corrected'}</span></div>
+     <div className="rv-body">
+      <p className="rv-en">{s.source}</p>
+      {showMt&&<p className="rv-mt km"><i>Machine:</i> {s.machine||'—'}{s.llm&&<><br/><i>LLM:</i> {s.llm}</>}</p>}
+      <textarea className={'rv-km'+(job.target_lang==='km'?' km':'')} rows={2} value={current(s)} aria-label={'Translation of line '+(s.index+1)}
+       onChange={e=>{const v=e.target.value;setDraft(d=>({...d,[s.index]:v}))}}
+       onKeyDown={e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();void save()}}}/>
+     </div>
+     <div className="rv-act">
+      {st==='todo'&&<button className="btn btn-outline btn-sm" title="The translation is correct" onClick={()=>setDraft(d=>({...d,[s.index]:s.final}))}><Icon name="check" size={15}/>Correct</button>}
+      {st==='unsaved'&&<button className="btn btn-ghost btn-sm" onClick={()=>setDraft(d=>{const n={...d};delete n[s.index];return n})}>Undo</button>}
+     </div>
+    </li>})}
+    {!items.length&&<li className="muted pad">All lines are reviewed. Thank you!</li>}</ol>
+    <div className={'review-save'+(dirty?' on':'')}>
+     <span>{dirty?`${dirty} unsaved change${dirty===1?'':'s'}`:'All changes saved'}</span>
+     <button className="btn btn-ghost btn-sm" disabled={!dirty||busy} onClick={()=>setDraft({})}>Discard</button>
+     <button className="btn btn-primary btn-sm" disabled={!dirty||busy} onClick={()=>void save()}>{busy?'Saving…':'Save'} <kbd>Ctrl ↵</kbd></button>
+    </div>
+   </>}
+  </div>}
+ </section>;
 }
 
 /* ================= Jobs (with library grid) ================= */
@@ -387,12 +526,13 @@ export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
  const initial=query.get('status')||'';
  const [status,setStatus]=useState<'all'|'active'|'completed'|'failed'>((['active','completed','failed'].includes(initial)?initial:'all') as 'all');
  const [view,setView]=useState<'list'|'grid'>(query.get('view')==='grid'?'grid':'list');
- const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[offset,setOffset]=useState(0);
+ const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[offset,setOffset]=useState(0),[sort,setSort]=useState('newest');
+ const mediaId=query.get('media')||'';
  const limit=view==='grid'?12:10;
  const [data,setData]=useState<{items:Job[];total:number}|null>(null);
- const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),status:view==='grid'&&status==='all'?'completed':status,source});if(search)p.set('search',search);setData(await req('/api/jobs?'+p))}catch(e){ctx.notify(errText(e),'err')}};
- useEffect(()=>{void load()},[status,search,source,offset,view]);
- useEffect(()=>{const t=setInterval(()=>void load(),6000);return()=>clearInterval(t)},[status,search,source,offset,view]);
+ const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),status:view==='grid'&&status==='all'?'completed':status,source,sort});if(search)p.set('search',search);if(mediaId)p.set('media_id',mediaId);setData(await req('/api/jobs?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[status,search,source,offset,view,sort]);
+ useEffect(()=>{const t=setInterval(()=>void load(),6000);return()=>clearInterval(t)},[status,search,source,offset,view,sort]);
  useEffect(()=>{const t=setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
  const m=ctx.metrics;
  return <>
@@ -400,11 +540,13 @@ export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
   <div className="toolbar">
    <Seg label="Status" value={status} onChange={v=>{setStatus(v);setOffset(0)}} items={[['all',<>All <em>{m.total}</em></>],['active',<>In progress <em>{m.processing+m.queued}</em></>],['completed',<>Completed <em>{m.completed}</em></>],['failed',<>Failed <em>{m.failed}</em></>]]}/>
    <div className="toolbar-r">
-    <label className="input-icon"><Icon name="search"/><input placeholder="Search title or ID" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search jobs"/></label>
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search title, ID or link" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search jobs"/></label>
+    <select className="select" value={sort} onChange={e=>{setSort(e.target.value);setOffset(0)}} aria-label="Sort jobs">{JOB_SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select>
     <select className="select" value={source} onChange={e=>{setSource(e.target.value);setOffset(0)}} aria-label="Source"><option value="all">All sources</option><option value="youtube">YouTube</option><option value="upload">Upload</option><option value="url">Video link</option></select>
     <Seg label="View" value={view} onChange={v=>{setView(v);setOffset(0)}} items={[['list',<Icon name="list" key="l"/>],['grid',<Icon name="grid" key="g"/>]]}/>
    </div>
   </div>
+  {mediaId&&<div className="alert alert-info filter-chip">Showing jobs for one video · <a href="#/jobs">Show all jobs</a></div>}
   {view==='list'?<section className="card">
    <div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Source</th><th>Status</th><th>Created</th><th><span className="sr">Action</span></th></tr></thead><tbody>
     {data?.items.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}>
@@ -412,7 +554,7 @@ export function Jobs({ctx,query}:{ctx:Ctx;query:URLSearchParams}){
      <td>{sourceLabel(j.source_kind,j.capture_seconds)}</td>
      <td><div className="scell"><Badge status={j.status}/>{isActive(j.status)&&j.status!=='queued'&&<><Bar value={j.progress}/><small>{j.stage||''} · {j.progress}%</small></>}{j.status==='queued'&&<small>Waiting for a worker</small>}{isFailed(j.status)&&<small className="clip" title={j.error||''}>{j.error||'Failed'}</small>}</div></td>
      <td className="nowrap">{asDate(j.created_at)}</td>
-     <td className="act" onClick={e=>e.stopPropagation()}>{isFailed(j.status)||j.status==='cancelled'?<button className="btn btn-outline btn-sm" onClick={()=>void jobAction(ctx,j,'retry',load)}>Retry</button>:<button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/job/'+j.id)}>{j.status==='completed'?'Open':'View'}</button>}</td>
+     <td className="act" onClick={e=>e.stopPropagation()}><div className="act-row">{isFailed(j.status)||j.status==='cancelled'?<button className="btn btn-outline btn-sm" onClick={()=>void jobAction(ctx,j,'retry',load)}>Retry</button>:<button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/job/'+j.id)}>{j.status==='completed'?'Open':'View'}</button>}<button className="btn btn-ghost btn-sm btn-icon btn-danger-text" disabled={isActive(j.status)} title={isActive(j.status)?'Cancel the job before deleting it':'Move to Trash'} aria-label={'Delete '+baseName(j.filename)} onClick={()=>void trashJob(ctx,j,load)}><Icon name="trash" size={16}/></button></div></td>
     </tr>)}
     {data&&!data.items.length&&<tr><td colSpan={5}><div className="empty"><b>No jobs match</b><span>Try another filter, or start a new translation.</span></div></td></tr>}
     {!data&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
@@ -444,6 +586,14 @@ export function System({ctx}:{ctx:Ctx}){
  const isReal=real(m);
  const modelRow=(step:string,comp:string,ok:boolean|undefined,off?:boolean)=>{const inst=m?.installed?.[comp];const st=!isReal?['Demo','muted']:off?['Off','muted']:ok?['Ready','ok']:['Missing','bad'];
   return <tr key={comp}><td><b>{step}</b></td><td>{inst?<><span>{inst.id.split('/').pop()}</span><small className="mono">{inst.id}</small></>:<span className="muted">Not installed</span>}</td><td>{inst?.license?<span className={inst.license.includes('nc')?'lic nc':'lic'}>{inst.license.toUpperCase()}</span>:'—'}</td><td><span className={'badge badge-'+st[1]}>{st[0]}</span></td></tr>};
+ const llm=m?.llm;
+ const llmRow=()=>{
+  if(!llm)return <tr key="llm"><td><b>Polish translation</b><small>LLM post-edit</small></td><td><span className="muted">Not reported</span></td><td>—</td><td><span className="badge badge-muted">Unknown</span></td></tr>;
+  const st:[string,string]=!isReal?['Demo','muted']:llm.status==='ready'?['Ready','ok']:llm.status==='model_missing'?['Model not pulled','bad']:llm.status==='offline'?['Server offline','bad']:llm.status==='misconfigured'?['Misconfigured','bad']:['Off','muted'];
+  const srv=llm.server==='online'?'server online':llm.server==='offline'?'server not running':'server unknown';
+  const proc:[string,string,string]|null=llm.processor==='gpu'?['GPU','ok',llm.gpu_percent!=null?llm.gpu_percent+'% on GPU':'Runs on GPU']:llm.processor==='split'?[`${llm.gpu_percent}% GPU`,'warn',`Only ${llm.gpu_percent}% of the model fits in VRAM; the rest runs on CPU`]:llm.processor==='cpu'?['CPU','warn','Running on CPU only (slow)']:llm.processor==='idle'?['Not loaded','muted','Loads into memory on the next job']:null;
+  return <tr key="llm"><td><b>Polish translation</b><small>LLM post-edit (optional)</small></td><td><span>{llm.model}</span><small className="mono">{llm.provider} · {srv}{llm.server==='online'?(llm.model_available?' · model pulled':' · model not pulled'):''}</small></td><td>—</td><td><div className="llm-proc"><span className={'badge badge-'+st[1]}>{st[0]}</span>{proc&&<span className={'badge badge-'+proc[1]} title={proc[2]}>{proc[0]}</span>}</div></td></tr>;
+ };
  return <>
   <Head title="System health" sub="Services, server resources and the AI models behind each step. Refreshes every few seconds."><button className="btn btn-outline" onClick={()=>void ctx.refresh()}><Icon name="refresh"/>Refresh now</button></Head>
   <div className={'banner '+(down.length?'bad':unknown.length?'warn':'ok')}><Icon name={down.length?'alert':'check'} size={22}/><div><b>{down.length?down.map(d=>d[1]).join(', ')+(down.length>1?' are':' is')+' offline':unknown.length?'Most services are running · '+unknown.map(u=>u[1]).join(', ')+' not responding to pings':'All 5 services are running normally'}</b><span>{isReal?'Real AI mode':'Demo mode'} · {m?.installed&&Object.keys(m.installed).length?Object.keys(m.installed).length+' models installed':'no models installed'}</span></div></div>
@@ -462,9 +612,115 @@ export function System({ctx}:{ctx:Ctx}){
     {modelRow('Transcribe','asr',m?.subtitle_translation_configured)}
     {modelRow('Translate','mt',m?.subtitle_translation_configured)}
     {modelRow('Khmer voice','tts',m?.speech_dubbing_available,!m?.khmer_dubbing_enabled)}
+    {llmRow()}
    </tbody></table></div>
+   {llm&&isReal&&llm.status!=='ready'&&<p className="hint pad-x">{llmHint(llm)}</p>}
+   {llm&&isReal&&llm.status==='ready'&&(llm.processor==='cpu'||llm.processor==='split')&&<p className="hint pad-x">{llmProcHint(llm)}</p>}
    <p className="hint pad-x pb">To add or update models run <code>python3 scripts/download-models.py</code> on the server, then restart the worker.</p>
   </section>
+ </>;
+}
+
+function llmHint(l:LLMInfo){
+ const pull=l.provider==='ollama'?<>Pull it with <code>docker compose exec ollama ollama pull {l.model}</code>. </>:null;
+ if(l.status==='model_missing')return <>The {l.provider} server is running but <b>{l.model}</b> isn't downloaded, so jobs skip polishing. {pull}</>;
+ if(l.status==='offline')return <>Post-editing is on but the {l.provider} server isn't reachable. Start it with the <code>compose.{l.provider}.yaml</code> override. Jobs still finish without polishing.</>;
+ if(l.status==='misconfigured')return <>Post-editing is misconfigured: {l.detail}</>;
+ return <>Optional AI polishing of Khmer translations is off. {l.server==='online'&&!l.model_available?pull:null}To turn it on set <code>{l.provider==='vllm'?'VLLM_POSTEDIT_ENABLED':'LLM_POSTEDIT_ENABLED'}=true</code> in <code>.env</code> and restart api and worker.</>;
+}
+
+function llmProcHint(l:LLMInfo){
+ if(l.processor==='cpu')return <>Post-editing is running on the <b>CPU</b>, so each subtitle line takes several seconds. To use an NVIDIA GPU, install the NVIDIA Container Toolkit and add <code>-f compose.ollama-gpu.yaml</code> when starting the stack.</>;
+ return <>Only <b>{l.gpu_percent}%</b> of <b>{l.model}</b> fits in GPU memory; the rest runs on the CPU, which slows post-editing. Lower <code>OLLAMA_CONTEXT_LENGTH</code> or use a smaller model.</>;
+}
+
+/* ================= Videos ================= */
+const MEDIA_SORTS:[string,string][]=[['newest','Newest first'],['oldest','Oldest first'],['name_asc','Name A–Z'],['name_desc','Name Z–A'],['size_desc','Largest first'],['size_asc','Smallest first']];
+const kindLabel=(k:string)=>k==='youtube'?'YouTube':k==='url'?'Video link':'Upload';
+export function Videos({ctx}:{ctx:Ctx}){
+ const [q,setQ]=useState(''),[search,setSearch]=useState(''),[source,setSource]=useState('all'),[sort,setSort]=useState('newest'),[offset,setOffset]=useState(0);
+ const limit=15;
+ const [data,setData]=useState<{items:MediaItem[];total:number}|null>(null);
+ const load=async()=>{try{const p=new URLSearchParams({limit:String(limit),offset:String(offset),source,sort});if(search)p.set('search',search);setData(await req('/api/media?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[search,source,sort,offset]);
+ useEffect(()=>{const t=setTimeout(()=>{setSearch(q.trim());setOffset(0)},300);return()=>clearTimeout(t)},[q]);
+ const remove=async(m:MediaItem)=>{
+  if(m.active){ctx.notify('This video has jobs in progress. Cancel them first.','err');return}
+  if(!await confirmDialog({tone:'danger',title:'Move video to Trash?',
+   message:<>“<b>{baseName(m.filename)}</b>” will disappear from Videos{m.jobs?<> together with its <b>{m.jobs} translation job{m.jobs===1?'':'s'}</b></>:null}.</>,
+   details:[ctx.isAdmin?'You can restore everything from the Trash.':'An administrator can restore it if needed.'],
+   confirmLabel:'Move to Trash',cancelLabel:'Keep video'}))return;
+  try{const r=await req<{jobs_trashed:number}>('/api/media/'+m.id,{method:'DELETE'});ctx.notify('Video moved to the Trash'+(r.jobs_trashed?' with '+r.jobs_trashed+' job'+(r.jobs_trashed===1?'':'s'):''));void load();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}};
+ const pg=data?{total:data.total,items:data.items as unknown as Job[]}:null;
+ return <>
+  <Head title="Videos" sub="Source videos you uploaded or linked. Deleting a video also removes its translation jobs."><NewBtn go={ctx.go}/></Head>
+  <div className="toolbar">
+   <span className="muted">{data?data.total+' video'+(data.total===1?'':'s'):''}</span>
+   <div className="toolbar-r">
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search name, ID or link" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search videos"/></label>
+    <select className="select" value={source} onChange={e=>{setSource(e.target.value);setOffset(0)}} aria-label="Source"><option value="all">All sources</option><option value="youtube">YouTube</option><option value="upload">Upload</option><option value="url">Video link</option></select>
+    <select className="select" value={sort} onChange={e=>{setSort(e.target.value);setOffset(0)}} aria-label="Sort videos">{MEDIA_SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select>
+   </div>
+  </div>
+  <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Source</th><th>Size</th><th>Jobs</th><th>Added</th><th><span className="sr">Actions</span></th></tr></thead><tbody>
+   {data?.items.map(m=><tr key={m.id} onClick={()=>ctx.go('/jobs?media='+m.id)}>
+    <td><div className="vcell"><Thumb/><div><b title={m.filename}>{baseName(m.filename)}</b><small className="clip" title={m.source_url||m.id}>{m.source_url||shortId(m.id)}</small></div></div></td>
+    <td>{kindLabel(m.source_kind)}</td>
+    <td className="nowrap">{m.size_bytes?size(m.size_bytes):'—'}</td>
+    <td className="nowrap">{m.jobs}{m.active?<small>{m.active} in progress</small>:m.completed?<small>{m.completed} completed</small>:null}</td>
+    <td className="nowrap">{asDate(m.created_at)}</td>
+    <td className="act" onClick={e=>e.stopPropagation()}><div className="act-row"><button className="btn btn-outline btn-sm" onClick={()=>ctx.go('/jobs?media='+m.id)}>Jobs</button><button className="btn btn-ghost btn-sm btn-icon btn-danger-text" disabled={m.active>0} title={m.active?'Cancel its jobs before deleting':'Move to Trash'} aria-label={'Delete '+baseName(m.filename)} onClick={()=>void remove(m)}><Icon name="trash" size={16}/></button></div></td>
+   </tr>)}
+   {data&&!data.items.length&&<tr><td colSpan={6}><div className="empty"><b>No videos match</b><span>Try another search, or start a new translation.</span></div></td></tr>}
+   {!data&&<tr><td colSpan={6}><span className="sk w80"/></td></tr>}
+  </tbody></table></div>
+  <Pager data={pg} offset={offset} limit={limit} setOffset={setOffset}/></section>
+ </>;
+}
+
+/* ================= Trash (admin) ================= */
+const TRASH_SORTS:[string,string][]=[['deleted_newest','Recently deleted'],['deleted_oldest','Oldest deleted'],['name_asc','Name A–Z'],['name_desc','Name Z–A']];
+export function Trash({ctx}:{ctx:Ctx}){
+ const [kind,setKind]=useState<'all'|'job'|'video'>('all'),[q,setQ]=useState(''),[search,setSearch]=useState(''),[sort,setSort]=useState('deleted_newest');
+ const [data,setData]=useState<{items:TrashItem[];total:number}|null>(null),[busy,setBusy]=useState(false);
+ const load=async()=>{if(!ctx.isAdmin)return;try{const p=new URLSearchParams({kind,sort,limit:'200'});if(search)p.set('search',search);setData(await req('/api/trash?'+p))}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[kind,search,sort,ctx.isAdmin]);
+ useEffect(()=>{const t=setTimeout(()=>setSearch(q.trim()),300);return()=>clearTimeout(t)},[q]);
+ if(!ctx.isAdmin)return <><Head title="Trash"/><div className="alert alert-err">Only administrators can open the Trash.</div></>;
+ const label=(i:TrashItem)=>i.kind==='video'?'video':'job';
+ const restore=async(i:TrashItem)=>{try{const r=await req<{jobs_restored:number}>(`/api/trash/${i.kind}/${i.id}/restore`,{method:'POST'});ctx.notify('Restored '+label(i)+(r.jobs_restored?' and '+r.jobs_restored+' job'+(r.jobs_restored===1?'':'s'):''));void load();void ctx.refresh()}catch(e){ctx.notify(errText(e),'err')}};
+ const purge=async(i:TrashItem)=>{
+  if(!await confirmDialog({tone:'danger',title:'Delete forever?',
+   message:<>“<b>{baseName(i.filename)}</b>” and its files will be erased from storage.</>,
+   details:[...(i.kind==='video'&&i.jobs?[`Its ${i.jobs} job${i.jobs===1?'':'s'} will be deleted too.`]:[]),'This cannot be undone.'],
+   confirmLabel:'Delete forever',cancelLabel:'Keep in Trash'}))return;
+  try{const r=await req<{storage_cleaned:boolean}>(`/api/trash/${i.kind}/${i.id}`,{method:'DELETE'});ctx.notify(r.storage_cleaned?'Permanently deleted':'Deleted, but some files could not be removed from storage',r.storage_cleaned?undefined:'err');void load()}catch(e){ctx.notify(errText(e),'err')}};
+ const empty=async()=>{
+  if(!data?.total)return;
+  if(!await confirmDialog({tone:'danger',title:'Empty the Trash?',
+   message:<>All <b>{data.total} item{data.total===1?'':'s'}</b> in the Trash and their files will be permanently deleted.</>,
+   details:['This cannot be undone.'],confirmLabel:'Empty Trash',cancelLabel:'Keep items'}))return;
+  setBusy(true);try{const r=await req<{jobs_deleted:number;videos_deleted:number;storage_cleaned:boolean}>('/api/trash',{method:'DELETE'});ctx.notify('Trash emptied · '+r.videos_deleted+' video'+(r.videos_deleted===1?'':'s')+', '+r.jobs_deleted+' job'+(r.jobs_deleted===1?'':'s')+' deleted'+(r.storage_cleaned?'':' (some files could not be removed)'),r.storage_cleaned?undefined:'err');void load()}catch(e){ctx.notify(errText(e),'err')}finally{setBusy(false)}};
+ return <>
+  <Head title="Trash" sub="Jobs and videos deleted by anyone. Restore them, or delete permanently to erase their files."><button className="btn btn-outline btn-danger-text" disabled={busy||!data?.total} onClick={()=>void empty()}><Icon name="trash"/>{busy?'Emptying…':'Empty Trash'}</button></Head>
+  <div className="toolbar">
+   <Seg label="Type" value={kind} onChange={setKind} items={[['all','All'],['video','Videos'],['job','Jobs']]}/>
+   <div className="toolbar-r">
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search name or ID" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search Trash"/></label>
+    <select className="select" value={sort} onChange={e=>setSort(e.target.value)} aria-label="Sort Trash">{TRASH_SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select>
+   </div>
+  </div>
+  <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Item</th><th>Type</th><th>Owner</th><th>Deleted</th><th><span className="sr">Actions</span></th></tr></thead><tbody>
+   {data?.items.map(i=><tr key={i.kind+i.id} className="no-click">
+    <td><div className="vcell"><Thumb/><div><b title={i.filename}>{baseName(i.filename)}</b><small>{shortId(i.id)}{i.kind==='video'?' · '+kindLabel(i.source_kind)+(i.jobs?' · '+i.jobs+' job'+(i.jobs===1?'':'s'):''):''}</small></div></div></td>
+    <td>{i.kind==='video'?'Video':<>Job {i.status&&<Badge status={i.status}/>}</>}</td>
+    <td>{i.owner_name||(i.owner_user_id?shortId(i.owner_user_id):'Administrator')}</td>
+    <td className="nowrap">{asDate(i.deleted_at)}<small>by {i.deleted_by_name||'unknown'}</small></td>
+    <td className="act"><div className="act-row"><button className="btn btn-outline btn-sm" onClick={()=>void restore(i)}><Icon name="restore" size={15}/>Restore</button><button className="btn btn-ghost btn-sm btn-danger-text" onClick={()=>void purge(i)}>Delete forever</button></div></td>
+   </tr>)}
+   {data&&!data.items.length&&<tr><td colSpan={5}><div className="empty"><b>Trash is empty</b><span>Deleted jobs and videos appear here until you delete them permanently.</span></div></td></tr>}
+   {!data&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
+  </tbody></table></div></section>
  </>;
 }
 
@@ -473,11 +729,67 @@ export function Datasets({ctx}:{ctx:Ctx}){
  const rows=ctx.jobs.filter(j=>j.status==='completed'&&j.transcript&&j.translation&&j.processing_mode==='real_subtitles');
  const exportJsonl=()=>saveBlob(new Blob([rows.map(j=>JSON.stringify({job_id:j.id,source_lang:j.source_lang,target_lang:j.target_lang,source:j.transcript,target:j.translation})).join('\n')+'\n'],{type:'application/jsonl'}),'khmerlive-parallel-text.jsonl');
  return <>
+  <FineTuneCard ctx={ctx}/>
   <Head title="Datasets" sub="Parallel English ⇔ Khmer text produced by finished real-mode jobs."><button className="btn btn-primary" disabled={!rows.length} onClick={exportJsonl}><Icon name="download"/>Export JSONL</button></Head>
   <section className="card"><div className="table-wrap"><table className="table"><thead><tr><th>Video</th><th>Pair</th><th>Source text</th><th>Translation</th></tr></thead><tbody>
    {rows.map(j=><tr key={j.id} onClick={()=>ctx.go('/job/'+j.id)}><td><b>{baseName(j.filename)}</b><small className="mono">{shortId(j.id)}</small></td><td>{j.source_lang.toUpperCase()}→{j.target_lang.toUpperCase()}</td><td className="clip">{j.transcript}</td><td className="clip km">{j.translation}</td></tr>)}
    {!rows.length&&<tr><td colSpan={4}><div className="empty"><b>No parallel text yet</b><span>Demo-mode jobs only produce placeholder text, so they're excluded.</span></div></td></tr>}
   </tbody></table></div></section>
+ </>;
+}
+
+function FineTuneCard({ctx}:{ctx:Ctx}){
+ const [s,setS]=useState<CorrectionSummary|null>(null);
+ useEffect(()=>{req<CorrectionSummary>('/api/dataset/corrections').then(setS).catch(e=>ctx.notify(errText(e),'err'))},[]);
+ if(!s)return null;
+ const pct=Math.min(100,s.pairs*100/s.recommended_minimum);
+ return <section className="card pad ft-card">
+  <div className="ft-head"><div><h2>Fine-tuning data</h2><p className="hint top">Lines you verified in <b>Review translation</b> on each job. They're used to fine-tune the translation model for your videos.</p></div>
+   <button className="btn btn-outline" disabled={!s.pairs} onClick={()=>void downloadBlob('/api/dataset/corrections?format=jsonl','khmerlive-corrections.jsonl').catch(e=>ctx.notify(errText(e),'err'))}><Icon name="download"/>Training JSONL</button></div>
+  <div className="ft-stats">
+   <div><b>{s.pairs}</b><small>verified lines</small></div><div><b>{s.edited}</b><small>corrected</small></div>
+   <div><b>{s.approved_unchanged}</b><small>confirmed correct</small></div><div><b>{s.jobs}</b><small>videos</small></div>
+  </div>
+  <div className="review-progress"><Bar value={pct}/><span>{s.pairs>=s.recommended_minimum?'Enough data to fine-tune':`${s.recommended_minimum-s.pairs} more lines recommended before fine-tuning (${s.recommended_minimum}+)`}</span></div>
+  <p className="hint">Then run <code>./scripts/finetune-mt.sh</code> on the server. It trains, compares against the current model on videos it hasn't seen, and switches over only if the new model is better. <code>--rollback</code> undoes it.</p>
+ </section>;
+}
+
+/* ================= Glossary ================= */
+export function Glossary({ctx}:{ctx:Ctx}){
+ const [items,setItems]=useState<GlossaryItem[]|null>(null),[q,setQ]=useState('');
+ const [en,setEn]=useState(''),[km,setKm]=useState(''),[note,setNote]=useState(''),[busy,setBusy]=useState(false);
+ const load=async()=>{try{setItems((await req<{items:GlossaryItem[]}>('/api/glossary')).items)}catch(e){ctx.notify(errText(e),'err')}};
+ useEffect(()=>{void load()},[]);
+ const add=async(e:React.FormEvent)=>{e.preventDefault();if(!en.trim()||!km.trim())return;setBusy(true);
+  try{const exists=items?.some(i=>i.source_term===en.trim().toLowerCase());
+   await req('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_term:en,target_term:km,note:note||null})});
+   ctx.notify(exists?'Term updated':'Term added');setEn('');setKm('');setNote('');void load()}
+  catch(err){ctx.notify(errText(err),'err')}finally{setBusy(false)}};
+ const remove=async(g:GlossaryItem)=>{
+  if(!await confirmDialog({tone:'danger',title:'Remove this term?',message:<>“<b>{g.source_term}</b> → <span className="km">{g.target_term}</span>” will no longer be enforced in new translations.</>,
+   details:['Videos already translated keep their current text.'],confirmLabel:'Remove term',cancelLabel:'Keep term'}))return;
+  try{await req('/api/glossary/'+g.id,{method:'DELETE'});ctx.notify('Term removed');void load()}catch(e){ctx.notify(errText(e),'err')}};
+ const shown=(items||[]).filter(i=>!q||i.source_term.includes(q.toLowerCase())||i.target_term.includes(q));
+ return <>
+  <Head title="Glossary" sub="Words that must always be translated a certain way. When an English line contains a term, the LLM uses your Khmer word (plurals match too: elephant → elephants)."/>
+  {ctx.isAdmin?<form className="card pad gl-form" onSubmit={e=>void add(e)}>
+   <label className="field"><span>English term</span><input value={en} onChange={e=>setEn(e.target.value)} placeholder="elephant" maxLength={200} required/></label>
+   <label className="field"><span>Khmer</span><input className="km" value={km} onChange={e=>setKm(e.target.value)} placeholder="ដំរី" maxLength={200} required/></label>
+   <label className="field"><span>Note <small>(optional)</small></span><input value={note} onChange={e=>setNote(e.target.value)} placeholder="animal, not the Internet" maxLength={500}/></label>
+   <button className="btn btn-primary" disabled={busy||!en.trim()||!km.trim()}><Icon name="plus"/>{items?.some(i=>i.source_term===en.trim().toLowerCase())?'Update term':'Add term'}</button>
+  </form>:<div className="alert alert-info">Only administrators can change the glossary.</div>}
+  <section className="card">
+   <div className="card-h pad-x pt"><h2>{items?items.length+' term'+(items.length===1?'':'s'):'Terms'}</h2>
+    <label className="input-icon"><Icon name="search"/><input placeholder="Search" value={q} onChange={e=>setQ(e.target.value)} aria-label="Search glossary"/></label></div>
+   <div className="table-wrap"><table className="table"><thead><tr><th>English</th><th>Khmer</th><th>Note</th><th>Added</th><th><span className="sr">Actions</span></th></tr></thead><tbody>
+    {shown.map(g=><tr key={g.id} className="no-click"><td><b>{g.source_term}</b></td><td className="km">{g.target_term}</td><td className="muted">{g.note||'—'}</td>
+     <td className="nowrap">{asDate(g.created_at)}</td>
+     <td className="act">{ctx.isAdmin&&<button className="btn btn-ghost btn-sm btn-icon btn-danger-text" aria-label={'Remove '+g.source_term} title="Remove" onClick={()=>void remove(g)}><Icon name="trash" size={16}/></button>}</td></tr>)}
+    {items&&!shown.length&&<tr><td colSpan={5}><div className="empty"><b>{items.length?'No terms match':'No terms yet'}</b><span>Add words the translation keeps getting wrong, e.g. elephant → ដំរី.</span></div></td></tr>}
+    {!items&&<tr><td colSpan={5}><span className="sk w80"/></td></tr>}
+   </tbody></table></div>
+  </section>
  </>;
 }
 

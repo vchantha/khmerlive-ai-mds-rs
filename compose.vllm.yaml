@@ -1,0 +1,41 @@
+# Optional NVIDIA GPU profile. Run with compose.yaml and compose.real.yaml.
+# Models must be downloaded/cached before offline execution.
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.11.0}
+    profiles: ["vllm"]
+    restart: unless-stopped
+    gpus: all
+    shm_size: "4gb"
+    command:
+      - --model
+      - ${VLLM_MODEL:-Qwen/Qwen3-0.6B}
+      - --served-model-name
+      - ${VLLM_SERVED_MODEL:-khmerlive-postedit}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-2048}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_UTILIZATION:-0.70}
+      # Turing/Pascal GPUs (e.g. T1000, compute 7.5) lack bf16; "half" works on all CUDA GPUs.
+      - --dtype
+      - ${VLLM_DTYPE:-half}
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ${HF_CACHE_DIR:-./models/huggingface}:/root/.cache/huggingface:ro
+    networks: [backend]
+    # Intentionally no published host port.
+  api:
+    # Read-only status for System health; the api never sends job text to the LLM.
+    environment:
+      VLLM_POSTEDIT_ENABLED: ${VLLM_POSTEDIT_ENABLED:-false}
+      VLLM_BASE_URL: http://vllm:8000/v1
+      VLLM_MODEL: ${VLLM_SERVED_MODEL:-khmerlive-postedit}
+  worker:
+    environment:
+      VLLM_POSTEDIT_ENABLED: ${VLLM_POSTEDIT_ENABLED:-false}
+      VLLM_BASE_URL: http://vllm:8000/v1
+      VLLM_MODEL: ${VLLM_SERVED_MODEL:-khmerlive-postedit}
+      VLLM_FAIL_OPEN: ${VLLM_FAIL_OPEN:-true}
+      LLM_TOTAL_BUDGET_SECONDS: ${LLM_TOTAL_BUDGET_SECONDS:-900}

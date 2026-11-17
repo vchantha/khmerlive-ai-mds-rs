@@ -1,3 +1,197 @@
+# KhmerLive AI — Docker Compose Research MVP
+
+## 🚀 Deploy (quick guide)
+
+One script deploys everything. It detects an NVIDIA GPU and picks the right
+setup, and it remembers that choice, so later plain `docker compose ...` commands work.
+
+### 1. Requirements
+
+| | CPU-only | With NVIDIA GPU |
+|---|---|---|
+| OS | Ubuntu 22.04/24.04/26.04 (any Linux with Docker) | same |
+| Docker | Docker Engine + Compose v2 | same + **NVIDIA driver** + **NVIDIA Container Toolkit** |
+| RAM | 8 GB min, 16 GB+ recommended | same |
+| Disk | ~15 GB (images + models) | ~25 GB (CUDA image is ~10 GB) |
+| GPU | — | 4 GB VRAM works (tested: Quadro T1000); 8 GB+ is faster |
+
+### 2. One-time setup
+
+```bash
+git clone <this repo> && cd khmerlive-ai-mds-rs
+bash scripts/init-env.sh                 # creates .env with random secrets (never commit it)
+pip install --user huggingface_hub       # needed by the download script
+python3 scripts/download-models.py       # speech, translation, Khmer voice models → ./models
+```
+
+Optional AI polishing of Khmer translations (local LLM via Ollama): set
+`LLM_POSTEDIT_ENABLED=true` in `.env`. The deploy script pulls the model.
+
+**GPU only, one time.** Let Docker use the GPU:
+
+```bash
+nvidia-smi                                # must list your GPU (install the NVIDIA driver first)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+docker info | grep -i runtimes            # must show "nvidia"
+```
+
+### 3. Deploy
+
+```bash
+./scripts/deploy.sh          # auto: GPU if Docker can use it, otherwise CPU
+./scripts/deploy.sh --cpu    # force CPU-only
+./scripts/deploy.sh --gpu    # force GPU
+./scripts/deploy.sh --demo   # no models; placeholder output (UI test only)
+```
+
+The script:
+1. picks the Compose files and saves them as `COMPOSE_FILE` in `.env`;
+2. builds and starts everything;
+3. converts the translation model to the fast engine (one time);
+4. pulls the LLM;
+5. waits until the API is ready.
+
+Open **http://localhost:8080** and sign in with `API_KEY` from `.env`.
+
+### 4. Check it works
+
+```bash
+docker compose ps                                 # all services Up / healthy
+docker compose logs --tail=50 worker              # "Worker process: N CPU threads per job; devices asr=… mt=… tts=…"
+docker compose exec ollama ollama ps              # GPU: PROCESSOR = 100% GPU
+```
+
+Every finished job records how long each stage took. You can see this under `timings` in
+`GET /api/jobs/<id>`, or in the worker log line `Job … finished in …s`.
+
+### 5. Everyday commands
+
+| Task | Command |
+|---|---|
+| Update after `git pull` | `./scripts/deploy.sh` (same mode as before) |
+| Restart the worker | `docker compose restart worker` |
+| Follow logs | `docker compose logs -f worker api` |
+| Stop / start | `docker compose stop` / `docker compose start` |
+| Switch CPU ↔ GPU | `./scripts/deploy.sh --cpu` or `--gpu` |
+| Re-convert translation model | `FORCE=1 ./scripts/convert-mt-ct2.sh && docker compose restart worker` |
+
+### Performance: what runs where
+
+Measured on one 9.3-minute English video, Quadro T1000 (4 GB) + 12-core CPU:
+
+| Stage | CPU-only | GPU deployment | How |
+|---|---|---|---|
+| Speech recognition | 51.5 s (Whisper small) | **25 s** (Whisper **large-v3-turbo**) | GPU `int8_float16`. Turbo makes **41% fewer word errors** (LibriSpeech: 7.48% → 4.43% WER) |
+| Translation (M2M100) | 66 s (Transformers) | **~19 s** | CTranslate2 int8 on CPU, used automatically in both modes |
+| Khmer voice (MMS VITS) | 33 s / 20 lines | **3.1 s / 20 lines** | GPU |
+| LLM polishing (qwen3 4B) | ~10–15 s / line | **~2.4 s / line** (≈4.8 s each, 2 at once) | Ollama on GPU; now the slowest stage |
+
+Whole job, 6.9-minute video: **19.8 min (old CPU pipeline) → 5.3 min (GPU)**, faster than real time.
+
+CTranslate2 and Transformers use slightly different decoding, so CTranslate2 phrases some
+translations differently (mean character similarity about 0.74). Neither version is clearly
+better. To get the old engine back, set `MT_ENGINE=transformers` in `.env`.
+
+### Tuning (`.env`, then `./scripts/deploy.sh`)
+
+| Setting | Default | When to change |
+|---|---|---|
+| `WORKER_CONCURRENCY` | `1` | Videos processed at the same time. CPU-only: about 1 per 4 cores and 4 GB RAM. CPU threads are split between them automatically. Keep `1` on a 4 GB GPU |
+| `CPU_THREADS` | `0` (auto) | Threads per video; auto = cores ÷ concurrency |
+| `MT_ENGINE` | `auto` | `transformers` = original engine (slower) |
+| `ASR_DEVICE` / `TTS_DEVICE` / `MT_DEVICE` | GPU mode: `cuda`/`cuda`/`cpu` | GPU with 8 GB+: `MT_DEVICE=cuda` |
+| `ASR_RELEASE_AFTER_USE` | GPU mode: `true` | Frees Whisper's VRAM after each use (~1 s reload). `false` on 8 GB+ |
+| `LLM_CONCURRENCY` + `OLLAMA_NUM_PARALLEL` | GPU: `2` | Parallel LLM lines. Raise both together on bigger GPUs |
+| `OLLAMA_MODEL` | `qwen3:4b-instruct` | Smaller (`qwen3:1.7b`) if `ollama ps` shows a CPU/GPU split, or for faster polishing (check Khmer quality) |
+| `LLM_PRELOAD_ON_START` | `true` | The worker loads the LLM into memory at startup, so the first job doesn't wait for it (a cold load took 46 s). `OLLAMA_KEEP_ALIVE=-1` keeps it loaded even when idle |
+| `WORKER_MAX_TASKS_PER_CHILD` | GPU: `1` | Fresh worker process per job so all GPU memory is freed between jobs (models reload in a few seconds). `0` = keep the process |
+
+### Speech recognition model
+
+| Deployment | Model | Word error rate* | Notes |
+|---|---|---|---|
+| GPU | **Whisper large-v3-turbo** (default) | **4.43%** | ~1.1 GB VRAM. On a 4 GB GPU the LLM is unloaded during speech recognition and reloaded for post-editing (adds ~3 s per job) |
+| CPU-only | Whisper small (default) | 7.48% | Turbo also works on CPU (`WHISPER_MODEL_PATH=/models/asr-large-v3-turbo`), about 4× slower |
+
+\*Measured on 73 LibriSpeech clean utterances with human reference transcripts.
+`./scripts/deploy.sh --gpu` downloads turbo automatically (1.6 GB, once). To use small on the GPU, set
+`GPU_WHISPER_MODEL_PATH=/models/asr`.
+
+We also tested asking the LLM (qwen3:4b) to correct the transcripts. It made them **worse**
+(4.43% → 5.30% WER; it also "corrected" words that were already right), so it isn't part of the pipeline.
+
+### Glossary: fix words the model keeps getting wrong
+
+Open **Glossary** (Administration) and add terms such as *elephant → ដំរី*. When an English line
+contains a term (whole word, plurals too: *elephants*), the LLM post-editor must use your Khmer word. If its
+answer doesn't contain the word, it is asked once more. Lines that still miss it show
+`edited (missing term: …)` in the job's **Pipeline log → LLM tasks**. This works right away, with no
+training. It needs LLM post-editing enabled (`LLM_POSTEDIT_ENABLED=true`) and applies to new jobs.
+
+Tested on "Me at the zoo": without the glossary, M2M100 turned *elephants* into អ៊ីនធឺណិត (*internet*) and
+the LLM kept it; with *elephant → ដំរី* the line says ដំរី. The glossary can only fix words the speech
+recognizer heard correctly. If the English line itself is wrong (e.g. *trunks* heard as *fronts*), fix it in
+**Review translation**.
+
+`LLM_MODE` sets how the LLM works: `polish` (default) makes small edits to the machine draft;
+`translate` has the LLM translate the English itself, using the draft only as a hint and the neighbouring
+lines as context. On the zoo test, `translate` gave the better first line and a worse third line, so
+`polish` stays the default until more reviewed lines show otherwise.
+
+### Improving translation with your own corrections (fine-tuning)
+
+The translation model (M2M100) makes word-level mistakes, for example "elephants" → "internet".
+You can teach it your content and style:
+
+1. **Review.** Open a finished job and expand **Review translation**. For each line, either fix the
+   Khmer or click **Correct** if it's already right, then **Save** (Ctrl+Enter). The play button on
+   each line jumps the video there. Only lines you saved become training data.
+2. **Track progress.** The **Datasets** page shows how many lines are verified. Collect **300+ lines**
+   from several videos before training (the script refuses with fewer than 100).
+3. **Train.** On the server, run:
+   ```bash
+   ./scripts/finetune-mt.sh              # train, evaluate, deploy only if better
+   ./scripts/finetune-mt.sh --no-deploy  # train and evaluate only
+   ./scripts/finetune-mt.sh --rollback   # back to the original model
+   ```
+   The script trains a LoRA adapter on the GPU (it pauses the worker meanwhile; queued jobs wait). It then
+   scores the old and new models on **videos held out from training** (chrF++) and switches
+   `MT_CT2_PATH` only if the new model scores at least 1 point higher. Each run's report, with
+   example translations, is saved at `models/mt-ft-<date>/report.json`.
+
+Notes: the first run needs Internet once (it installs the PEFT library into the training container).
+Jobs processed before this feature can't be reviewed; run the video again to review it. Fix the
+translation of what was said; if the English line itself is wrong (a speech-recognition error), translate
+what the speaker actually said.
+
+### Khmer voice (dubbing) behaviour
+
+Each Khmer line is spoken at **natural speed and pitch**, starting at its subtitle time.
+It is never slowed down to fill a gap. A line longer than the pause before the next line is
+sped up, first through the voice model's own speaking rate (up to 1.5×), then with a
+pitch-preserving tempo change (up to 2× in total). The rare line that still doesn't fit is
+trimmed with a fade, and the worker log reports how each line was placed (`Khmer dub: …`).
+Every line is normalised to the same loudness and gets short fades, so there are no clicks.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Deploy says "NVIDIA GPU found but Docker can't use it" | Install the NVIDIA Container Toolkit (step 2), then `./scripts/deploy.sh --gpu` |
+| `CUDA failed with error out of memory` in worker logs | Keep `MT_DEVICE=cpu` and `ASR_RELEASE_AFTER_USE=true`; check `nvidia-smi`; use a smaller `OLLAMA_MODEL` |
+| `ollama ps` shows e.g. `30%/70% CPU/GPU` | Model doesn't fit in VRAM: smaller model or lower `OLLAMA_CONTEXT_LENGTH` |
+| Job stuck "processing" after a restart | Recovered automatically when the worker starts (marked *Interrupted*, press **Retry**) |
+| Cancel | Stops the job immediately (the running step is terminated). If it shows "Cancelling…", click **Stop now** |
+| Slow on CPU-only | Expected: GPU is 4–10× faster for speech and voice. Make sure `models/mt-ct2` exists (fast translation) |
+
+---
+
 ## Khmer voice dubbing (new)
 
 English→Khmer real-model jobs can now replace English speech with an offline
@@ -8,8 +202,6 @@ weights must be downloaded separately. Existing completed videos are not
 retroactively dubbed. Default Docker Compose remains **demo**; use
 `docker compose -f compose.yaml -f compose.real.yaml up -d --build`.
 No end-to-end Khmer speech synthesis on the user's machine has been verified.
-
-# KhmerLive AI — Docker Compose Research MVP
 
 **Research:** Uncertainty-Aware Adaptive Speech Segmentation for Low-Latency Offline English–Khmer Simultaneous Translation. [Notion roadmap](https://app.notion.com/p/41931200c90381c9bd02d240f29d9392).
 

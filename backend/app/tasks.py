@@ -1,8 +1,15 @@
 import hashlib
+import json
+import logging
+import os
+import signal
 import subprocess
 import tempfile
+import time
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from celery import Celery
+from celery.signals import worker_process_init,worker_ready
 from sqlalchemy import select
 from app.config import settings
 from app.db import SessionLocal
@@ -11,11 +18,113 @@ from app.storage import client
 from app.adapters import get_adapters
 from app.real_inference import translate_audio, build_srt, TimedText
 from app.khmer_tts import build_dubbed_audio
+from app.llm_postedit import postedit_rows,unload_llm,preload_llm,prompt_version
+from app.joblog import log_event,log_llm_tasks
 from app.live_capture import capture_chunks,combine_chunks
 from app.stream_urls import validate_stream_url
 from app.youtube import download_youtube,youtube_video_id,safe_title
 celery_app=Celery("khmerlive",broker=settings.redis_url,backend=settings.redis_url)
-celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=settings.job_time_limit_seconds,task_soft_time_limit=max(60,settings.job_time_limit_seconds-300))
+celery_app.conf.update(task_acks_late=True,worker_prefetch_multiplier=1,task_track_started=True,task_serializer="json",accept_content=["json"],task_time_limit=settings.job_time_limit_seconds,task_soft_time_limit=max(60,settings.job_time_limit_seconds-300),
+                       worker_max_tasks_per_child=settings.worker_max_tasks_per_child or None)
+logger=logging.getLogger(__name__)
+ACTIVE=("processing","cancelling")
+
+
+@worker_process_init.connect
+def _limit_threads(**_):
+    """Give each prefork process its share of the CPU so parallel jobs don't oversubscribe cores."""
+    threads=settings.threads_per_job()
+    for var in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS"):
+        os.environ[var]=str(threads)
+    try:
+        import torch
+        torch.set_num_threads(threads)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass   # demo image has no torch
+    signal.signal(signal.SIGTERM,_on_sigterm)
+    logger.info("Worker process: %d CPU threads per job; devices asr=%s mt=%s tts=%s",
+                threads,settings.device_for("asr"),settings.device_for("mt"),settings.device_for("tts"))
+
+
+def recover_interrupted_jobs(active_job_ids:set[str]|None)->int:
+    """Fail jobs left 'processing' by a worker that died (restart, crash, OOM) so users can Retry.
+
+    active_job_ids: job ids running on live workers, or None if they couldn't be listed;
+    then only jobs older than the hard time limit (certainly dead) are recovered.
+    """
+    cutoff=datetime.now(timezone.utc)-timedelta(seconds=settings.job_time_limit_seconds+120)
+    with SessionLocal() as db:
+        q=select(TranslationJob).where(TranslationJob.status.in_(ACTIVE))
+        if active_job_ids is None:q=q.where(TranslationJob.updated_at<cutoff)
+        elif active_job_ids:q=q.where(TranslationJob.id.not_in(active_job_ids))
+        stuck=db.scalars(q.with_for_update()).all()
+        n=0
+        for job in stuck:
+            job.status="failed" if job.status=="processing" else "cancelled"
+            job.stage="interrupted" if job.status=="failed" else "cancelled"
+            job.error="Interrupted: the worker stopped while processing (for example a restart). Retry the job." if job.status=="failed" else None
+            n+=1
+        db.commit()
+    if n:logger.warning("Recovered %d interrupted job(s)",n)
+    return n
+
+
+@worker_ready.connect
+def _recover_on_start(sender=None,**_):
+    active:set[str]|None=set()
+    try:
+        replies=celery_app.control.inspect(timeout=2).active() or {}
+        for host,tasks in replies.items():
+            if sender is not None and host==getattr(sender,"hostname",None):continue
+            for t in tasks:
+                args=t.get("args") or []
+                if args:active.add(str(args[0]))
+    except Exception as exc:
+        logger.warning("Could not list active tasks (%s); only recovering jobs past the time limit",exc)
+        active=None
+    try:recover_interrupted_jobs(active)
+    except Exception as exc:logger.warning("Interrupted-job recovery failed: %s",exc)
+    if settings.llm_preload_on_start and settings.llm_postedit_enabled:
+        import threading
+        threading.Thread(target=preload_llm,name="llm-preload",daemon=True).start()
+
+
+STAGE_LABELS={"prepare":"Prepare","download":"Get source video","extract_audio":"Extract audio",
+              "asr_translate":"Speech recognition + translation","llm_postedit":"LLM post-editing",
+              "tts":"Khmer voice synthesis","mux":"Build video (mux)","upload":"Publish output"}
+
+class StageClock:
+    """Wall-clock seconds per pipeline stage (saved on the job) and a step log (job_events)."""
+    def __init__(self,job_id:str|None=None):
+        self.data:dict={};self._t=time.monotonic();self._start=self._t;self._stage=None
+        self.job_id=job_id;self._notes:dict={}
+    def note(self,**details):
+        """Attach details to the current stage's 'finished' log event."""
+        self._notes.update(details)
+    def mark(self,stage:str|None):
+        now=time.monotonic()
+        if self._stage:
+            self.data[self._stage]=round(self.data.get(self._stage,0)+now-self._t,2)
+            if self.job_id:
+                log_event(self.job_id,self._stage,"Finished: "+STAGE_LABELS.get(self._stage,self._stage),
+                          seconds=now-self._t,**self._notes)
+        self._notes={}
+        if stage and self.job_id:
+            log_event(self.job_id,stage,"Started: "+STAGE_LABELS.get(stage,stage))
+        self._stage,self._t=stage,now
+    def finish(self)->dict:
+        self.mark(None);self.data["total"]=round(time.monotonic()-self._start,2);return self.data
+
+def inference_kwargs(timings:dict)->dict:
+    asr=settings.device_for("asr")
+    return dict(mt_device=settings.device_for("mt"),asr_compute=settings.asr_compute_type,
+                mt_engine=settings.mt_engine,mt_ct2_dir=settings.mt_ct2_path,beam_size=settings.mt_beam_size,
+                timings=timings,keep_asr_loaded=not(asr=="cuda" and (settings.asr_release_after_use or settings.llm_unload_before_gpu_asr)))
+
+def free_gpu_for_asr():
+    if settings.device_for("asr")=="cuda" and settings.llm_unload_before_gpu_asr:
+        unload_llm()
 
 def output_codec_args(source:Path)->list[str]:
     """Stream-copy when the input is already browser-playable (H.264 yuv420p + AAC).
@@ -42,6 +151,22 @@ def output_codec_args(source:Path)->list[str]:
 
 class CancelledJob(Exception):
     pass
+
+class JobAborted(BaseException):
+    """Raised by the SIGTERM handler when the API terminates a running job.
+
+    BaseException so broad `except Exception` blocks inside stages can't swallow it;
+    unwinding kills child processes (subprocess.run) and removes the temp directory.
+    """
+
+_running_job:str|None=None
+
+def _on_sigterm(signum,frame):
+    if _running_job:
+        raise JobAborted()
+    # Idle process: behave like the default SIGTERM (exit).
+    signal.signal(signal.SIGTERM,signal.SIG_DFL)
+    os.kill(os.getpid(),signal.SIGTERM)
 
 def check_cancel(db,job):
     db.refresh(job)
@@ -73,6 +198,31 @@ def persist_captured(s3,db,media,source:Path):
 
 @celery_app.task(name="translate_media",bind=True)
 def translate_media(self,job_id:str):
+    global _running_job
+    _running_job=job_id
+    try:
+        return _translate_media(job_id)
+    except JobAborted:
+        _finish_aborted(job_id)
+    finally:
+        _running_job=None
+
+def _finish_aborted(job_id:str):
+    """Terminated mid-stage: Cancelled if the user asked for it, otherwise Interrupted."""
+    with SessionLocal() as db:
+        job=db.get(TranslationJob,job_id)
+        if job is None or job.status in ("completed","failed","cancelled"):return
+        if job.cancel_requested or job.status=="cancelling":
+            job.status,job.stage,job.error="cancelled","cancelled",None
+        else:
+            job.status,job.stage="failed","interrupted"
+            job.error="Interrupted: the worker stopped while processing. Retry the job."
+        db.commit()
+        status=job.status
+    log_event(job_id,"job","Stopped immediately: cancelled by user" if status=="cancelled"
+              else "Interrupted: the worker was stopped",level="warning")
+
+def _translate_media(job_id:str):
     with SessionLocal() as db:
         job=db.get(TranslationJob,job_id)
         if job is None:return
@@ -80,6 +230,11 @@ def translate_media(self,job_id:str):
         check_cancel(db,job)
         set_state(db,job,"processing",progress=5,stage="starting")
         media=db.get(MediaAsset,job.media_id)
+        log_event(job.id,"job","Job started",mode=job.processing_mode,source=media.source_kind,
+                  file=media.filename,languages=f"{job.source_lang}->{job.target_lang}",
+                  devices={k:settings.device_for(k) for k in ("asr","mt","tts")},cpu_threads=settings.threads_per_job())
+        clock=StageClock(job.id);clock.mark("prepare")
+        timings:dict={}
         try:
             mode=job.processing_mode
             if mode not in ("demo","real_subtitles"):
@@ -93,7 +248,20 @@ def translate_media(self,job_id:str):
                 result=root/"output.mp4"
                 s3=client()
                 streamed_rows=None
-                if media.source_kind=="youtube":
+                clock.mark("download")
+                reused=False
+                if media.source_kind in ("youtube","url") and media.sha256 not in (None,"","pending"):
+                    # Already downloaded/captured by an earlier run: replay the stored copy
+                    # instead of fetching again (faster, and immune to YouTube/network hiccups).
+                    try:
+                        s3.download_file(settings.minio_bucket,media.object_key,str(source))
+                        reused=True
+                        clock.note(reused_stored_copy=True)
+                    except Exception as exc:
+                        logger.warning("Stored copy of %s unavailable (%s); fetching again",media.id,exc)
+                if reused:
+                    pass
+                elif media.source_kind=="youtube":
                     check_cancel(db,job)
                     set_state(db,job,"processing",progress=10,stage="downloading YouTube video")
                     video_id=youtube_video_id(media.source_url)
@@ -129,9 +297,10 @@ def translate_media(self,job_id:str):
                                 "-i",str(part),"-map","0:a:0","-vn","-ac","1",
                                 "-ar","16000",str(piece_audio)],check=True,timeout=90)
                             try:
+                                free_gpu_for_asr()
                                 chunk_rows=translate_audio(piece_audio,job.source_lang,job.target_lang,
                                     settings.whisper_model_path,settings.translation_model_path,
-                                    settings.inference_device,settings.asr_cpu_threads)
+                                    settings.device_for("asr"),settings.threads_per_job(),**inference_kwargs(timings))
                             except ValueError as exc:
                                 if "No intelligible speech" not in str(exc):
                                     raise
@@ -164,6 +333,7 @@ def translate_media(self,job_id:str):
                 else:
                     s3.download_file(settings.minio_bucket,media.object_key,str(source))
                 check_cancel(db,job)
+                clock.note(source=media.source_kind,size_mb=round(source.stat().st_size/1048576,1))
                 if source.stat().st_size>settings.max_upload_mb*1024*1024:
                     raise ValueError("Captured media exceeds configured MAX_UPLOAD_MB")
                 import json
@@ -177,33 +347,65 @@ def translate_media(self,job_id:str):
                         str(settings.max_video_duration_seconds)+"s)")
                 subtitle_path=root/"translated.srt"
                 rows_for_dubbing=None
+                machine_rows=None
                 if streamed_rows is not None:
                     # The streaming URL path has already produced real captions.
                     text=" ".join(row.source_text for row in streamed_rows)
                     translated=" ".join(row.target_text for row in streamed_rows)
                     subtitle_path.write_text(build_srt(streamed_rows),encoding="utf-8")
                     rows_for_dubbing=streamed_rows
+                    machine_rows=list(streamed_rows)
                 else:
+                    clock.mark("extract_audio")
                     set_state(db,job,"processing",progress=25,stage="extracting audio")
                     subprocess.run(["ffmpeg","-v","error","-nostdin","-y",
                         "-i",str(source),"-map","0:a:0","-vn","-ac","1",
                         "-ar","16000",str(audio)],check=True,timeout=600)
                     check_cancel(db,job)
                     if mode=="real_subtitles":
+                        clock.mark("asr_translate")
                         set_state(db,job,"processing",progress=45,stage="recognizing and translating speech")
+                        free_gpu_for_asr()
                         rows=translate_audio(audio,job.source_lang,job.target_lang,
                                              settings.whisper_model_path,
                                              settings.translation_model_path,
-                                             settings.inference_device,settings.asr_cpu_threads)
+                                             settings.device_for("asr"),settings.threads_per_job(),
+                                             **inference_kwargs(timings))
                         text=" ".join(row.source_text for row in rows)
                         translated=" ".join(row.target_text for row in rows)
                         subtitle_path.write_text(build_srt(rows),encoding="utf-8")
                         rows_for_dubbing=rows
+                        machine_rows=list(rows)
+                        clock.note(segments=len(rows),asr_seconds=timings.get("asr"),translate_seconds=timings.get("translate"),
+                                   asr_device=settings.device_for("asr"),mt_device=settings.device_for("mt"),
+                                   mt_engine=timings.get("mt_engine"),media_seconds=round(clip_seconds,1))
                     else:
                         set_state(db,job,"processing",progress=45,stage="demo transcription")
                         text=asr.transcribe(audio,job.source_lang).text
                         translated=mt.translate(text,job.source_lang,job.target_lang)
+                if mode=="real_subtitles" and rows_for_dubbing is not None:
+                    check_cancel(db,job)
+                    if (settings.llm_postedit_enabled or settings.vllm_postedit_enabled) and job.source_lang=="en" and job.target_lang=="km":
+                        clock.mark("llm_postedit")
+                        set_state(db,job,"processing",progress=60,stage="offline LLM translation post-editing")
+                        llm_tasks:list=[]
+                        try:
+                            from app.glossary import load_terms
+                            glossary=load_terms(job.source_lang,job.target_lang)
+                        except Exception as exc:
+                            logger.warning("Glossary unavailable: %s",exc);glossary=[]
+                        rows_for_dubbing=postedit_rows(rows_for_dubbing,job.source_lang,job.target_lang,
+                                                       report=llm_tasks,terms=glossary)
+                        log_llm_tasks(job.id,llm_tasks)
+                        counts={}
+                        for t in llm_tasks:counts[t["status"]]=counts.get(t["status"],0)+1
+                        clock.note(model=settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
+                                   mode=settings.llm_mode,prompt_version=prompt_version(),glossary_terms=len(glossary),
+                                   lines=len(llm_tasks),results=counts,parallel=settings.llm_concurrency)
+                        translated=" ".join(row.target_text for row in rows_for_dubbing)
+                        subtitle_path.write_text(build_srt(rows_for_dubbing),encoding="utf-8")
                 check_cancel(db,job)
+                clock.mark("mux")
                 set_state(db,job,"processing",progress=65,stage="muxing subtitles" if mode=="real_subtitles" else "remuxing demo video")
                 codec_args=output_codec_args(source)
                 # Reuse the duration probed above; transcodes scale with length.
@@ -214,11 +416,15 @@ def translate_media(self,job_id:str):
                     dubbing=settings.enable_khmer_dubbing and job.target_lang=="km"
                     audio_args=[]
                     if dubbing:
+                        clock.mark("tts")
                         set_state(db,job,"processing",progress=70,stage="synthesizing Khmer voice")
                         dubbed=root/"khmer-dub.wav"
+                        placement:dict={}
                         build_dubbed_audio(rows_for_dubbing or [],dubbed,clip_seconds,
-                                           settings.khmer_tts_model_path,settings.inference_device)
+                                           settings.khmer_tts_model_path,settings.device_for("tts"),stats_out=placement)
+                        clock.note(device=settings.device_for("tts"),lines=sum(placement.values()),placement=placement)
                         check_cancel(db,job)
+                        clock.mark("mux")
                         audio_args=["-i",str(dubbed)]
                     cmd=["ffmpeg","-v","error","-nostdin","-y",
                          "-i",str(source),"-i",str(subtitle_path),*audio_args,
@@ -253,6 +459,7 @@ def translate_media(self,job_id:str):
                         raise RuntimeError("Khmer-dubbed AAC audio stream was not created")
                 key=(f"outputs/{job.id}.khmer-dubbed.mp4" if mode=="real_subtitles" and settings.enable_khmer_dubbing and job.target_lang=="km" else f"outputs/{job.id}.mp4")
                 check_cancel(db,job)
+                clock.mark("upload")
                 set_state(db,job,"processing",progress=85,stage="publishing output")
                 s3.upload_file(str(result),settings.minio_bucket,key,ExtraArgs={"ContentType":"video/mp4"})
                 check_cancel(db,job)
@@ -264,10 +471,35 @@ def translate_media(self,job_id:str):
                 job.transcript=text
                 job.translation=translated
                 job.output_key=key
+                if machine_rows is not None and rows_for_dubbing is not None:
+                    llm_used=rows_for_dubbing is not machine_rows and any(
+                        a.target_text!=b.target_text for a,b in zip(machine_rows,rows_for_dubbing))
+                    job.segments=json.dumps([{"start_ms":m.start_ms,"end_ms":m.end_ms,"source":m.source_text,
+                        "machine":m.target_text,"llm":f.target_text if llm_used else None,"final":f.target_text}
+                        for m,f in zip(machine_rows,rows_for_dubbing)],ensure_ascii=False)
+                stages=clock.finish()
+                if "asr_translate" in stages and "asr" in timings:
+                    # Split the combined stage using the engines' own measurements.
+                    stages.pop("asr_translate")
+                    stages["asr"]=timings["asr"];stages["translate"]=timings.get("translate",0)
+                info={"seconds":stages,"media_seconds":round(clip_seconds,1),"segments":timings.get("segments"),
+                      "mt_engine":timings.get("mt_engine"),"devices":{k:settings.device_for(k) for k in ("asr","mt","tts")},
+                      "cpu_threads":settings.threads_per_job()}
+                if machine_rows is not None and (settings.llm_postedit_enabled or settings.vllm_postedit_enabled):
+                    # Provenance for research: which LLM/prompt produced the "llm" column of job.segments.
+                    info["llm"]={"provider":settings.llm_provider if settings.llm_postedit_enabled else "vllm",
+                                 "model":settings.llm_model if settings.llm_postedit_enabled else settings.vllm_model,
+                                 "mode":settings.llm_mode,"prompt_version":prompt_version()}
+                job.timings=json.dumps(info)
+                logger.info("Job %s finished in %.1fs for %.0fs of media: %s",job.id,stages["total"],clip_seconds,stages)
                 set_state(db,job,"completed",progress=100,stage="completed")
+                log_event(job.id,"job","Job completed",seconds=stages["total"],stages=stages,
+                          media_seconds=round(clip_seconds,1),output=key)
         except CancelledJob:
+            log_event(job.id,"job","Cancelled by user",level="warning")
             return
         except Exception as exc:
             db.rollback()
             set_state(db,job,"failed",str(exc)[:1500],stage="failed")
+            log_event(job.id,clock._stage or "job","Failed: "+str(exc)[:500],level="error",error_type=type(exc).__name__)
             raise
